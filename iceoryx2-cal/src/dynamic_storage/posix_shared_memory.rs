@@ -61,8 +61,11 @@ use self::dynamic_storage_configuration::DynamicStorageConfiguration;
 
 const INIT_PERMISSIONS: Permission = Permission::OWNER_WRITE;
 
-#[cfg(not(feature = "dev_permissions"))]
+#[cfg(all(not(feature = "group_permissions"), not(feature = "dev_permissions")))]
 const FINAL_PERMISSIONS: Permission = Permission::OWNER_ALL;
+
+#[cfg(all(feature = "group_permissions", not(feature = "dev_permissions")))]
+const FINAL_PERMISSIONS: Permission = Permission::OWNER_ALL_GROUP_ALL;
 
 #[cfg(feature = "dev_permissions")]
 const FINAL_PERMISSIONS: Permission = Permission::ALL;

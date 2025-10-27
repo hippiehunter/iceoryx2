@@ -56,7 +56,14 @@ use iceoryx2_bb_posix::{
 };
 use iceoryx2_pal_concurrency_sync::iox_atomic::IoxAtomicBool;
 
+#[cfg(all(not(feature = "group_permissions"), not(feature = "dev_permissions")))]
 const FINAL_PERMISSIONS: Permission = Permission::OWNER_READ;
+
+#[cfg(all(feature = "group_permissions", not(feature = "dev_permissions")))]
+const FINAL_PERMISSIONS: Permission = Permission::OWNER_READ_GROUP_READ;
+
+#[cfg(feature = "dev_permissions")]
+const FINAL_PERMISSIONS: Permission = Permission::ALL;
 
 /// The custom configuration of the [`Storage`].
 #[derive(Clone, Debug)]
@@ -381,7 +388,14 @@ impl crate::static_storage::StaticStorageBuilder<Storage> for Builder {
     }
 
     fn create_locked(self) -> Result<Locked, StaticStorageCreateError> {
-        let directory_permission = Permission::OWNER_ALL | Permission::GROUP_ALL;
+        #[cfg(all(not(feature = "group_permissions"), not(feature = "dev_permissions")))]
+        let directory_permission = Permission::OWNER_ALL;
+
+        #[cfg(all(feature = "group_permissions", not(feature = "dev_permissions")))]
+        let directory_permission = Permission::OWNER_ALL_GROUP_ALL_SETGID;
+
+        #[cfg(feature = "dev_permissions")]
+        let directory_permission = Permission::ALL;
 
         let msg = format!("Unable to create target directory \"{}\"", self.config.path);
         if !fail!(from self, when Directory::does_exist(&self.config.path),
