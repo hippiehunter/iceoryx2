@@ -14,12 +14,12 @@ version = { workspace = true }
 # The permissions of all resources will be set to read, write, execute for the owner and group.
 # This enables multi-user scenarios where all processes belong to a shared Unix group.
 # Suitable for production deployments with controlled group membership.
-group_permissions = []
+group_permissions = ["iceoryx2-bb-posix/group_permissions"]
 
 # The permissions of all resources will be set to read, write, execute for everyone.
 # This shall not be used in production and is meant to be enabled in a docker environment
 # with inconsistent user configuration.
-dev_permissions = []
+dev_permissions = ["iceoryx2-bb-posix/dev_permissions"]
 
 [dependencies]
 iceoryx2-bb-posix = { workspace = true }

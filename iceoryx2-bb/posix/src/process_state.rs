@@ -336,11 +336,18 @@ impl ProcessGuard {
             path
         );
 
+        #[cfg(all(not(feature = "group_permissions"), not(feature = "dev_permissions")))]
         let default_directory_permissions = Permission::OWNER_ALL
             | Permission::GROUP_READ
             | Permission::GROUP_EXEC
             | Permission::OTHERS_READ
             | Permission::OTHERS_EXEC;
+
+        #[cfg(all(feature = "group_permissions", not(feature = "dev_permissions")))]
+        let default_directory_permissions = Permission::OWNER_ALL_GROUP_ALL_SETGID;
+
+        #[cfg(feature = "dev_permissions")]
+        let default_directory_permissions = Permission::ALL;
 
         let dir_path = path.path();
 

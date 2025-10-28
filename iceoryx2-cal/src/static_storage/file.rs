@@ -65,6 +65,16 @@ const FINAL_PERMISSIONS: Permission = Permission::OWNER_READ_GROUP_READ;
 #[cfg(feature = "dev_permissions")]
 const FINAL_PERMISSIONS: Permission = Permission::ALL;
 
+// Initial permissions for files during locked/creation state
+#[cfg(all(not(feature = "group_permissions"), not(feature = "dev_permissions")))]
+const INIT_FILE_PERMISSIONS: Permission = Permission::OWNER_ALL;
+
+#[cfg(all(feature = "group_permissions", not(feature = "dev_permissions")))]
+const INIT_FILE_PERMISSIONS: Permission = Permission::OWNER_ALL_GROUP_ALL;
+
+#[cfg(feature = "dev_permissions")]
+const INIT_FILE_PERMISSIONS: Permission = Permission::ALL;
+
 /// The custom configuration of the [`Storage`].
 #[derive(Clone, Debug)]
 pub struct Configuration {
@@ -204,7 +214,7 @@ impl crate::named_concept::NamedConceptMgmt for Storage {
             }
         };
 
-        fail!(from origin, when file.set_permission(Permission::OWNER_ALL),
+        fail!(from origin, when file.set_permission(INIT_FILE_PERMISSIONS),
                 with NamedConceptRemoveError::InternalError,
                 "{} since the permissions could not be adjusted.", msg);
 
@@ -415,7 +425,7 @@ impl crate::static_storage::StaticStorageBuilder<Storage> for Builder {
         let file = fail!(from self, when
             FileBuilder::new(&self.config.path_for(&self.storage_name))
             .creation_mode(CreationMode::CreateExclusive)
-            .permission(Permission::OWNER_ALL)
+            .permission(INIT_FILE_PERMISSIONS)
             .create(),
             map FileCreationError::FileAlreadyExists => StaticStorageCreateError::AlreadyExists;
                 FileCreationError::InsufficientPermissions => StaticStorageCreateError::InsufficientPermissions,
