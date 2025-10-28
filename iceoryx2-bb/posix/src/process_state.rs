@@ -251,8 +251,24 @@ pub struct ProcessGuard {
     owner_lock_file: File,
 }
 
+// Permissions for process monitoring files - respects feature flags
+#[cfg(all(not(feature = "group_permissions"), not(feature = "dev_permissions")))]
 const INIT_PERMISSION: Permission = Permission::OWNER_WRITE;
+
+#[cfg(all(feature = "group_permissions", not(feature = "dev_permissions")))]
+const INIT_PERMISSION: Permission = Permission::OWNER_WRITE_GROUP_WRITE;
+
+#[cfg(feature = "dev_permissions")]
+const INIT_PERMISSION: Permission = Permission::WRITE_ALL;
+
+#[cfg(all(not(feature = "group_permissions"), not(feature = "dev_permissions")))]
 const FINAL_PERMISSION: Permission = Permission::OWNER_ALL;
+
+#[cfg(all(feature = "group_permissions", not(feature = "dev_permissions")))]
+const FINAL_PERMISSION: Permission = Permission::OWNER_ALL_GROUP_ALL;
+
+#[cfg(feature = "dev_permissions")]
+const FINAL_PERMISSION: Permission = Permission::ALL;
 const OWNER_LOCK_SUFFIX: &[u8] = b"_owner_lock";
 
 fn generate_owner_lock_path(path: &FilePath) -> Result<FilePath, SemanticStringError> {

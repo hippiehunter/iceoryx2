@@ -45,6 +45,8 @@ impl Permission {
 
     // Combined permissions for common use cases
     pub const OWNER_READ_GROUP_READ: Self = Self(0o0440);
+    pub const OWNER_WRITE_GROUP_WRITE: Self = Self(0o0220);
+    pub const WRITE_ALL: Self = Self(0o0222);
     pub const OWNER_ALL_GROUP_ALL: Self = Self(0o0770);
     pub const OWNER_ALL_GROUP_ALL_SETGID: Self = Self(0o2770);
 
