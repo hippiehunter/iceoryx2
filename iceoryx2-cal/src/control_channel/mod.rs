@@ -59,6 +59,9 @@
 pub mod recommended;
 pub mod unix_stream;
 
+#[cfg(windows)]
+pub mod named_pipe;
+
 use core::fmt::Debug;
 use core::time::Duration;
 

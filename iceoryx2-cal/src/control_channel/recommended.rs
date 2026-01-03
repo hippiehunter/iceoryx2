@@ -44,3 +44,11 @@
 /// On Unix systems, this is [`unix_stream::Channel`](super::unix_stream::Channel).
 #[cfg(unix)]
 pub type Ipc = crate::control_channel::unix_stream::Channel;
+
+/// Recommended [`ControlChannel`] implementation for inter-process communication.
+///
+/// On Windows systems, this is [`named_pipe::Channel`](super::named_pipe::Channel)
+/// which uses Windows Named Pipes with handle duplication for passing handles
+/// between processes.
+#[cfg(windows)]
+pub type Ipc = crate::control_channel::named_pipe::Channel;

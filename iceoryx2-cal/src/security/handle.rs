@@ -13,45 +13,74 @@
 //! Platform-specific handle types with RAII semantics.
 //!
 //! This module provides [`PlatformHandle`], a safe wrapper around OS-level file descriptors
-//! that ensures proper resource cleanup. It also provides [`AccessRights`] for specifying
-//! read/write permissions and [`HandleBundle`] for bundling handles with segment metadata.
+//! (Unix) or handles (Windows) that ensures proper resource cleanup. It also provides
+//! [`AccessRights`] for specifying read/write permissions and [`HandleBundle`] for bundling
+//! handles with segment metadata.
 
 use core::fmt::Debug;
 
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
+#[cfg(unix)]
 use std::os::unix::io::IntoRawFd;
+#[cfg(unix)]
 use std::os::unix::io::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::io::FromRawHandle;
+#[cfg(windows)]
+use std::os::windows::io::IntoRawHandle;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
 
 use crate::shm_allocator::SegmentId;
 
 use super::error::HandleError;
 
+// ============================================================================
+// PlatformHandle - Unix Implementation
+// ============================================================================
+
 /// Platform-specific handle with RAII semantics.
 ///
 /// On Unix systems, this wraps an [`OwnedFd`] which represents ownership of a file descriptor.
-/// The file descriptor is automatically closed when the [`PlatformHandle`] is dropped.
+/// On Windows, this wraps an [`OwnedHandle`] which represents ownership of a Windows handle.
+/// The handle is automatically closed when the [`PlatformHandle`] is dropped.
 ///
 /// # Example
 ///
 /// ```ignore
 /// use iceoryx2_cal::security::PlatformHandle;
 ///
-/// // Create from a raw file descriptor (unsafe)
+/// // Unix: Create from a raw file descriptor (unsafe)
+/// #[cfg(unix)]
 /// let handle = unsafe { PlatformHandle::from_raw_fd(fd) };
 ///
-/// // Clone the handle (duplicates the underlying fd)
-/// let cloned = handle.try_clone().expect("Failed to clone handle");
+/// // Windows: Create from a raw handle (unsafe)
+/// #[cfg(windows)]
+/// let handle = unsafe { PlatformHandle::from_raw_handle(handle) };
 ///
-/// // Access the raw fd (for syscalls)
-/// let raw_fd = handle.as_raw_fd();
+/// // Clone the handle (duplicates the underlying resource)
+/// let cloned = handle.try_clone().expect("Failed to clone handle");
 /// ```
 #[derive(Debug)]
 pub struct PlatformHandle {
+    #[cfg(unix)]
     inner: OwnedFd,
+    #[cfg(windows)]
+    inner: OwnedHandle,
 }
 
+// Unix implementation
+#[cfg(unix)]
 impl PlatformHandle {
     /// Creates a [`PlatformHandle`] from a raw file descriptor.
     ///
@@ -106,6 +135,7 @@ impl PlatformHandle {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for PlatformHandle {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
@@ -113,6 +143,7 @@ impl AsRawFd for PlatformHandle {
     }
 }
 
+#[cfg(unix)]
 impl IntoRawFd for PlatformHandle {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
@@ -120,6 +151,7 @@ impl IntoRawFd for PlatformHandle {
     }
 }
 
+#[cfg(unix)]
 impl FromRawFd for PlatformHandle {
     /// Creates a [`PlatformHandle`] from a raw file descriptor.
     ///
@@ -131,6 +163,99 @@ impl FromRawFd for PlatformHandle {
         Self::from_raw_fd(fd)
     }
 }
+
+// ============================================================================
+// PlatformHandle - Windows Implementation
+// ============================================================================
+
+#[cfg(windows)]
+impl PlatformHandle {
+    /// Creates a [`PlatformHandle`] from a raw Windows handle.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that `handle` is a valid, open Windows handle.
+    /// - The caller must transfer ownership of the handle to this [`PlatformHandle`].
+    /// - The handle must not be closed by any other code after this call.
+    /// - The handle must remain valid for the lifetime of the [`PlatformHandle`].
+    /// - The handle must be closeable with `CloseHandle` (not a pseudo-handle).
+    #[inline]
+    pub unsafe fn from_raw_handle(handle: RawHandle) -> Self {
+        Self {
+            inner: OwnedHandle::from_raw_handle(handle),
+        }
+    }
+
+    /// Duplicates the handle, creating a new independent [`PlatformHandle`].
+    ///
+    /// The new handle refers to the same underlying resource but has independent
+    /// ownership. Closing one handle does not affect the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandleError::DuplicationFailed`] if the underlying `DuplicateHandle`
+    /// call fails, which can happen if:
+    /// - The process has reached its handle limit
+    /// - The handle is invalid
+    /// - Insufficient privileges to duplicate the handle
+    pub fn try_clone(&self) -> Result<Self, HandleError> {
+        self.inner
+            .try_clone()
+            .map(|h| Self { inner: h })
+            .map_err(|_| HandleError::DuplicationFailed)
+    }
+
+    /// Returns the raw Windows handle without transferring ownership.
+    ///
+    /// The returned handle is valid only as long as this [`PlatformHandle`]
+    /// exists and has not been consumed by [`into_raw_handle`](Self::into_raw_handle).
+    #[inline]
+    pub fn as_raw_handle(&self) -> RawHandle {
+        self.inner.as_raw_handle()
+    }
+
+    /// Consumes the [`PlatformHandle`] and returns the raw Windows handle.
+    ///
+    /// After calling this method, the caller is responsible for closing the
+    /// handle with `CloseHandle`. The [`PlatformHandle`] will not close it on drop.
+    #[inline]
+    pub fn into_raw_handle(self) -> RawHandle {
+        self.inner.into_raw_handle()
+    }
+}
+
+#[cfg(windows)]
+impl AsRawHandle for PlatformHandle {
+    #[inline]
+    fn as_raw_handle(&self) -> RawHandle {
+        self.inner.as_raw_handle()
+    }
+}
+
+#[cfg(windows)]
+impl IntoRawHandle for PlatformHandle {
+    #[inline]
+    fn into_raw_handle(self) -> RawHandle {
+        self.inner.into_raw_handle()
+    }
+}
+
+#[cfg(windows)]
+impl FromRawHandle for PlatformHandle {
+    /// Creates a [`PlatformHandle`] from a raw Windows handle.
+    ///
+    /// # Safety
+    ///
+    /// See [`PlatformHandle::from_raw_handle`] for safety requirements.
+    #[inline]
+    unsafe fn from_raw_handle(handle: RawHandle) -> Self {
+        Self::from_raw_handle(handle)
+    }
+}
+
+// ============================================================================
+// AccessRights
+// ============================================================================
 
 /// Access rights for a handle.
 ///
@@ -221,6 +346,10 @@ impl Default for AccessRights {
     }
 }
 
+// ============================================================================
+// HandleBundle
+// ============================================================================
+
 /// Bundle of handles for a data-plane resource.
 ///
 /// A [`HandleBundle`] combines a platform handle with metadata about the segment it represents:
@@ -308,5 +437,211 @@ impl HandleBundle {
     #[inline]
     pub fn into_handle(self) -> PlatformHandle {
         self.segment
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_access_rights_none() {
+        let rights = AccessRights::none();
+        assert!(!rights.read);
+        assert!(!rights.write);
+        assert!(!rights.has_any());
+        assert!(!rights.can_read());
+        assert!(!rights.can_write());
+    }
+
+    #[test]
+    fn test_access_rights_read_only() {
+        let rights = AccessRights::read_only();
+        assert!(rights.read);
+        assert!(!rights.write);
+        assert!(rights.has_any());
+        assert!(rights.can_read());
+        assert!(!rights.can_write());
+    }
+
+    #[test]
+    fn test_access_rights_read_write() {
+        let rights = AccessRights::read_write();
+        assert!(rights.read);
+        assert!(rights.write);
+        assert!(rights.has_any());
+        assert!(rights.can_read());
+        assert!(rights.can_write());
+    }
+
+    #[test]
+    fn test_access_rights_default() {
+        let rights = AccessRights::default();
+        assert_eq!(rights, AccessRights::none());
+    }
+
+    #[test]
+    fn test_access_rights_clone_copy() {
+        let rights = AccessRights::read_write();
+        let cloned = rights.clone();
+        let copied = rights;
+        assert_eq!(rights, cloned);
+        assert_eq!(rights, copied);
+    }
+
+    #[test]
+    fn test_access_rights_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(AccessRights::none());
+        set.insert(AccessRights::read_only());
+        set.insert(AccessRights::read_write());
+        assert_eq!(set.len(), 3);
+    }
+
+    #[cfg(unix)]
+    mod unix_tests {
+        use super::*;
+        use std::os::unix::io::AsRawFd;
+
+        #[test]
+        fn test_platform_handle_from_pipe() {
+            // Create a pipe to get valid file descriptors
+            let mut fds = [0i32; 2];
+            unsafe {
+                libc::pipe(fds.as_mut_ptr());
+            }
+
+            let read_fd = fds[0];
+            let write_fd = fds[1];
+
+            // Create handles
+            let read_handle = unsafe { PlatformHandle::from_raw_fd(read_fd) };
+            let write_handle = unsafe { PlatformHandle::from_raw_fd(write_fd) };
+
+            // Verify raw fd access
+            assert_eq!(read_handle.as_raw_fd(), read_fd);
+            assert_eq!(write_handle.as_raw_fd(), write_fd);
+
+            // Handles are closed on drop
+        }
+
+        #[test]
+        fn test_platform_handle_try_clone() {
+            let mut fds = [0i32; 2];
+            unsafe {
+                libc::pipe(fds.as_mut_ptr());
+            }
+
+            let handle = unsafe { PlatformHandle::from_raw_fd(fds[0]) };
+            let cloned = handle.try_clone().expect("Clone should succeed");
+
+            // Both should be valid but different fds
+            assert_ne!(handle.as_raw_fd(), cloned.as_raw_fd());
+
+            // Close the write end
+            unsafe { libc::close(fds[1]) };
+        }
+
+        #[test]
+        fn test_platform_handle_into_raw_fd() {
+            let mut fds = [0i32; 2];
+            unsafe {
+                libc::pipe(fds.as_mut_ptr());
+            }
+
+            let handle = unsafe { PlatformHandle::from_raw_fd(fds[0]) };
+            let raw = handle.into_raw_fd();
+
+            assert_eq!(raw, fds[0]);
+
+            // Manual cleanup since we took ownership
+            unsafe {
+                libc::close(raw);
+                libc::close(fds[1]);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    mod windows_tests {
+        use super::*;
+        use std::os::windows::io::AsRawHandle;
+
+        #[test]
+        fn test_platform_handle_from_event() {
+            use windows_sys::Win32::System::Threading::CreateEventW;
+            use windows_sys::Win32::Foundation::CloseHandle;
+
+            // Create an event to get a valid handle
+            let handle = unsafe {
+                CreateEventW(
+                    core::ptr::null(),
+                    1, // manual reset
+                    0, // initial state = non-signaled
+                    core::ptr::null(),
+                )
+            };
+            assert!(handle != 0, "Failed to create event");
+
+            let platform_handle = unsafe { PlatformHandle::from_raw_handle(handle as *mut _) };
+
+            // Verify raw handle access
+            assert_eq!(platform_handle.as_raw_handle(), handle as *mut _);
+
+            // Handle is closed on drop
+        }
+
+        #[test]
+        fn test_platform_handle_try_clone() {
+            use windows_sys::Win32::System::Threading::CreateEventW;
+
+            let handle = unsafe {
+                CreateEventW(
+                    core::ptr::null(),
+                    1,
+                    0,
+                    core::ptr::null(),
+                )
+            };
+            assert!(handle != 0, "Failed to create event");
+
+            let platform_handle = unsafe { PlatformHandle::from_raw_handle(handle as *mut _) };
+            let cloned = platform_handle.try_clone().expect("Clone should succeed");
+
+            // Both should be valid but different handles
+            assert_ne!(
+                platform_handle.as_raw_handle(),
+                cloned.as_raw_handle()
+            );
+        }
+
+        #[test]
+        fn test_platform_handle_into_raw_handle() {
+            use windows_sys::Win32::System::Threading::CreateEventW;
+            use windows_sys::Win32::Foundation::CloseHandle;
+
+            let handle = unsafe {
+                CreateEventW(
+                    core::ptr::null(),
+                    1,
+                    0,
+                    core::ptr::null(),
+                )
+            };
+            assert!(handle != 0, "Failed to create event");
+
+            let platform_handle = unsafe { PlatformHandle::from_raw_handle(handle as *mut _) };
+            let raw = platform_handle.into_raw_handle();
+
+            assert_eq!(raw, handle as *mut _);
+
+            // Manual cleanup since we took ownership
+            unsafe { CloseHandle(raw as isize) };
+        }
     }
 }

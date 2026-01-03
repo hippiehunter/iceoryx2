@@ -14,11 +14,14 @@ pub mod constants;
 pub mod dirent;
 pub mod errno;
 pub mod fcntl;
+pub mod handle_passing;
 pub mod mman;
+pub mod named_pipe;
 pub mod pthread;
 pub mod pwd;
 pub mod resource;
 pub mod sched;
+pub mod security_descriptor;
 pub mod select;
 pub mod semaphore;
 #[doc(hidden)]
