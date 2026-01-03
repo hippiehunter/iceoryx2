@@ -94,3 +94,34 @@ pub unsafe fn fchown(fd: int, owner: uid_t, group: gid_t) -> int {
 pub unsafe fn fsync(fd: int) -> int {
     crate::internal::fsync(fd)
 }
+
+/// Syscall number for memfd_create
+/// x86_64: 319, aarch64: 279
+#[cfg(target_arch = "x86_64")]
+const SYS_MEMFD_CREATE: long = 319;
+
+#[cfg(target_arch = "aarch64")]
+const SYS_MEMFD_CREATE: long = 279;
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const SYS_MEMFD_CREATE: long = 319;
+
+pub unsafe fn memfd_create(name: *const c_char, flags: uint) -> int {
+    crate::internal::syscall(SYS_MEMFD_CREATE, name as long, flags as long) as int
+}
+
+/// Syscall number for pidfd_open on x86_64 is 434
+/// On aarch64 it is 434 as well
+/// This is Linux kernel 5.3+
+#[cfg(target_arch = "x86_64")]
+const SYS_PIDFD_OPEN: long = 434;
+
+#[cfg(target_arch = "aarch64")]
+const SYS_PIDFD_OPEN: long = 434;
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const SYS_PIDFD_OPEN: long = 434;
+
+pub unsafe fn pidfd_open(pid: pid_t, flags: uint) -> int {
+    crate::internal::syscall(SYS_PIDFD_OPEN, pid as long, flags as long) as int
+}

@@ -136,6 +136,15 @@ impl SocketCred {
         Self::default()
     }
 
+    /// Creates a [`SocketCred`] from a POSIX ucred structure.
+    pub fn from_ucred(cred: posix::ucred) -> SocketCred {
+        SocketCred {
+            pid: ProcessId::new(cred.pid),
+            uid: Uid::new_from_native(cred.uid),
+            gid: Gid::new_from_native(cred.gid),
+        }
+    }
+
     /// Overrides the current pid
     pub fn set_pid(&mut self, pid: ProcessId) {
         self.pid = pid;
@@ -341,6 +350,76 @@ impl SocketAncillary {
 
     pub(crate) fn len(&self) -> usize {
         self.message.msg_controllen as _
+    }
+
+    /// Extract received data for stream sockets (generic version)
+    pub(crate) fn extract_received_data_for_stream<T: core::fmt::Debug>(&mut self, receiver: &T) {
+        let mut cmsghdr = unsafe { posix::CMSG_FIRSTHDR(&self.message) };
+
+        loop {
+            if cmsghdr.is_null() {
+                break;
+            }
+
+            if unsafe { (*cmsghdr).cmsg_level != CMSG_SOCKET_LEVEL } {
+                warn!(from receiver, "A cmsghdr with the wrong cmsg_level was received - expected {}, received {}.",
+                    unsafe{(*cmsghdr).cmsg_level}, CMSG_SOCKET_LEVEL);
+                cmsghdr = unsafe { posix::CMSG_NXTHDR(&self.message, cmsghdr) };
+                continue;
+            }
+
+            match unsafe { (*cmsghdr).cmsg_type } {
+                posix::SCM_RIGHTS => {
+                    let mut i = 0;
+                    if self.len() % SIZE_OF_FD != 0 {
+                        warn!(from receiver, "Received an incomplete set of file descriptors.")
+                    }
+
+                    while i < self.len() {
+                        let mut raw_fd: i32 = 0;
+                        unsafe {
+                            posix::memcpy(
+                                (&mut raw_fd as *mut i32) as *mut posix::void,
+                                posix::CMSG_DATA(cmsghdr).add(i) as *const posix::void,
+                                SIZE_OF_FD,
+                            )
+                        };
+                        if raw_fd == 0 {
+                            break;
+                        }
+
+                        if let Some(fd) = FileDescriptor::new(raw_fd) {
+                            self.file_descriptors.push(fd);
+                        } else {
+                            warn!(from receiver, "An invalid file descriptor was received and will be ignored.");
+                        }
+
+                        i += SIZE_OF_FD;
+                    }
+                }
+                posix::SCM_CREDENTIALS => {
+                    let mut raw_cred = posix::ucred::new_zeroed();
+                    unsafe {
+                        posix::memcpy(
+                            (&mut raw_cred as *mut posix::ucred) as *mut posix::void,
+                            posix::CMSG_DATA(cmsghdr) as *const posix::void,
+                            SIZE_OF_CRED,
+                        )
+                    };
+
+                    self.credentials = Some(SocketCred {
+                        pid: ProcessId::new(raw_cred.pid),
+                        uid: Uid::new_from_native(raw_cred.uid),
+                        gid: Gid::new_from_native(raw_cred.gid),
+                    });
+                }
+                v => {
+                    warn!(from receiver, "A cmsghdr with an unknown cmsg_type ({}) was received.", v);
+                }
+            }
+
+            cmsghdr = unsafe { posix::CMSG_NXTHDR(&self.message, cmsghdr) };
+        }
     }
 
     pub(crate) fn extract_received_data(&mut self, receiver: &UnixDatagramReceiver) {

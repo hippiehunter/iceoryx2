@@ -23,6 +23,8 @@ extern crate iceoryx2_loggers;
 
 pub mod arc_sync_policy;
 pub mod communication_channel;
+#[cfg(feature = "std")]
+pub mod control_channel;
 pub mod dynamic_storage;
 pub mod event;
 pub mod hash;
