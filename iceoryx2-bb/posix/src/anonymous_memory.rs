@@ -74,12 +74,11 @@ use iceoryx2_pal_posix::posix::errno::Errno;
 use iceoryx2_pal_posix::*;
 
 pub use crate::access_mode::AccessMode;
-use crate::file_descriptor::{FileDescriptor, FileDescriptorBased, FileDescriptorManagement};
 use crate::file::FileTruncateError;
+use crate::file_descriptor::{FileDescriptor, FileDescriptorBased, FileDescriptorManagement};
 use crate::handle_errno;
 use crate::memory_mapping::{
-    MappingBehavior, MemoryMapping, MemoryMappingBuilder,
-    MemoryMappingCreationError,
+    MappingBehavior, MemoryMapping, MemoryMappingBuilder, MemoryMappingCreationError,
 };
 
 /// Seal flags for anonymous memory.
@@ -350,9 +349,8 @@ impl AnonymousMemory {
         let msg = "Unable to create anonymous memory from file descriptor";
 
         // Verify it's a memfd by checking F_GET_SEALS works
-        let current_seals_flags = unsafe {
-            posix::fcntl_int(fd.native_handle(), posix::F_GET_SEALS, 0)
-        };
+        let current_seals_flags =
+            unsafe { posix::fcntl_int(fd.native_handle(), posix::F_GET_SEALS, 0) };
         if current_seals_flags < 0 {
             fail!(from "AnonymousMemory::from_file_descriptor",
                 with AnonymousMemoryFromFdError::NotAMemfd,

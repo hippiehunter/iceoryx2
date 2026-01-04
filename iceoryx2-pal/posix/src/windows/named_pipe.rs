@@ -40,32 +40,32 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
 
+extern crate alloc;
+
 use core::fmt::{self, Display, Formatter};
 use core::time::Duration;
 
 // Windows API imports
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, BOOL, FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE,
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
-    ERROR_HANDLE_EOF, ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
-    ERROR_PIPE_NOT_CONNECTED, ERROR_SUCCESS,
+    CloseHandle, GetLastError, SetLastError, BOOL, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
+    ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_HANDLE,
+    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED, ERROR_SUCCESS, FALSE, HANDLE,
+    INVALID_HANDLE_VALUE, TRUE,
 };
 
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, ReadFile, WriteFile,
-    FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING,
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING,
 };
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    PeekNamedPipe, SetNamedPipeHandleState,
-    PIPE_ACCESS_DUPLEX, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PIPE_NOWAIT,
+    PeekNamedPipe, SetNamedPipeHandleState, PIPE_ACCESS_DUPLEX, PIPE_NOWAIT, PIPE_READMODE_MESSAGE,
+    PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 
 #[cfg(windows)]
@@ -74,9 +74,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 #[cfg(windows)]
-use windows_sys::Win32::System::IO::{
-    CancelIo, GetOverlappedResult, OVERLAPPED,
-};
+use windows_sys::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 
 #[cfg(windows)]
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -199,7 +197,9 @@ impl core::error::Error for NamedPipeError {}
 /// # Returns
 /// * `Ok((buffer, len))` - The wide string buffer and its length (excluding null)
 /// * `Err(NamedPipeError::NameTooLong)` - If the resulting name is too long
-pub fn pipe_name_to_wide(name: &[u8]) -> Result<([u16; MAX_PIPE_NAME_LENGTH], usize), NamedPipeError> {
+pub fn pipe_name_to_wide(
+    name: &[u8],
+) -> Result<([u16; MAX_PIPE_NAME_LENGTH], usize), NamedPipeError> {
     let mut buffer = [0u16; MAX_PIPE_NAME_LENGTH];
     let prefix = PIPE_NAME_PREFIX;
 
@@ -237,26 +237,92 @@ pub fn pipe_name_to_wide(name: &[u8]) -> Result<([u16; MAX_PIPE_NAME_LENGTH], us
 /// On Windows, only the process ID is available directly from the pipe.
 /// UID and GID are set to default values as Windows uses a different
 /// security model (SIDs instead of numeric UIDs/GIDs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// For proper Windows identity information, use the [`user_sid()`](Self::user_sid) and
+/// [`group_sids()`](Self::group_sids) methods which return the actual Windows Security
+/// Identifiers when available.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipeProcessCredentials {
     /// Process ID of the connected peer.
-    pub pid: u32,
+    pid: u32,
     /// User ID (always 0 on Windows - use Windows SID APIs for actual identity).
-    pub uid: u32,
+    uid: u32,
     /// Group ID (always 0 on Windows - use Windows SID APIs for actual identity).
-    pub gid: u32,
+    gid: u32,
+    /// The user's Security Identifier (SID) if available.
+    user_sid: Option<super::security_descriptor::Sid>,
+    /// The group SIDs the user belongs to, if available.
+    group_sids: Option<alloc::vec::Vec<super::security_descriptor::Sid>>,
 }
 
 impl PipeProcessCredentials {
     /// Creates new process credentials with the specified PID.
     ///
     /// UID and GID are set to 0 as Windows doesn't use numeric IDs.
+    /// SIDs are set to None. Use [`with_sids`](Self::with_sids) to include SID information.
     pub fn new(pid: u32) -> Self {
         Self {
             pid,
             uid: 0,
             gid: 0,
+            user_sid: None,
+            group_sids: None,
         }
+    }
+
+    /// Creates new process credentials with the specified PID and SIDs.
+    ///
+    /// # Arguments
+    /// * `pid` - Process ID of the connected peer
+    /// * `user_sid` - The user's Security Identifier
+    /// * `group_sids` - The group SIDs the user belongs to
+    pub fn with_sids(
+        pid: u32,
+        user_sid: super::security_descriptor::Sid,
+        group_sids: alloc::vec::Vec<super::security_descriptor::Sid>,
+    ) -> Self {
+        Self {
+            pid,
+            uid: 0,
+            gid: 0,
+            user_sid: Some(user_sid),
+            group_sids: Some(group_sids),
+        }
+    }
+
+    /// Returns the process ID of the connected peer.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Returns the user ID (always 0 on Windows).
+    ///
+    /// Windows uses SIDs instead of numeric UIDs. Use [`user_sid()`](Self::user_sid)
+    /// for actual identity information.
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    /// Returns the group ID (always 0 on Windows).
+    ///
+    /// Windows uses SIDs instead of numeric GIDs. Use [`group_sids()`](Self::group_sids)
+    /// for actual identity information.
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
+    /// Returns the user's Security Identifier (SID) if available.
+    ///
+    /// Returns `None` if SID extraction failed during credential retrieval.
+    pub fn user_sid(&self) -> Option<&super::security_descriptor::Sid> {
+        self.user_sid.as_ref()
+    }
+
+    /// Returns the group SIDs the user belongs to, if available.
+    ///
+    /// Returns `None` if SID extraction failed during credential retrieval.
+    pub fn group_sids(&self) -> Option<&[super::security_descriptor::Sid]> {
+        self.group_sids.as_deref()
     }
 }
 
@@ -323,7 +389,7 @@ impl NamedPipeServer {
         let handle = unsafe {
             CreateNamedPipeW(
                 name_wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX,  // Bidirectional pipe
+                PIPE_ACCESS_DUPLEX, // Bidirectional pipe
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 DEFAULT_PIPE_BUFFER_SIZE,
@@ -391,7 +457,10 @@ impl NamedPipeServer {
     /// * `Ok(Some(connection))` - A client connected
     /// * `Ok(None)` - Timeout expired without a connection
     /// * `Err(NamedPipeError)` - An error occurred
-    pub fn timed_accept(&mut self, timeout: Duration) -> Result<Option<NamedPipeConnection>, NamedPipeError> {
+    pub fn timed_accept(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<NamedPipeConnection>, NamedPipeError> {
         if self.is_connected {
             return Err(NamedPipeError::AlreadyConnected);
         }
@@ -469,9 +538,7 @@ impl NamedPipeServer {
                             // we're returning None for timeout anyway
                             Ok(None)
                         }
-                        WAIT_ABANDONED => {
-                            Err(NamedPipeError::Interrupted)
-                        }
+                        WAIT_ABANDONED => Err(NamedPipeError::Interrupted),
                         WAIT_FAILED | _ => {
                             let error = unsafe { GetLastError() };
                             Err(NamedPipeError::from_win32(error))
@@ -585,7 +652,10 @@ impl NamedPipeServer {
         Err(NamedPipeError::UnknownError(0))
     }
 
-    pub fn timed_accept(&mut self, _timeout: Duration) -> Result<Option<NamedPipeConnection>, NamedPipeError> {
+    pub fn timed_accept(
+        &mut self,
+        _timeout: Duration,
+    ) -> Result<Option<NamedPipeConnection>, NamedPipeError> {
         Err(NamedPipeError::UnknownError(0))
     }
 
@@ -725,14 +795,35 @@ impl NamedPipeConnection {
 
     /// Returns the credentials of the connected peer.
     ///
-    /// On Windows, only the process ID is available. UID and GID are set to 0.
+    /// On Windows, this retrieves the process ID and attempts to extract the client's
+    /// Security Identifiers (SIDs) via token impersonation. If SID extraction fails,
+    /// credentials are returned with PID only (graceful fallback).
     ///
     /// # Returns
-    /// * `Ok(credentials)` - The peer's credentials
-    /// * `Err(NamedPipeError)` - Failed to get credentials
+    /// * `Ok(credentials)` - The peer's credentials (with or without SIDs)
+    /// * `Err(NamedPipeError)` - Failed to get basic credentials (PID)
     pub fn peer_credentials(&mut self) -> Result<PipeProcessCredentials, NamedPipeError> {
         let pid = self.client_process_id()?;
-        Ok(PipeProcessCredentials::new(pid))
+
+        // Attempt to get SIDs via token impersonation.
+        // If this fails, we gracefully fall back to PID-only credentials.
+        match super::process_token::get_client_token_sids(self.handle) {
+            Ok(token_sids) => Ok(PipeProcessCredentials::with_sids(
+                pid,
+                token_sids.user_sid,
+                token_sids.group_sids,
+            )),
+            Err(_e) => {
+                // SID extraction failed, return PID-only credentials.
+                // TODO: Add logging once iceoryx2_bb_log is available in PAL crate.
+                // This would help diagnose issues like:
+                // - Insufficient privileges for impersonation
+                // - Token access failures
+                // - Invalid SID structures
+                // For now, the failure is silent and we fall back to PID-only credentials.
+                Ok(PipeProcessCredentials::new(pid))
+            }
+        }
     }
 
     /// Writes data to the pipe (blocking).
@@ -897,7 +988,11 @@ impl NamedPipeConnection {
     ///
     /// The use of `std::time::Instant` and `std::thread::sleep` is acceptable because
     /// the PAL crate enables std on Windows platforms.
-    pub fn timed_read(&self, buffer: &mut [u8], timeout: Duration) -> Result<usize, NamedPipeError> {
+    pub fn timed_read(
+        &self,
+        buffer: &mut [u8],
+        timeout: Duration,
+    ) -> Result<usize, NamedPipeError> {
         use std::time::Instant;
 
         let deadline = Instant::now() + timeout;
@@ -1016,7 +1111,11 @@ impl NamedPipeConnection {
         Err(NamedPipeError::UnknownError(0))
     }
 
-    pub fn timed_read(&self, _buffer: &mut [u8], _timeout: Duration) -> Result<usize, NamedPipeError> {
+    pub fn timed_read(
+        &self,
+        _buffer: &mut [u8],
+        _timeout: Duration,
+    ) -> Result<usize, NamedPipeError> {
         Err(NamedPipeError::UnknownError(0))
     }
 
@@ -1071,9 +1170,26 @@ mod tests {
     #[test]
     fn test_pipe_process_credentials_new() {
         let creds = PipeProcessCredentials::new(1234);
-        assert_eq!(creds.pid, 1234);
-        assert_eq!(creds.uid, 0);
-        assert_eq!(creds.gid, 0);
+        assert_eq!(creds.pid(), 1234);
+        assert_eq!(creds.uid(), 0);
+        assert_eq!(creds.gid(), 0);
+        assert!(creds.user_sid().is_none());
+        assert!(creds.group_sids().is_none());
+    }
+
+    #[test]
+    fn test_pipe_process_credentials_with_sids() {
+        use super::security_descriptor::Sid;
+
+        let user_sid = Sid::everyone();
+        let group_sids = vec![Sid::local_system()];
+
+        let creds = PipeProcessCredentials::with_sids(1234, user_sid.clone(), group_sids.clone());
+        assert_eq!(creds.pid(), 1234);
+        assert_eq!(creds.uid(), 0);
+        assert_eq!(creds.gid(), 0);
+        assert_eq!(creds.user_sid(), Some(&user_sid));
+        assert_eq!(creds.group_sids(), Some(group_sids.as_slice()));
     }
 
     #[test]
@@ -1082,10 +1198,7 @@ mod tests {
             format!("{}", NamedPipeError::NameTooLong),
             "Pipe name exceeds maximum length"
         );
-        assert_eq!(
-            format!("{}", NamedPipeError::AccessDenied),
-            "Access denied"
-        );
+        assert_eq!(format!("{}", NamedPipeError::AccessDenied), "Access denied");
         assert_eq!(
             format!("{}", NamedPipeError::UnknownError(42)),
             "Unknown error (code: 42)"
@@ -1169,9 +1282,11 @@ mod tests {
     #[test]
     fn test_pipe_process_credentials_new() {
         let creds = PipeProcessCredentials::new(1234);
-        assert_eq!(creds.pid, 1234);
-        assert_eq!(creds.uid, 0);
-        assert_eq!(creds.gid, 0);
+        assert_eq!(creds.pid(), 1234);
+        assert_eq!(creds.uid(), 0);
+        assert_eq!(creds.gid(), 0);
+        assert!(creds.user_sid().is_none());
+        assert!(creds.group_sids().is_none());
     }
 
     #[test]

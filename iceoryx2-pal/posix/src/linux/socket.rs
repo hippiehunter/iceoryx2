@@ -102,10 +102,6 @@ pub unsafe fn listen(socket: int, backlog: int) -> int {
     crate::internal::listen(socket, backlog)
 }
 
-pub unsafe fn accept(
-    socket: int,
-    address: *mut sockaddr,
-    address_len: *mut socklen_t,
-) -> int {
+pub unsafe fn accept(socket: int, address: *mut sockaddr, address_len: *mut socklen_t) -> int {
     crate::internal::accept(socket, address, address_len)
 }

@@ -48,22 +48,18 @@ use core::hash::Hash;
 // Windows API imports
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, BOOL, FALSE, HANDLE, INVALID_HANDLE_VALUE,
-    ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+    CloseHandle, GetLastError, BOOL, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_PARAMETER, FALSE, HANDLE, INVALID_HANDLE_VALUE,
 };
 
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
-};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::DuplicateHandle;
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{
-    DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS,
-};
+use windows_sys::Win32::Foundation::{DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS};
 
 // ============================================================================
 // Error Types
@@ -632,8 +628,8 @@ mod tests {
 
         #[test]
         fn test_duplicate_handle_local_with_event() {
-            use windows_sys::Win32::System::Threading::CreateEventW;
             use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::CreateEventW;
 
             // SAFETY: CreateEventW with NULL parameters creates a manual-reset event
             let event = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
@@ -658,8 +654,8 @@ mod tests {
 
         #[test]
         fn test_duplicate_to_current_process() {
-            use windows_sys::Win32::System::Threading::CreateEventW;
             use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::CreateEventW;
 
             let event = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
             assert!(event != 0, "Failed to create event");
@@ -689,8 +685,8 @@ mod tests {
 
         #[test]
         fn test_duplicate_to_nonexistent_process() {
-            use windows_sys::Win32::System::Threading::CreateEventW;
             use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::CreateEventW;
 
             let event = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
             assert!(event != 0, "Failed to create event");

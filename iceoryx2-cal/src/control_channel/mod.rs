@@ -298,8 +298,10 @@ pub trait ControlChannelConnection: Debug + Sized {
     fn send_handles(&self, handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError>;
 
     /// Tries to send platform handles without blocking.
-    fn try_send_handles(&self, handles: &[&PlatformHandle])
-        -> Result<bool, ControlChannelSendError>;
+    fn try_send_handles(
+        &self,
+        handles: &[&PlatformHandle],
+    ) -> Result<bool, ControlChannelSendError>;
 
     /// Receives platform handles (file descriptors) from the peer.
     ///
@@ -319,9 +321,7 @@ pub trait ControlChannelConnection: Debug + Sized {
     ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError>;
 
     /// Blocks until platform handles are received.
-    fn blocking_receive_handles(
-        &self,
-    ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError>;
+    fn blocking_receive_handles(&self) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError>;
 
     /// Sends raw bytes to the peer.
     fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError>;
@@ -348,8 +348,10 @@ pub trait ControlChannelClient: Debug + NamedConcept + Sized {
     fn send_handles(&self, handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError>;
 
     /// Tries to send platform handles without blocking.
-    fn try_send_handles(&self, handles: &[&PlatformHandle])
-        -> Result<bool, ControlChannelSendError>;
+    fn try_send_handles(
+        &self,
+        handles: &[&PlatformHandle],
+    ) -> Result<bool, ControlChannelSendError>;
 
     /// Receives platform handles (file descriptors) from the server.
     fn receive_handles(&self) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError>;
@@ -366,9 +368,7 @@ pub trait ControlChannelClient: Debug + NamedConcept + Sized {
     ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError>;
 
     /// Blocks until platform handles are received.
-    fn blocking_receive_handles(
-        &self,
-    ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError>;
+    fn blocking_receive_handles(&self) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError>;
 
     /// Sends raw bytes to the server.
     fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError>;

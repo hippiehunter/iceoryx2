@@ -15,6 +15,8 @@
 //! This module provides [`ProcessCredentials`], which represents the identity of a process
 //! including its process ID (PID), user ID (UID), and group ID (GID).
 
+extern crate alloc;
+
 use core::fmt::Debug;
 
 /// Process credentials containing identity information.
@@ -23,26 +25,52 @@ use core::fmt::Debug;
 /// - `uid`: The user ID of the process owner
 /// - `gid`: The group ID of the process owner
 /// - `start_time` (Unix only): Optional process start time for PID reuse detection
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// - `user_sid` (Windows only): Optional user Security Identifier (SID)
+/// - `group_sids` (Windows only): Optional group SIDs the user belongs to
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ProcessCredentials {
     pid: u32,
     uid: u32,
     gid: u32,
     #[cfg(unix)]
     start_time: Option<u64>,
+    #[cfg(windows)]
+    user_sid: Option<alloc::vec::Vec<u8>>,
+    #[cfg(windows)]
+    group_sids: Option<alloc::vec::Vec<alloc::vec::Vec<u8>>>,
 }
 
 impl ProcessCredentials {
     /// Creates new [`ProcessCredentials`] from the specified values.
+    #[cfg(unix)]
     #[inline]
     pub const fn new(pid: u32, uid: u32, gid: u32) -> Self {
         Self {
             pid,
             uid,
             gid,
-            #[cfg(unix)]
             start_time: None,
         }
+    }
+
+    /// Creates new [`ProcessCredentials`] from the specified values.
+    #[cfg(windows)]
+    #[inline]
+    pub fn new(pid: u32, uid: u32, gid: u32) -> Self {
+        Self {
+            pid,
+            uid,
+            gid,
+            user_sid: None,
+            group_sids: None,
+        }
+    }
+
+    /// Creates new [`ProcessCredentials`] from the specified values.
+    #[cfg(not(any(unix, windows)))]
+    #[inline]
+    pub const fn new(pid: u32, uid: u32, gid: u32) -> Self {
+        Self { pid, uid, gid }
     }
 
     /// Creates new [`ProcessCredentials`] with a start time for PID reuse detection.
@@ -57,7 +85,30 @@ impl ProcessCredentials {
         }
     }
 
+    /// Creates new [`ProcessCredentials`] with Windows SIDs.
+    ///
+    /// # Arguments
+    /// * `pid` - Process ID
+    /// * `user_sid` - The user's Security Identifier in binary form
+    /// * `group_sids` - The group SIDs the user belongs to, each in binary form
+    #[cfg(windows)]
+    #[inline]
+    pub fn with_sids(
+        pid: u32,
+        user_sid: alloc::vec::Vec<u8>,
+        group_sids: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    ) -> Self {
+        Self {
+            pid,
+            uid: 0,
+            gid: 0,
+            user_sid: Some(user_sid),
+            group_sids: Some(group_sids),
+        }
+    }
+
     /// Creates [`ProcessCredentials`] for the current process.
+    #[cfg(unix)]
     #[inline]
     pub fn from_self() -> Self {
         use iceoryx2_bb_posix::process::Process;
@@ -80,9 +131,60 @@ impl ProcessCredentials {
             pid,
             uid,
             gid,
-            #[cfg(unix)]
             start_time: None,
         }
+    }
+
+    /// Creates [`ProcessCredentials`] for the current process.
+    #[cfg(windows)]
+    #[inline]
+    pub fn from_self() -> Self {
+        use iceoryx2_bb_posix::process::Process;
+        use iceoryx2_bb_posix::user::User;
+
+        let process = Process::from_self();
+        let pid = process.id().value() as u32;
+
+        // Get uid and gid from user - fallback to 0 if unavailable
+        let (uid, gid) = match User::from_self() {
+            Ok(user) => {
+                let uid = user.uid().value();
+                let gid = user.details().map(|d| d.gid().value()).unwrap_or(0);
+                (uid, gid)
+            }
+            Err(_) => (0, 0),
+        };
+
+        Self {
+            pid,
+            uid,
+            gid,
+            user_sid: None,
+            group_sids: None,
+        }
+    }
+
+    /// Creates [`ProcessCredentials`] for the current process.
+    #[cfg(not(any(unix, windows)))]
+    #[inline]
+    pub fn from_self() -> Self {
+        use iceoryx2_bb_posix::process::Process;
+        use iceoryx2_bb_posix::user::User;
+
+        let process = Process::from_self();
+        let pid = process.id().value() as u32;
+
+        // Get uid and gid from user - fallback to 0 if unavailable
+        let (uid, gid) = match User::from_self() {
+            Ok(user) => {
+                let uid = user.uid().value();
+                let gid = user.details().map(|d| d.gid().value()).unwrap_or(0);
+                (uid, gid)
+            }
+            Err(_) => (0, 0),
+        };
+
+        Self { pid, uid, gid }
     }
 
     /// Creates [`ProcessCredentials`] for the current process with start time.
@@ -181,6 +283,64 @@ impl ProcessCredentials {
         None
     }
 
+    /// Returns the user's Security Identifier (SID) if available.
+    ///
+    /// This is only available on Windows when SIDs were successfully extracted
+    /// from the process token.
+    #[cfg(windows)]
+    #[inline]
+    pub fn user_sid(&self) -> Option<&[u8]> {
+        self.user_sid.as_deref()
+    }
+
+    /// Returns `None` on non-Windows platforms.
+    #[cfg(not(windows))]
+    #[inline]
+    pub fn user_sid(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// Returns the group SIDs if available.
+    ///
+    /// This is only available on Windows when SIDs were successfully extracted
+    /// from the process token.
+    #[cfg(windows)]
+    #[inline]
+    pub fn group_sids(&self) -> Option<&[alloc::vec::Vec<u8>]> {
+        self.group_sids.as_deref()
+    }
+
+    /// Returns `None` on non-Windows platforms.
+    #[cfg(not(windows))]
+    #[inline]
+    pub fn group_sids(&self) -> Option<&[alloc::vec::Vec<u8>]> {
+        None
+    }
+
+    /// Checks if the process is a member of the specified group SID.
+    ///
+    /// # Arguments
+    /// * `group_sid` - The group SID to check membership for (in binary form)
+    ///
+    /// # Returns
+    /// * `true` if the process is a member of the group
+    /// * `false` if the process is not a member or SIDs are not available
+    #[cfg(windows)]
+    #[inline]
+    pub fn is_member_of(&self, group_sid: &[u8]) -> bool {
+        match &self.group_sids {
+            Some(groups) => groups.iter().any(|sid| sid.as_slice() == group_sid),
+            None => false,
+        }
+    }
+
+    /// Always returns `false` on non-Windows platforms.
+    #[cfg(not(windows))]
+    #[inline]
+    pub fn is_member_of(&self, _group_sid: &[u8]) -> bool {
+        false
+    }
+
     /// Checks if this process is likely still the same process.
     #[cfg(unix)]
     pub fn is_same_process(&self) -> bool {
@@ -212,6 +372,12 @@ impl Debug for ProcessCredentials {
         #[cfg(unix)]
         {
             debug_struct.field("start_time", &self.start_time);
+        }
+
+        #[cfg(windows)]
+        {
+            debug_struct.field("user_sid", &self.user_sid.as_ref().map(|s| s.len()));
+            debug_struct.field("group_sids", &self.group_sids.as_ref().map(|g| g.len()));
         }
 
         debug_struct.finish()

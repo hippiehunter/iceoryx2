@@ -533,9 +533,9 @@ pub unsafe fn mprotect(addr: *mut void, len: size_t, prot: int) -> int {
 // Anonymous Memory Mapping for Control Channel
 // ============================================================================
 
+use super::security_descriptor::SecurityDescriptor;
 use core::fmt::{self, Display, Formatter};
 use core::hash::Hash;
-use super::security_descriptor::SecurityDescriptor;
 
 /// Errors that can occur when creating an anonymous memory mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -556,8 +556,8 @@ impl AnonymousMappingError {
     /// Converts a Win32 error code to an [`AnonymousMappingError`].
     pub fn from_win32(error_code: u32) -> Self {
         use windows_sys::Win32::Foundation::{
-            ERROR_ACCESS_DENIED, ERROR_NOT_ENOUGH_MEMORY, ERROR_OUTOFMEMORY,
-            ERROR_NO_SYSTEM_RESOURCES, ERROR_COMMITMENT_LIMIT,
+            ERROR_ACCESS_DENIED, ERROR_COMMITMENT_LIMIT, ERROR_NOT_ENOUGH_MEMORY,
+            ERROR_NO_SYSTEM_RESOURCES, ERROR_OUTOFMEMORY,
         };
 
         match error_code {
@@ -757,7 +757,10 @@ mod anonymous_mapping_tests {
     #[test]
     fn test_create_anonymous_mapping_read_only() {
         let result = create_anonymous_mapping(4096, false, None);
-        assert!(result.is_ok(), "Failed to create read-only anonymous mapping");
+        assert!(
+            result.is_ok(),
+            "Failed to create read-only anonymous mapping"
+        );
 
         let handle = result.unwrap();
         assert!(handle != 0);
@@ -771,7 +774,10 @@ mod anonymous_mapping_tests {
         let sd = SecurityDescriptor::everyone_full_access()
             .expect("Failed to create security descriptor");
         let result = create_anonymous_mapping(4096, true, Some(&sd));
-        assert!(result.is_ok(), "Failed to create anonymous mapping with security");
+        assert!(
+            result.is_ok(),
+            "Failed to create anonymous mapping with security"
+        );
 
         let handle = result.unwrap();
         assert!(handle != 0);
@@ -799,15 +805,7 @@ mod anonymous_mapping_tests {
         let handle = result.unwrap();
 
         // Map a view of the file mapping
-        let view = unsafe {
-            MapViewOfFile(
-                handle,
-                FILE_MAP_ALL_ACCESS,
-                0,
-                0,
-                4096,
-            )
-        };
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, 4096) };
         assert!(view != 0, "Failed to map view of anonymous mapping");
 
         // Write to the mapping to verify it works

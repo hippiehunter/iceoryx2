@@ -17,6 +17,7 @@ pub mod fcntl;
 pub mod handle_passing;
 pub mod mman;
 pub mod named_pipe;
+pub mod process_token;
 pub mod pthread;
 pub mod pwd;
 pub mod resource;

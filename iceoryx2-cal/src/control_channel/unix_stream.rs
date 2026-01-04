@@ -66,7 +66,7 @@ use crate::static_storage::file::{
 
 use super::{
     ControlChannel, ControlChannelAcceptError, ControlChannelClient, ControlChannelClientBuilder,
-    ControlChannelConnection, ControlChannelConnectError, ControlChannelCredentialsError,
+    ControlChannelConnectError, ControlChannelConnection, ControlChannelCredentialsError,
     ControlChannelListener, ControlChannelListenerBuilder, ControlChannelListenerCreateError,
     ControlChannelReceiveError, ControlChannelSendError,
 };
@@ -394,9 +394,7 @@ impl ControlChannelConnection for Connection {
         timed_receive_handles_impl(&self.inner, timeout)
     }
 
-    fn blocking_receive_handles(
-        &self,
-    ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
+    fn blocking_receive_handles(&self) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
         blocking_receive_handles_impl(&self.inner)
     }
 
@@ -600,9 +598,7 @@ impl ControlChannelClient for Client {
         timed_receive_handles_impl(&self.inner, timeout)
     }
 
-    fn blocking_receive_handles(
-        &self,
-    ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
+    fn blocking_receive_handles(&self) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
         blocking_receive_handles_impl(&self.inner)
     }
 

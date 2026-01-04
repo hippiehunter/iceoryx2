@@ -329,7 +329,11 @@ impl ProcessIdentity {
 
 impl Display for ProcessIdentity {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "ProcessIdentity {{ pid: {}, start_time: {} }}", self.pid, self.start_time)
+        write!(
+            f,
+            "ProcessIdentity {{ pid: {}, start_time: {} }}",
+            self.pid, self.start_time
+        )
     }
 }
 
@@ -444,9 +448,8 @@ impl PidFd {
                 "Unable to open /proc/{}/stat for reading.", pid.value());
         }
 
-        let bytes_read = unsafe {
-            posix::read(fd, buffer.as_mut_ptr() as *mut posix::void, buffer.len())
-        };
+        let bytes_read =
+            unsafe { posix::read(fd, buffer.as_mut_ptr() as *mut posix::void, buffer.len()) };
         unsafe { posix::close(fd) };
 
         // Bounds checking to prevent buffer overflow

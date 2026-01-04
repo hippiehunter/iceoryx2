@@ -574,8 +574,8 @@ mod tests {
 
         #[test]
         fn test_platform_handle_from_event() {
-            use windows_sys::Win32::System::Threading::CreateEventW;
             use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::CreateEventW;
 
             // Create an event to get a valid handle
             let handle = unsafe {
@@ -600,39 +600,22 @@ mod tests {
         fn test_platform_handle_try_clone() {
             use windows_sys::Win32::System::Threading::CreateEventW;
 
-            let handle = unsafe {
-                CreateEventW(
-                    core::ptr::null(),
-                    1,
-                    0,
-                    core::ptr::null(),
-                )
-            };
+            let handle = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
             assert!(handle != 0, "Failed to create event");
 
             let platform_handle = unsafe { PlatformHandle::from_raw_handle(handle as *mut _) };
             let cloned = platform_handle.try_clone().expect("Clone should succeed");
 
             // Both should be valid but different handles
-            assert_ne!(
-                platform_handle.as_raw_handle(),
-                cloned.as_raw_handle()
-            );
+            assert_ne!(platform_handle.as_raw_handle(), cloned.as_raw_handle());
         }
 
         #[test]
         fn test_platform_handle_into_raw_handle() {
-            use windows_sys::Win32::System::Threading::CreateEventW;
             use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::CreateEventW;
 
-            let handle = unsafe {
-                CreateEventW(
-                    core::ptr::null(),
-                    1,
-                    0,
-                    core::ptr::null(),
-                )
-            };
+            let handle = unsafe { CreateEventW(core::ptr::null(), 1, 0, core::ptr::null()) };
             assert!(handle != 0, "Failed to create event");
 
             let platform_handle = unsafe { PlatformHandle::from_raw_handle(handle as *mut _) };

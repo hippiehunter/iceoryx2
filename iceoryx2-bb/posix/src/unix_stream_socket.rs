@@ -666,12 +666,16 @@ impl UnixStreamListener {
 
             // Enable SO_PASSCRED on accepted socket for credential passing
             if posix::POSIX_SUPPORT_UNIX_DATAGRAM_SOCKETS_ANCILLARY_DATA {
-                if let Err(e) = conn_socket.set_socket_option("Enable SO_PASSCRED", &1u32, posix::SO_PASSCRED) {
+                if let Err(e) =
+                    conn_socket.set_socket_option("Enable SO_PASSCRED", &1u32, posix::SO_PASSCRED)
+                {
                     warn!(from self, "Failed to enable SO_PASSCRED on accepted socket: {:?}", e);
                 }
             }
 
-            return Ok(Some(UnixStreamConnection { socket: conn_socket }));
+            return Ok(Some(UnixStreamConnection {
+                socket: conn_socket,
+            }));
         }
 
         let msg = "Unable to accept connection";
@@ -769,7 +773,9 @@ impl UnixStreamClientBuilder {
 
         // Enable SO_PASSCRED for credential passing
         if posix::POSIX_SUPPORT_UNIX_DATAGRAM_SOCKETS_ANCILLARY_DATA {
-            if let Err(e) = socket.set_socket_option("Enable SO_PASSCRED", &1u32, posix::SO_PASSCRED) {
+            if let Err(e) =
+                socket.set_socket_option("Enable SO_PASSCRED", &1u32, posix::SO_PASSCRED)
+            {
                 warn!(from self, "Failed to enable SO_PASSCRED on client socket: {:?}", e);
             }
         }

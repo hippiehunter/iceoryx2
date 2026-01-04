@@ -86,7 +86,7 @@ use crate::static_storage::file::{
 
 use super::{
     ControlChannel, ControlChannelAcceptError, ControlChannelClient, ControlChannelClientBuilder,
-    ControlChannelConnection, ControlChannelConnectError, ControlChannelCredentialsError,
+    ControlChannelConnectError, ControlChannelConnection, ControlChannelCredentialsError,
     ControlChannelListener, ControlChannelListenerBuilder, ControlChannelListenerCreateError,
     ControlChannelReceiveError, ControlChannelSendError,
 };
@@ -311,13 +311,16 @@ impl ControlChannelListener for Listener {
         let mut server = self.inner.borrow_mut();
         match server.try_accept() {
             Ok(Some(mut conn)) => {
-                // Get client PID while we have mutable access to the connection
-                let client_pid = conn
-                    .client_process_id()
+                // Get client credentials including PID and SIDs
+                let creds = conn
+                    .peer_credentials()
                     .map_err(map_pipe_error_to_accept_inner)?;
+                let (user_sid, group_sids) = extract_sids_from_pipe_creds(&creds);
                 Ok(Some(Connection {
                     inner: conn,
-                    client_pid,
+                    client_pid: creds.pid(),
+                    user_sid,
+                    group_sids,
                 }))
             }
             Ok(None) => Ok(None),
@@ -332,13 +335,16 @@ impl ControlChannelListener for Listener {
         let mut server = self.inner.borrow_mut();
         match server.timed_accept(timeout) {
             Ok(Some(mut conn)) => {
-                // Get client PID while we have mutable access to the connection
-                let client_pid = conn
-                    .client_process_id()
+                // Get client credentials including PID and SIDs
+                let creds = conn
+                    .peer_credentials()
                     .map_err(map_pipe_error_to_accept_inner)?;
+                let (user_sid, group_sids) = extract_sids_from_pipe_creds(&creds);
                 Ok(Some(Connection {
                     inner: conn,
-                    client_pid,
+                    client_pid: creds.pid(),
+                    user_sid,
+                    group_sids,
                 }))
             }
             Ok(None) => Ok(None),
@@ -350,14 +356,17 @@ impl ControlChannelListener for Listener {
         let mut server = self.inner.borrow_mut();
         match server.blocking_accept() {
             Ok(mut conn) => {
-                // Get client PID while we have mutable access to the connection
-                let client_pid = conn
-                    .client_process_id()
+                // Get client credentials including PID and SIDs
+                let creds = conn
+                    .peer_credentials()
                     .map_err(map_pipe_error_to_accept_inner)?;
-                trace!(from self, "accepted connection from pid {}", client_pid);
+                let (user_sid, group_sids) = extract_sids_from_pipe_creds(&creds);
+                trace!(from self, "accepted connection from pid {}", creds.pid());
                 Ok(Connection {
                     inner: conn,
-                    client_pid,
+                    client_pid: creds.pid(),
+                    user_sid,
+                    group_sids,
                 })
             }
             Err(e) => map_pipe_error_to_accept(e),
@@ -370,16 +379,38 @@ impl ControlChannelListener for Listener {
 // ============================================================================
 
 /// Server-side connection after accepting a client.
+///
+/// # SID Caching
+///
+/// User and group SIDs are extracted once during connection acceptance and cached
+/// in this struct. This avoids repeated token impersonation calls when `peer_credentials()`
+/// is called multiple times. The SIDs are stored as raw bytes (`Vec<u8>`) to decouple from
+/// the PAL-layer `Sid` type.
+///
+/// If SID extraction fails during acceptance (e.g., due to insufficient privileges),
+/// the connection is still established but `user_sid` and `group_sids` will be `None`.
+/// In this case, `peer_credentials()` returns credentials with PID only.
 #[derive(Debug)]
 pub struct Connection {
     inner: NamedPipeConnection,
     client_pid: u32,
+    /// Cached user SID (as bytes) if available.
+    user_sid: Option<Vec<u8>>,
+    /// Cached group SIDs (as bytes) if available.
+    group_sids: Option<Vec<Vec<u8>>>,
 }
 
 impl ControlChannelConnection for Connection {
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
-        // On Windows, we only have the PID. UID/GID are set to 0.
-        Ok(ProcessCredentials::new(self.client_pid, 0, 0))
+        // On Windows, we have PID and optionally SIDs. UID/GID are set to 0.
+        match (&self.user_sid, &self.group_sids) {
+            (Some(user_sid), Some(group_sids)) => Ok(ProcessCredentials::with_sids(
+                self.client_pid,
+                user_sid.clone(),
+                group_sids.clone(),
+            )),
+            _ => Ok(ProcessCredentials::new(self.client_pid, 0, 0)),
+        }
     }
 
     fn send_handles(&self, handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError> {
@@ -416,9 +447,7 @@ impl ControlChannelConnection for Connection {
         timed_receive_handles_from_pipe(&self.inner, timeout)
     }
 
-    fn blocking_receive_handles(
-        &self,
-    ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
+    fn blocking_receive_handles(&self) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
         blocking_receive_handles_from_pipe(&self.inner)
     }
 
@@ -569,9 +598,7 @@ impl ControlChannelClient for Client {
         timed_receive_handles_from_pipe(&self.inner, timeout)
     }
 
-    fn blocking_receive_handles(
-        &self,
-    ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
+    fn blocking_receive_handles(&self) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
         blocking_receive_handles_from_pipe(&self.inner)
     }
 
@@ -607,6 +634,22 @@ impl ControlChannelClient for Client {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+use iceoryx2_pal_posix::windows::named_pipe::PipeProcessCredentials;
+
+/// Extracts SIDs from PipeProcessCredentials and converts to byte vectors.
+///
+/// Returns a tuple of (user_sid, group_sids) where each is an Option containing
+/// the SID data as bytes.
+fn extract_sids_from_pipe_creds(
+    creds: &PipeProcessCredentials,
+) -> (Option<Vec<u8>>, Option<Vec<Vec<u8>>>) {
+    let user_sid = creds.user_sid().map(|sid| sid.as_bytes().to_vec());
+    let group_sids = creds
+        .group_sids()
+        .map(|sids| sids.iter().map(|sid| sid.as_bytes().to_vec()).collect());
+    (user_sid, group_sids)
+}
 
 /// Builds the full pipe name from the FileName and configuration.
 fn build_pipe_name(name: &FileName, config: &Configuration) -> String {
@@ -808,8 +851,10 @@ fn parse_handle_message(
             buffer[offset + 7],
         ]);
 
-        // SAFETY: The handle was duplicated into our process by the sender.
-        // We now own it and are responsible for closing it.
+        // SAFETY: The handle value was duplicated into our process by the sender
+        // using DuplicateHandle. The sender is trusted (server process) and the
+        // protocol ensures handle values received are valid in our process space.
+        // We now take ownership and are responsible for closing the handle.
         let handle = unsafe { PlatformHandle::from_raw_handle(handle_val as *mut _) };
         handles.push(handle);
     }
@@ -929,7 +974,9 @@ fn map_pipe_error_to_send<T>(e: NamedPipeError) -> Result<T, ControlChannelSendE
         NamedPipeError::NotConnected => Err(ControlChannelSendError::NotConnected),
         NamedPipeError::WouldBlock => Err(ControlChannelSendError::WouldBlock),
         NamedPipeError::AccessDenied => Err(ControlChannelSendError::InsufficientPermissions),
-        NamedPipeError::InsufficientResources => Err(ControlChannelSendError::InsufficientResources),
+        NamedPipeError::InsufficientResources => {
+            Err(ControlChannelSendError::InsufficientResources)
+        }
         _ => Err(ControlChannelSendError::InternalFailure),
     }
 }
@@ -941,7 +988,9 @@ fn map_pipe_error_to_receive<T>(e: NamedPipeError) -> Result<T, ControlChannelRe
         NamedPipeError::Interrupted => Err(ControlChannelReceiveError::Interrupt),
         NamedPipeError::NotConnected => Err(ControlChannelReceiveError::NotConnected),
         NamedPipeError::WouldBlock => Err(ControlChannelReceiveError::WouldBlock),
-        NamedPipeError::InsufficientResources => Err(ControlChannelReceiveError::InsufficientResources),
+        NamedPipeError::InsufficientResources => {
+            Err(ControlChannelReceiveError::InsufficientResources)
+        }
         _ => Err(ControlChannelReceiveError::InternalFailure),
     }
 }

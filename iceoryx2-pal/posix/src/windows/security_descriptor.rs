@@ -61,9 +61,7 @@ use core::hash::Hash;
 
 // Windows API imports
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{
-    GetLastError, FALSE, ERROR_INVALID_PARAMETER,
-};
+use windows_sys::Win32::Foundation::{GetLastError, ERROR_INVALID_PARAMETER, FALSE};
 
 #[cfg(windows)]
 use windows_sys::Win32::Security::Authorization::{
@@ -71,9 +69,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 
 #[cfg(windows)]
-use windows_sys::Win32::Security::{
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-};
+use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Memory::LocalFree;
@@ -623,7 +619,10 @@ mod tests {
         #[test]
         fn test_security_descriptor_owner_only() {
             let result = SecurityDescriptor::owner_only();
-            assert!(result.is_ok(), "Failed to create owner_only security descriptor");
+            assert!(
+                result.is_ok(),
+                "Failed to create owner_only security descriptor"
+            );
             let sd = result.unwrap();
             assert!(!sd.as_ptr().is_null());
         }
@@ -631,7 +630,10 @@ mod tests {
         #[test]
         fn test_security_descriptor_everyone_full_access() {
             let result = SecurityDescriptor::everyone_full_access();
-            assert!(result.is_ok(), "Failed to create everyone_full_access security descriptor");
+            assert!(
+                result.is_ok(),
+                "Failed to create everyone_full_access security descriptor"
+            );
             let sd = result.unwrap();
             assert!(!sd.as_ptr().is_null());
         }
@@ -639,19 +641,28 @@ mod tests {
         #[test]
         fn test_security_descriptor_authenticated_users_read() {
             let result = SecurityDescriptor::authenticated_users_read();
-            assert!(result.is_ok(), "Failed to create authenticated_users_read security descriptor");
+            assert!(
+                result.is_ok(),
+                "Failed to create authenticated_users_read security descriptor"
+            );
         }
 
         #[test]
         fn test_security_descriptor_system_only() {
             let result = SecurityDescriptor::system_only();
-            assert!(result.is_ok(), "Failed to create system_only security descriptor");
+            assert!(
+                result.is_ok(),
+                "Failed to create system_only security descriptor"
+            );
         }
 
         #[test]
         fn test_security_descriptor_from_sddl() {
             let result = SecurityDescriptor::from_sddl(b"D:(A;;GA;;;WD)\0");
-            assert!(result.is_ok(), "Failed to create security descriptor from SDDL");
+            assert!(
+                result.is_ok(),
+                "Failed to create security descriptor from SDDL"
+            );
         }
 
         #[test]
@@ -682,9 +693,7 @@ mod tests {
         #[test]
         fn test_security_descriptor_with_file_mapping() {
             use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-            use windows_sys::Win32::System::Memory::{
-                CreateFileMappingW, PAGE_READWRITE,
-            };
+            use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
 
             let sd = SecurityDescriptor::everyone_full_access().unwrap();
             let attrs = sd.as_security_attributes();
@@ -701,7 +710,10 @@ mod tests {
                 )
             };
 
-            assert!(handle != 0, "Failed to create file mapping with security descriptor");
+            assert!(
+                handle != 0,
+                "Failed to create file mapping with security descriptor"
+            );
 
             // SAFETY: CloseHandle is called with a valid handle
             unsafe { CloseHandle(handle) };
