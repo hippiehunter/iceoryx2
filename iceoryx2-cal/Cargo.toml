@@ -35,6 +35,7 @@ iceoryx2-bb-elementary = { workspace = true }
 iceoryx2-bb-elementary-traits = { workspace = true }
 iceoryx2-bb-memory = { workspace = true }
 iceoryx2-bb-lock-free = { workspace = true }
+iceoryx2-pal-posix = { workspace = true }
 
 lazy_static = { workspace = true }
 postcard = { workspace = true }
@@ -47,3 +48,6 @@ tiny-fn = { workspace = true }
 iceoryx2-bb-testing = { workspace = true }
 iceoryx2-loggers = { workspace = true }
 generic-tests = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

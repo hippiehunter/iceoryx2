@@ -61,6 +61,7 @@ use iceoryx2_bb_memory::bump_allocator::BumpAllocator;
 use iceoryx2_bb_system_types::file_name::*;
 use tiny_fn::tiny_fn;
 
+use crate::security::{AccessRights, HandleBasedOpenError, PlatformHandle};
 use crate::static_storage::file::{NamedConcept, NamedConceptBuilder, NamedConceptMgmt};
 
 tiny_fn! {
@@ -165,6 +166,18 @@ pub trait DynamicStorageBuilder<'builder, T: Send + Sync, D: DynamicStorage<T>>:
     /// removed without corrupting already opened [`DynamicStorage`]s.
     fn create(self, initial_value: T) -> Result<D, DynamicStorageCreateError>;
 
+    /// Initializes a [`DynamicStorage`] from an existing shared memory mapping.
+    ///
+    /// Implementations that do not support this should return
+    /// [`DynamicStorageCreateError::InternalError`].
+    fn init_from_shared_memory(
+        self,
+        _shm: iceoryx2_bb_posix::shared_memory::SharedMemory,
+        _initial_value: T,
+    ) -> Result<D, DynamicStorageCreateError> {
+        Err(DynamicStorageCreateError::InternalError)
+    }
+
     /// Opens a [`DynamicStorage`]. The implementation must ensure that a [`DynamicStorage`]
     /// which is in the midst of creation cannot be opened. If the [`DynamicStorage`] does not
     /// exist or is not initialized it fails.
@@ -172,6 +185,19 @@ pub trait DynamicStorageBuilder<'builder, T: Send + Sync, D: DynamicStorage<T>>:
 
     /// Opens the [`DynamicStorage`] if it exists, otherwise it creates it.
     fn open_or_create(self, initial_value: T) -> Result<D, DynamicStorageOpenOrCreateError>;
+
+    /// Opens a [`DynamicStorage`] from a platform handle with a known total size.
+    ///
+    /// Implementations that do not support handle-based access should return
+    /// [`HandleBasedOpenError::InternalError`].
+    fn open_from_handle(
+        self,
+        _handle: PlatformHandle,
+        _access: AccessRights,
+        _total_size: usize,
+    ) -> Result<D, HandleBasedOpenError> {
+        Err(HandleBasedOpenError::InternalError)
+    }
 }
 
 /// Is being built by the [`DynamicStorageBuilder`]. The [`DynamicStorage`] trait shall provide

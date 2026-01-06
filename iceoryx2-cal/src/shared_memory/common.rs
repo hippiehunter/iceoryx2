@@ -36,6 +36,12 @@ pub mod details {
     use pool_allocator::PoolAllocator;
 
     use super::*;
+    use crate::dynamic_storage::posix_shared_memory::{header_data_from_mapping, header_size};
+    use crate::security::{
+        platform_handle_into_fd, AccessRights, HandleBasedOpenError, PlatformHandle,
+    };
+    use iceoryx2_bb_posix::memory_mapping::{MappingBehavior, MappingPermission, MemoryMappingBuilder};
+    use iceoryx2_bb_posix::shared_memory::SharedMemory as PosixSharedMemory;
 
     fn get_payload_start_address<
         Allocator: ShmAllocator + Debug,
@@ -320,6 +326,205 @@ pub mod details {
                 storage,
                 _phantom: PhantomData,
             })
+        }
+
+        fn open_from_handle(
+            mut self,
+            handle: PlatformHandle,
+            access: AccessRights,
+            config: &Configuration<Allocator, Storage>,
+        ) -> Result<Memory<Allocator, Storage>, HandleBasedOpenError> {
+            let msg = "Unable to open shared memory from handle";
+            self.config = config.clone();
+
+            if !access.can_read() {
+                fail!(from self, with HandleBasedOpenError::InsufficientPermissions,
+                    "{} due to insufficient permissions.", msg);
+            }
+
+            let header_handle = handle
+                .try_clone()
+                .map_err(|_| HandleBasedOpenError::InternalError)?;
+            let header_fd = platform_handle_into_fd(header_handle)?;
+            let header_size = header_size::<AllocatorDetails<Allocator>>();
+
+            let header_mapping = MemoryMappingBuilder::from_file_descriptor(header_fd)
+                .mapping_behavior(MappingBehavior::Shared)
+                .initial_mapping_permission(MappingPermission::Read)
+                .size(header_size)
+                .create()
+                .map_err(|e| map_mapping_error(e, msg))?;
+
+            let details = unsafe {
+                header_data_from_mapping::<AllocatorDetails<Allocator>>(&header_mapping)
+            };
+
+            let total_size = header_size
+                .checked_add(details.mgmt_size)
+                .and_then(|size| size.checked_add(details.payload_size))
+                .ok_or(HandleBasedOpenError::InternalError)?;
+
+            drop(header_mapping);
+
+            let storage = Storage::Builder::new(&self.name)
+                .config(&self.config.dynamic_storage_config)
+                .timeout(self.timeout)
+                .open_from_handle(handle, access, total_size)?;
+
+            if storage.get().allocator_id != Allocator::unique_id() {
+                fail!(from self, with HandleBasedOpenError::WrongAllocatorSelected,
+                    "{} since the shared memory contains an allocator with unique id {} but the selected allocator has the unique id {}.",
+                    msg, storage.get().allocator_id, Allocator::unique_id());
+            }
+
+            let payload_size = storage.get().payload_size;
+            if payload_size < self.size {
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since a memory size of {} was requested but only {} is available.",
+                    msg, self.size, payload_size);
+            }
+
+            Ok(Memory::<Allocator, Storage> {
+                payload_start_address: get_payload_start_address(&storage),
+                name: self.name,
+                storage,
+                _phantom: PhantomData,
+            })
+        }
+
+        fn create_anonymous(
+            self,
+            allocator_config: &Allocator::Configuration,
+        ) -> Result<(Memory<Allocator, Storage>, PlatformHandle), SharedMemoryCreateError> {
+            let msg = "Unable to create anonymous shared memory";
+
+            if self.size == 0 {
+                fail!(from self, with SharedMemoryCreateError::SizeIsZero,
+                    "{} since the size is zero.", msg);
+            }
+
+            let allocator_mgmt_size = Allocator::management_size(self.size, allocator_config);
+            let header_size = header_size::<AllocatorDetails<Allocator>>();
+            let total_size = header_size
+                .checked_add(self.size)
+                .and_then(|size| size.checked_add(allocator_mgmt_size))
+                .ok_or(SharedMemoryCreateError::InternalError)?;
+
+            let full_name = self
+                .config
+                .dynamic_storage_config
+                .path_for(&self.name)
+                .file_name();
+
+            #[cfg(unix)]
+            let (fd, handle) = {
+                use iceoryx2_bb_posix::anonymous_memory::{AccessMode, AnonymousMemoryBuilder};
+                let anon = AnonymousMemoryBuilder::new()
+                    .name(core::str::from_utf8(full_name.as_bytes()).unwrap_or("iox2_shm"))
+                    .size(total_size)
+                    .access_mode(AccessMode::ReadWrite)
+                    .create()
+                    .map_err(|e| map_anonymous_error(e, msg))?;
+
+                let fd = anon.into_file_descriptor();
+                let raw_fd = unsafe { iceoryx2_pal_posix::posix::dup(fd.native_handle()) };
+                if raw_fd < 0 {
+                    fail!(from self, with SharedMemoryCreateError::InternalError,
+                        "{} since the handle could not be duplicated.", msg);
+                }
+
+                let handle = unsafe { PlatformHandle::from_raw_fd(raw_fd) };
+                (fd, handle)
+            };
+
+            #[cfg(windows)]
+            let (fd, handle) = {
+                use iceoryx2_pal_posix::windows::mman::create_anonymous_mapping;
+
+                let raw_handle = create_anonymous_mapping(total_size, true, None)
+                    .map_err(|_| SharedMemoryCreateError::InternalError)? as *mut _;
+                let handle = unsafe { PlatformHandle::from_raw_handle(raw_handle) };
+                let mapping_handle = handle
+                    .try_clone()
+                    .map_err(|_| SharedMemoryCreateError::InternalError)?;
+                let fd = platform_handle_into_fd(mapping_handle)
+                    .map_err(|_| SharedMemoryCreateError::InternalError)?;
+                (fd, handle)
+            };
+
+            let shm = PosixSharedMemory::from_file_descriptor(
+                &full_name,
+                fd,
+                total_size,
+                iceoryx2_bb_posix::shared_memory::AccessMode::ReadWrite,
+                self.has_ownership,
+            )
+            .map_err(|_| SharedMemoryCreateError::InternalError)?;
+
+            let storage_builder = Storage::Builder::new(&self.name)
+                .config(&self.config.dynamic_storage_config)
+                .supplementary_size(self.size + allocator_mgmt_size)
+                .has_ownership(self.has_ownership)
+                .initializer(|details, init_allocator| {
+                    self.initialize(allocator_config, details, init_allocator)
+                });
+
+            let storage = storage_builder
+                .init_from_shared_memory(
+                    shm,
+                    AllocatorDetails {
+                        allocator_id: Allocator::unique_id(),
+                        allocator: MaybeUninit::uninit(),
+                        mgmt_size: allocator_mgmt_size,
+                        payload_size: self.size,
+                        payload_start_offset: 0,
+                    },
+                )
+                .map_err(|_| SharedMemoryCreateError::InternalError)?;
+
+            Ok((
+                Memory::<Allocator, Storage> {
+                    payload_start_address: get_payload_start_address(&storage),
+                    name: self.name,
+                    storage,
+                    _phantom: PhantomData,
+                },
+                handle,
+            ))
+        }
+    }
+
+    fn map_mapping_error(
+        error: iceoryx2_bb_posix::memory_mapping::MemoryMappingCreationError,
+        msg: &str,
+    ) -> HandleBasedOpenError {
+        use iceoryx2_bb_posix::memory_mapping::MemoryMappingCreationError::*;
+
+        match error {
+            InsufficientPermissions => HandleBasedOpenError::InsufficientPermissions,
+            MappingLargerThanCorrespondingFile | MappingSizeIsZero => HandleBasedOpenError::SizeMismatch,
+            FileDescriptorDoesNotSupportMemoryMappings => HandleBasedOpenError::InvalidHandle,
+            _ => {
+                let _ = msg;
+                HandleBasedOpenError::MappingFailed
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn map_anonymous_error(
+        error: iceoryx2_bb_posix::anonymous_memory::AnonymousMemoryCreationError,
+        msg: &str,
+    ) -> SharedMemoryCreateError {
+        use iceoryx2_bb_posix::anonymous_memory::AnonymousMemoryCreationError::*;
+
+        match error {
+            SizeIsZero => SharedMemoryCreateError::SizeIsZero,
+            InsufficientPermissions => SharedMemoryCreateError::InsufficientPermissions,
+            _ => {
+                let _ = msg;
+                SharedMemoryCreateError::InternalError
+            }
         }
     }
 

@@ -13,12 +13,15 @@
 extern crate iceoryx2_loggers;
 
 mod shared_memory_posix_shared_memory_tests {
+    use core::alloc::Layout;
     use core::time::Duration;
     use iceoryx2_bb_posix::creation_mode::CreationMode;
     use iceoryx2_bb_posix::permission::Permission;
     use iceoryx2_bb_testing::assert_that;
     use iceoryx2_cal::named_concept::*;
+    use iceoryx2_cal::security::AccessRights;
     use iceoryx2_cal::shared_memory::*;
+    use iceoryx2_cal::shm_allocator::pool_allocator;
     use iceoryx2_cal::shm_allocator::pool_allocator::PoolAllocator;
     use iceoryx2_cal::testing::generate_name;
 
@@ -48,5 +51,32 @@ mod shared_memory_posix_shared_memory_tests {
         assert_that!(sut, is_err);
         assert_that!(sut.err().unwrap(), eq SharedMemoryOpenError::InitializationNotYetFinalized);
         assert_that!(start.elapsed().unwrap(), ge TIMEOUT);
+    }
+
+    #[test]
+    fn create_anonymous_and_open_from_handle_works() {
+        type Sut = iceoryx2_cal::shared_memory::posix::Memory<PoolAllocator>;
+        let storage_name = generate_name();
+        let allocator_config = pool_allocator::Config {
+            bucket_layout: Layout::new::<u64>(),
+        };
+
+        let (creator, handle) = <Sut as SharedMemory<PoolAllocator>>::Builder::new(&storage_name)
+            .size(1024)
+            .create_anonymous(&allocator_config)
+            .unwrap();
+
+        unsafe {
+            (creator.payload_start_address() as *mut u64).write(0xDEAD_BEEF);
+        }
+
+        let config = <Sut as NamedConceptMgmt>::Configuration::default();
+        let opened = <Sut as SharedMemory<PoolAllocator>>::Builder::new(&storage_name)
+            .size(1024)
+            .open_from_handle(handle, AccessRights::read_only(), &config)
+            .unwrap();
+
+        let value = unsafe { *(opened.payload_start_address() as *const u64) };
+        assert_that!(value, eq 0xDEAD_BEEF);
     }
 }

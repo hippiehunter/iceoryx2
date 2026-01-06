@@ -19,27 +19,32 @@
 
 use core::fmt::Debug;
 
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 use std::os::unix::io::FromRawFd;
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 use std::os::unix::io::IntoRawFd;
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 use std::os::unix::io::OwnedFd;
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 use std::os::unix::io::RawFd;
 
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 use std::os::windows::io::AsRawHandle;
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 use std::os::windows::io::FromRawHandle;
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 use std::os::windows::io::IntoRawHandle;
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 use std::os::windows::io::OwnedHandle;
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 use std::os::windows::io::RawHandle;
+
+#[cfg(all(not(feature = "std"), unix))]
+type RawFd = iceoryx2_pal_posix::posix::int;
+#[cfg(all(not(feature = "std"), windows))]
+type RawHandle = *mut core::ffi::c_void;
 
 use crate::shm_allocator::SegmentId;
 
@@ -71,6 +76,7 @@ use super::error::HandleError;
 /// // Clone the handle (duplicates the underlying resource)
 /// let cloned = handle.try_clone().expect("Failed to clone handle");
 /// ```
+#[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct PlatformHandle {
     #[cfg(unix)]
@@ -79,8 +85,17 @@ pub struct PlatformHandle {
     inner: OwnedHandle,
 }
 
+#[cfg(not(feature = "std"))]
+#[derive(Debug)]
+pub struct PlatformHandle {
+    #[cfg(unix)]
+    raw_fd: RawFd,
+    #[cfg(windows)]
+    raw_handle: RawHandle,
+}
+
 // Unix implementation
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 impl PlatformHandle {
     /// Creates a [`PlatformHandle`] from a raw file descriptor.
     ///
@@ -135,7 +150,7 @@ impl PlatformHandle {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 impl AsRawFd for PlatformHandle {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
@@ -143,7 +158,7 @@ impl AsRawFd for PlatformHandle {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 impl IntoRawFd for PlatformHandle {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
@@ -151,7 +166,7 @@ impl IntoRawFd for PlatformHandle {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 impl FromRawFd for PlatformHandle {
     /// Creates a [`PlatformHandle`] from a raw file descriptor.
     ///
@@ -168,7 +183,7 @@ impl FromRawFd for PlatformHandle {
 // PlatformHandle - Windows Implementation
 // ============================================================================
 
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 impl PlatformHandle {
     /// Creates a [`PlatformHandle`] from a raw Windows handle.
     ///
@@ -224,7 +239,7 @@ impl PlatformHandle {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 impl AsRawHandle for PlatformHandle {
     #[inline]
     fn as_raw_handle(&self) -> RawHandle {
@@ -232,7 +247,7 @@ impl AsRawHandle for PlatformHandle {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 impl IntoRawHandle for PlatformHandle {
     #[inline]
     fn into_raw_handle(self) -> RawHandle {
@@ -240,7 +255,7 @@ impl IntoRawHandle for PlatformHandle {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(feature = "std", windows))]
 impl FromRawHandle for PlatformHandle {
     /// Creates a [`PlatformHandle`] from a raw Windows handle.
     ///
@@ -250,6 +265,92 @@ impl FromRawHandle for PlatformHandle {
     #[inline]
     unsafe fn from_raw_handle(handle: RawHandle) -> Self {
         Self::from_raw_handle(handle)
+    }
+}
+
+// ============================================================================
+// PlatformHandle - no_std Placeholder
+// ============================================================================
+
+#[cfg(all(not(feature = "std"), unix))]
+impl PlatformHandle {
+    /// Creates a [`PlatformHandle`] from a raw file descriptor.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that `fd` is a valid, open file descriptor.
+    /// - The caller must transfer ownership of the file descriptor to this [`PlatformHandle`].
+    #[inline]
+    pub unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        Self { raw_fd: fd }
+    }
+
+    /// Duplicates the handle by calling `dup()`.
+    pub fn try_clone(&self) -> Result<Self, HandleError> {
+        let fd = unsafe { iceoryx2_pal_posix::posix::dup(self.raw_fd) };
+        if fd < 0 {
+            return Err(HandleError::DuplicationFailed);
+        }
+
+        Ok(Self { raw_fd: fd })
+    }
+
+    /// Returns the raw file descriptor without transferring ownership.
+    #[inline]
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.raw_fd
+    }
+
+    /// Consumes the [`PlatformHandle`] and returns the raw file descriptor.
+    #[inline]
+    pub fn into_raw_fd(self) -> RawFd {
+        let fd = self.raw_fd;
+        core::mem::forget(self);
+        fd
+    }
+}
+
+#[cfg(all(not(feature = "std"), unix))]
+impl Drop for PlatformHandle {
+    fn drop(&mut self) {
+        if self.raw_fd >= 0 {
+            unsafe {
+                iceoryx2_pal_posix::posix::close(self.raw_fd);
+            }
+        }
+    }
+}
+
+#[cfg(all(not(feature = "std"), windows))]
+impl PlatformHandle {
+    /// Creates a [`PlatformHandle`] from a raw Windows handle.
+    ///
+    /// # Safety
+    ///
+    /// - The caller must ensure that `handle` is a valid, open Windows handle.
+    /// - The caller must transfer ownership of the handle to this [`PlatformHandle`].
+    #[inline]
+    pub unsafe fn from_raw_handle(handle: RawHandle) -> Self {
+        Self { raw_handle: handle }
+    }
+
+    /// Placeholder implementation that does not duplicate the handle.
+    pub fn try_clone(&self) -> Result<Self, HandleError> {
+        Err(HandleError::DuplicationFailed)
+    }
+
+    /// Returns the raw Windows handle without transferring ownership.
+    #[inline]
+    pub fn as_raw_handle(&self) -> RawHandle {
+        self.raw_handle
+    }
+
+    /// Consumes the [`PlatformHandle`] and returns the raw Windows handle.
+    #[inline]
+    pub fn into_raw_handle(self) -> RawHandle {
+        let handle = self.raw_handle;
+        core::mem::forget(self);
+        handle
     }
 }
 
@@ -444,7 +545,7 @@ impl HandleBundle {
 // Tests
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

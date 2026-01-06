@@ -40,11 +40,12 @@ use crate::shared_memory::{
 };
 use crate::shm_allocator::pool_allocator::PoolAllocator;
 use crate::shm_allocator::ShmAllocationError;
+use crate::security::{AccessRights, PlatformHandle};
 
 use super::{
     NamedConcept, NamedConceptBuilder, NamedConceptDoesExistError, NamedConceptListError,
     NamedConceptMgmt, NamedConceptRemoveError, ResizableSharedMemory, ResizableSharedMemoryBuilder,
-    ResizableSharedMemoryForPoolAllocator, ResizableSharedMemoryView,
+    ResizableSharedMemoryError, ResizableSharedMemoryForPoolAllocator, ResizableSharedMemoryView,
     ResizableSharedMemoryViewBuilder, ResizableShmAllocationError,
 };
 
@@ -89,6 +90,7 @@ struct InternalState<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> {
 struct ShmEntry<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> {
     shm: Shm,
     chunk_count: AtomicU64,
+    pinned: bool,
     _data: PhantomData<Allocator>,
 }
 
@@ -103,8 +105,22 @@ impl<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> ShmEntry<Allocator, 
         Self {
             shm,
             chunk_count: AtomicU64::new(0),
+            pinned: false,
             _data: PhantomData,
         }
+    }
+
+    fn new_pinned(shm: Shm) -> Self {
+        Self {
+            shm,
+            chunk_count: AtomicU64::new(0),
+            pinned: true,
+            _data: PhantomData,
+        }
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.pinned
     }
 
     fn register_offset(&self) {
@@ -323,7 +339,7 @@ where
 
         let old_key = SlotMapKey::new(old_idx);
         if let Some(shm) = shared_memory_map.get(old_key) {
-            if shm.chunk_count.load(Ordering::Relaxed) == 0 {
+            if shm.chunk_count.load(Ordering::Relaxed) == 0 && !shm.is_pinned() {
                 shared_memory_map.remove(old_key);
             }
         }
@@ -380,6 +396,7 @@ where
                 let state = entry.unregister_offset();
                 if state == ShmEntryState::Empty
                     && self.current_idx.load(Ordering::Relaxed) != key.value()
+                    && !entry.is_pinned()
                 {
                     shared_memory_map.remove(key);
                 }
@@ -394,6 +411,76 @@ where
     fn number_of_active_segments(&self) -> usize {
         let shared_memory_map = unsafe { &mut *self.shared_memory_map.get() };
         shared_memory_map.len()
+    }
+
+    fn add_segment_from_handle(
+        &mut self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        access: AccessRights,
+    ) -> Result<(), ResizableSharedMemoryError> {
+        let msg = "Unable to add shared memory segment from handle";
+        let key = SlotMapKey::new(segment_id.value() as usize);
+        let shared_memory_map = unsafe { &mut *self.shared_memory_map.get() };
+
+        if shared_memory_map.contains(key) {
+            fail!(from self, with ResizableSharedMemoryError::SegmentAlreadyExists,
+                "{} since the segment id {:?} is already mapped.", msg, segment_id);
+        }
+
+        let shm = DynamicMemory::<Allocator, Shm>::segment_builder(
+            &self.view_config.base_name,
+            &self.view_config.shm,
+            segment_id,
+        )
+        .has_ownership(false)
+        .timeout(self.view_config.shm_builder_timeout)
+        .open_from_handle(handle, access, &self.view_config.shm)
+        .map_err(ResizableSharedMemoryError::from)?;
+
+        if !shared_memory_map.insert_at(key, ShmEntry::new_pinned(shm)) {
+            fail!(from self, with ResizableSharedMemoryError::InvalidSegmentId,
+                "{} since the segment id {:?} is out of range.", msg, segment_id);
+        }
+
+        Self::release_old_unused_segments(
+            shared_memory_map,
+            self.current_idx.swap(key.value(), Ordering::Relaxed),
+        );
+
+        Ok(())
+    }
+
+    fn retire_segment(&mut self, segment_id: SegmentId) -> Result<(), ResizableSharedMemoryError> {
+        let msg = "Unable to retire shared memory segment";
+        let key = SlotMapKey::new(segment_id.value() as usize);
+        let shared_memory_map = unsafe { &mut *self.shared_memory_map.get() };
+
+        if key.value() >= shared_memory_map.capacity() {
+            fail!(from self, with ResizableSharedMemoryError::InvalidSegmentId,
+                "{} since the segment id {:?} is out of range.", msg, segment_id);
+        }
+
+        let entry = match shared_memory_map.get(key) {
+            Some(entry) => entry,
+            None => {
+                fail!(from self, with ResizableSharedMemoryError::SegmentDoesNotExist,
+                    "{} since the segment id {:?} is not mapped.", msg, segment_id);
+            }
+        };
+
+        if entry.chunk_count.load(Ordering::Relaxed) != 0 {
+            fail!(from self, with ResizableSharedMemoryError::SegmentInUse,
+                "{} since the segment id {:?} is still in use.", msg, segment_id);
+        }
+
+        shared_memory_map.remove(key);
+
+        if self.current_idx.load(Ordering::Relaxed) == key.value() {
+            self.current_idx.store(INVALID_KEY, Ordering::Relaxed);
+        }
+
+        Ok(())
     }
 }
 

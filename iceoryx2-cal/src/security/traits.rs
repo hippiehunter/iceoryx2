@@ -17,7 +17,7 @@
 
 use core::fmt::Debug;
 
-use super::handle::PlatformHandle;
+use super::handle::{AccessRights, PlatformHandle};
 
 /// A resource that can be opened from a platform handle.
 ///
@@ -31,11 +31,12 @@ pub trait HandleBasedConcept: Debug + Sized {
     /// Error type returned when opening from a handle fails.
     type OpenError: Debug;
 
-    /// Opens the resource from a platform handle.
+    /// Opens the resource from a platform handle with explicit access rights.
     ///
     /// Takes ownership of the handle and attempts to construct the resource.
     fn open_from_handle(
         handle: PlatformHandle,
+        access: AccessRights,
         config: &Self::Configuration,
     ) -> Result<Self, Self::OpenError>;
 }
@@ -45,10 +46,10 @@ pub trait HandleBasedConcept: Debug + Sized {
 /// Provides a fluent interface for opening resources from handles,
 /// following the same pattern as [`crate::named_concept::NamedConceptBuilder`].
 pub trait HandleBasedConceptBuilder<T: HandleBasedConcept>: Sized {
-    /// Creates a new builder from a platform handle.
+    /// Creates a new builder from a platform handle with explicit access rights.
     ///
     /// Takes ownership of the handle.
-    fn from_handle(handle: PlatformHandle) -> Self;
+    fn from_handle(handle: PlatformHandle, access: AccessRights) -> Self;
 
     /// Sets the configuration for opening the resource.
     fn config(self, config: &T::Configuration) -> Self;

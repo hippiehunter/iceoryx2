@@ -31,14 +31,18 @@
 //! - [`HandleError`] - Errors that can occur during handle operations
 //! - [`HandleBasedOpenError`] - Errors when opening resources from handles
 
+#[cfg(feature = "std")]
 pub mod credentials;
 pub mod error;
 pub mod handle;
+mod handle_fd;
 pub mod mode;
 pub mod traits;
 
+#[cfg(feature = "std")]
 pub use credentials::*;
 pub use error::*;
 pub use handle::*;
+pub(crate) use handle_fd::platform_handle_into_fd;
 pub use mode::*;
 pub use traits::*;

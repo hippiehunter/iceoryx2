@@ -60,6 +60,7 @@ use iceoryx2_bb_elementary::package_version::PackageVersion;
 use iceoryx2_bb_posix::adaptive_wait::AdaptiveWaitBuilder;
 use iceoryx2_bb_posix::directory::*;
 use iceoryx2_bb_posix::file_descriptor::FileDescriptorManagement;
+use iceoryx2_bb_posix::memory_mapping::MemoryMapping;
 use iceoryx2_bb_posix::shared_memory::*;
 use iceoryx2_bb_system_types::path::Path;
 use iceoryx2_log::fail;
@@ -117,6 +118,16 @@ struct Data<T: Send + Sync + Debug> {
     version: AtomicU64,
     call_drop_on_destruction: bool,
     data: T,
+}
+
+pub(crate) fn header_size<T: Send + Sync + Debug>() -> usize {
+    core::mem::size_of::<Data<T>>()
+}
+
+pub(crate) unsafe fn header_data_from_mapping<T: Send + Sync + Debug>(
+    mapping: &MemoryMapping,
+) -> &T {
+    &(*(mapping.base_address() as *const Data<T>)).data
 }
 
 impl<T: Send + Sync + Debug> Default for Configuration<T> {
@@ -228,6 +239,19 @@ impl<T: Send + Sync + Debug> Builder<'_, T> {
                                     "{} since the adaptive wait call failed.", msg);
         };
 
+        self.open_with_shm(shm)
+    }
+
+    pub(crate) fn open_with_shm(
+        &self,
+        shm: SharedMemory,
+    ) -> Result<Storage<T>, DynamicStorageOpenError> {
+        let msg = "Failed to open posix_shared_memory::DynamicStorage";
+        let mut wait_for_read_write_access = fail!(from self, when AdaptiveWaitBuilder::new().create(),
+                                    with DynamicStorageOpenError::InternalError,
+                                    "{} since the AdaptiveWait could not be initialized.", msg);
+        let mut elapsed_time = Duration::ZERO;
+
         let init_state = shm.base_address().as_ptr() as *const Data<T>;
 
         loop {
@@ -301,7 +325,7 @@ impl<T: Send + Sync + Debug> Builder<'_, T> {
         Ok(shm)
     }
 
-    fn init_impl(
+    pub(crate) fn init_impl(
         &mut self,
         mut shm: SharedMemory,
         initial_value: T,
@@ -398,6 +422,14 @@ impl<'builder, T: Send + Sync + Debug> DynamicStorageBuilder<'builder, T, Storag
         self.init_impl(shm, initial_value)
     }
 
+    fn init_from_shared_memory(
+        mut self,
+        shm: iceoryx2_bb_posix::shared_memory::SharedMemory,
+        initial_value: T,
+    ) -> Result<Storage<T>, DynamicStorageCreateError> {
+        self.init_impl(shm, initial_value)
+    }
+
     fn open(self) -> Result<Storage<T>, DynamicStorageOpenError> {
         self.open_impl()
     }
@@ -417,6 +449,71 @@ impl<'builder, T: Send + Sync + Debug> DynamicStorageBuilder<'builder, T, Storag
                     Err(e) => return Err(e.into()),
                 },
                 Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    fn open_from_handle(
+        self,
+        handle: crate::security::PlatformHandle,
+        access: crate::security::AccessRights,
+        total_size: usize,
+    ) -> Result<Storage<T>, crate::security::HandleBasedOpenError> {
+        use crate::security::{platform_handle_into_fd, HandleBasedOpenError};
+
+        let msg = "Failed to open posix_shared_memory::DynamicStorage from handle";
+        if total_size == 0 {
+            fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                "{} since the total size is zero.", msg);
+        }
+
+        if !access.can_read() {
+            fail!(from self, with HandleBasedOpenError::InsufficientPermissions,
+                "{} due to insufficient permissions.", msg);
+        }
+
+        let full_name = self.config.path_for(&self.storage_name).file_name();
+        let fd = platform_handle_into_fd(handle)?;
+        let access_mode = if access.can_write() {
+            AccessMode::ReadWrite
+        } else {
+            AccessMode::Read
+        };
+
+        let shm = match SharedMemory::from_file_descriptor(
+            &full_name,
+            fd,
+            total_size,
+            access_mode,
+            false,
+        ) {
+            Ok(shm) => shm,
+            Err(SharedMemoryCreationError::InsufficientPermissions) => {
+                fail!(from self, with HandleBasedOpenError::InsufficientPermissions,
+                    "{} due to insufficient permissions.", msg);
+            }
+            Err(SharedMemoryCreationError::UnsupportedSizeOfZero)
+            | Err(SharedMemoryCreationError::SizeDoesNotFit) => {
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} due to a size mismatch.", msg);
+            }
+            Err(_) => {
+                fail!(from self, with HandleBasedOpenError::MappingFailed,
+                    "{} since the memory mapping failed.", msg);
+            }
+        };
+
+        match self.open_with_shm(shm) {
+            Ok(storage) => Ok(storage),
+            Err(DynamicStorageOpenError::InitializationNotYetFinalized)
+            | Err(DynamicStorageOpenError::VersionMismatch)
+            | Err(DynamicStorageOpenError::InternalError) => {
+                fail!(from self, with HandleBasedOpenError::InternalError,
+                    "{} due to an internal error while validating the storage.", msg);
+            }
+            Err(DynamicStorageOpenError::DoesNotExist) => {
+                fail!(from self, with HandleBasedOpenError::InvalidHandle,
+                    "{} since the underlying shared memory does not exist.", msg);
             }
         }
     }

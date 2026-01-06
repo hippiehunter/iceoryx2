@@ -223,6 +223,7 @@ impl SharedMemoryBuilder {
         let shm = SharedMemory {
             name: self.name,
             has_ownership: AtomicBool::new(false),
+            cleanup_on_drop: true,
             memory_lock: None,
             memory_mapping,
             mapping_offset: self.mapping_offset,
@@ -338,6 +339,7 @@ impl SharedMemoryCreationBuilder {
             let shm = SharedMemory {
                 name: self.config.name,
                 has_ownership: AtomicBool::new(self.config.has_ownership),
+                cleanup_on_drop: true,
                 memory_lock: None,
                 memory_mapping,
                 mapping_offset: self.config.mapping_offset,
@@ -363,6 +365,7 @@ impl SharedMemoryCreationBuilder {
         let mut shm = SharedMemory {
             name: self.config.name,
             has_ownership: AtomicBool::new(self.config.has_ownership),
+            cleanup_on_drop: true,
             memory_lock: None,
             memory_mapping,
             mapping_offset: self.config.mapping_offset,
@@ -412,6 +415,7 @@ impl SharedMemoryCreationBuilder {
 pub struct SharedMemory {
     name: FileName,
     has_ownership: AtomicBool,
+    cleanup_on_drop: bool,
     memory_mapping: MemoryMapping,
     memory_lock: Option<MemoryLock>,
     mapping_offset: isize,
@@ -419,7 +423,7 @@ pub struct SharedMemory {
 
 impl Drop for SharedMemory {
     fn drop(&mut self) {
-        if self.has_ownership() {
+        if self.has_ownership() && self.cleanup_on_drop {
             match self.set_permission(Permission::OWNER_ALL) {
                 Ok(()) => match Self::shm_unlink(&self.name) {
                     Ok(_) => {
@@ -511,6 +515,71 @@ impl SharedMemory {
     /// returns the name of the shared memory
     pub fn name(&self) -> &FileName {
         &self.name
+    }
+
+    /// Creates a shared memory mapping from an existing file descriptor.
+    ///
+    /// This is intended for handle-based workflows (e.g., memfd or anonymous mappings)
+    /// where the shared memory object is not opened by name.
+    pub fn from_file_descriptor(
+        name: &FileName,
+        file_descriptor: FileDescriptor,
+        size: usize,
+        access_mode: AccessMode,
+        has_ownership: bool,
+    ) -> Result<Self, SharedMemoryCreationError> {
+        let msg = "Unable to map shared memory from file descriptor";
+
+        if size == 0 {
+            fail!(from "SharedMemory::from_file_descriptor", with SharedMemoryCreationError::UnsupportedSizeOfZero,
+                "{} since size is zero.", msg);
+        }
+
+        let memory_mapping = match MemoryMappingBuilder::from_file_descriptor(file_descriptor)
+            .mapping_behavior(MappingBehavior::Shared)
+            .initial_mapping_permission(access_mode.into())
+            .size(size)
+            .create()
+        {
+            Ok(mapping) => mapping,
+            Err(MemoryMappingCreationError::InsufficientPermissions) => {
+                fail!(from "SharedMemory::from_file_descriptor", with SharedMemoryCreationError::InsufficientPermissions,
+                    "{} due to insufficient permissions.", msg);
+            }
+            Err(MemoryMappingCreationError::MappingLargerThanCorrespondingFile) => {
+                fail!(from "SharedMemory::from_file_descriptor", with SharedMemoryCreationError::SizeDoesNotFit,
+                    "{} since the mapping size exceeds the underlying object.", msg);
+            }
+            Err(MemoryMappingCreationError::MappingSizeIsZero) => {
+                fail!(from "SharedMemory::from_file_descriptor", with SharedMemoryCreationError::UnsupportedSizeOfZero,
+                    "{} since the mapping size is zero.", msg);
+            }
+            Err(MemoryMappingCreationError::ExceedsTheMaximumNumberOfMappedRegions) => {
+                fail!(from "SharedMemory::from_file_descriptor", with SharedMemoryCreationError::MappedRegionLimitReached,
+                    "{} since the maximum number of mapped regions was reached.", msg);
+            }
+            Err(MemoryMappingCreationError::PerProcessFileHandleLimitReached) => {
+                fail!(from "SharedMemory::from_file_descriptor", with SharedMemoryCreationError::PerProcessFileHandleLimitReached,
+                    "{} since the per-process file handle limit was reached.", msg);
+            }
+            Err(MemoryMappingCreationError::SystemWideFileHandleLimitReached) => {
+                fail!(from "SharedMemory::from_file_descriptor", with SharedMemoryCreationError::SystemWideFileHandleLimitReached,
+                    "{} since the system-wide file handle limit was reached.", msg);
+            }
+            Err(e) => {
+                fail!(from "SharedMemory::from_file_descriptor", with SharedMemoryCreationError::UnknownError(0),
+                    "{} due to an internal error ({:?}).", msg, e);
+            }
+        };
+
+        Ok(SharedMemory {
+            name: *name,
+            has_ownership: AtomicBool::new(has_ownership),
+            cleanup_on_drop: false,
+            memory_mapping,
+            memory_lock: None,
+            mapping_offset: 0,
+        })
     }
 
     /// returns the base address of the shared memory. The base address is always aligned to the

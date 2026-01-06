@@ -98,10 +98,12 @@ use core::time::Duration;
 use iceoryx2_bb_elementary::enum_gen;
 
 use crate::named_concept::*;
+use crate::security::HandleBasedOpenError;
 use crate::shared_memory::{
     SegmentId, SharedMemory, SharedMemoryCreateError, SharedMemoryOpenError, ShmPointer,
 };
 use crate::shm_allocator::{PointerOffset, ShmAllocationError, ShmAllocator};
+use crate::security::{AccessRights, PlatformHandle};
 
 enum_gen! {
 /// Defines all erros that can occur when calling [`ResizableSharedMemory::allocate()`]
@@ -125,6 +127,32 @@ impl core::fmt::Display for ResizableShmAllocationError {
 }
 
 impl core::error::Error for ResizableShmAllocationError {}
+
+/// Errors that can occur when managing handle-based segments in a
+/// [`ResizableSharedMemoryView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResizableSharedMemoryError {
+    SegmentAlreadyExists,
+    SegmentDoesNotExist,
+    SegmentInUse,
+    InvalidSegmentId,
+    OpenError(HandleBasedOpenError),
+    InternalError,
+}
+
+impl core::fmt::Display for ResizableSharedMemoryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ResizableSharedMemoryError::{self:?}")
+    }
+}
+
+impl core::error::Error for ResizableSharedMemoryError {}
+
+impl From<HandleBasedOpenError> for ResizableSharedMemoryError {
+    fn from(error: HandleBasedOpenError) -> Self {
+        ResizableSharedMemoryError::OpenError(error)
+    }
+}
 
 /// Creates a [`ResizableSharedMemoryView`] to an existing [`ResizableSharedMemory`] and maps the
 /// [`ResizableSharedMemory`] read-only into the process space.
@@ -204,6 +232,18 @@ pub trait ResizableSharedMemoryView<Allocator: ShmAllocator, Shm: SharedMemory<A
 
     /// Returns the number of active [`SharedMemory`] segments.
     fn number_of_active_segments(&self) -> usize;
+
+    /// Adds a new [`SharedMemory`] segment from a handle received via IAM with the provided
+    /// access rights.
+    fn add_segment_from_handle(
+        &mut self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        access: AccessRights,
+    ) -> Result<(), ResizableSharedMemoryError>;
+
+    /// Retires a segment after IAM confirmed it can be released.
+    fn retire_segment(&mut self, segment_id: SegmentId) -> Result<(), ResizableSharedMemoryError>;
 }
 
 /// The [`ResizableSharedMemory`] can be only owned by exactly one process that is allowed to

@@ -47,7 +47,7 @@ use crate::posix::{
     constants::*,
     shm_set_size,
     types::*,
-    win32_handle_translator::{FdHandleEntry, FileHandle},
+    win32_handle_translator::{FdHandleEntry, FileHandle, ShmHandle},
     Errno, MemZeroedStruct,
 };
 
@@ -158,6 +158,23 @@ impl MemZeroedStruct for WSAPROTOCOL_INFOA {}
 
 pub unsafe fn dup(fildes: int) -> int {
     match HandleTranslator::get_instance().get(fildes) {
+        Some(FdHandleEntry::SharedMemory(handle)) => {
+            let mut duplicate: HANDLE = 0;
+            win32call! { DuplicateHandle(GetCurrentProcess(), handle.handle.handle, GetCurrentProcess(), &mut duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)};
+
+            let mut duplicate_state: HANDLE = INVALID_HANDLE_VALUE;
+            if handle.state_handle != INVALID_HANDLE_VALUE {
+                win32call! { DuplicateHandle(GetCurrentProcess(), handle.state_handle, GetCurrentProcess(), &mut duplicate_state, 0, FALSE, DUPLICATE_SAME_ACCESS)};
+            }
+
+            HandleTranslator::get_instance().add(FdHandleEntry::SharedMemory(ShmHandle {
+                handle: FileHandle {
+                    handle: duplicate,
+                    lock_state: handle.handle.lock_state,
+                },
+                state_handle: duplicate_state,
+            }))
+        }
         Some(FdHandleEntry::Socket(handle)) => {
             let mut protocol_info = WSAPROTOCOL_INFOA::new_zeroed();
             let (result, _) = win32call! { winsock WSADuplicateSocketA(handle.fd, GetCurrentProcessId(), &mut protocol_info) };
@@ -196,7 +213,9 @@ pub unsafe fn close(fd: int) -> int {
         Some(FdHandleEntry::SharedMemory(handle)) => {
             HandleTranslator::get_instance().remove(fd);
             win32call! { CloseHandle(handle.handle.handle)};
-            win32call! { CloseHandle(handle.state_handle)};
+            if handle.state_handle != INVALID_HANDLE_VALUE {
+                win32call! { CloseHandle(handle.state_handle)};
+            }
             0
         }
         Some(FdHandleEntry::File(handle)) => {
