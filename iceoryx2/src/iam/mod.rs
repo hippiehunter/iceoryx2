@@ -82,6 +82,9 @@ pub mod segment_manager;
 pub mod server;
 pub mod session;
 
+#[cfg(test)]
+mod tests;
+
 // Re-export error types
 pub use error::{IamClientError, IamServerError};
 
