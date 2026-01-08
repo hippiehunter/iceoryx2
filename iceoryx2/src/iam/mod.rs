@@ -53,10 +53,16 @@
 //! ```
 
 pub mod error;
+pub mod policy;
 pub mod protocol;
 
 // Re-export error types
 pub use error::{IamClientError, IamServerError};
+
+// Re-export policy types
+pub use policy::{
+    DefaultPolicy, IamPolicy, PolicyDecision, ResourceLimits, MAX_REASONABLE_SEGMENT_SIZE,
+};
 
 // Re-export protocol types
 pub use protocol::{
