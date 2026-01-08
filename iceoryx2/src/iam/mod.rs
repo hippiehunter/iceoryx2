@@ -74,6 +74,7 @@
 //! assert!(client_version.is_compatible_with(&server_version));
 //! ```
 
+pub mod client;
 pub mod error;
 pub mod policy;
 pub mod protocol;
@@ -104,3 +105,6 @@ pub use server::{ControlChannelConnection, ControlChannelListener, IamServer};
 
 // Re-export session types
 pub use session::{ClientSession, PortInfo, SessionResourceUsage};
+
+// Re-export client types
+pub use client::{ClientControlChannelConnection, IamClient};
