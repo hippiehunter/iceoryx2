@@ -12,7 +12,7 @@
 
 //! Identity and Access Management (IAM) for secured iceoryx2 services.
 //!
-//! This module provides the protocol and error types for IAM client-server
+//! This module provides the complete IAM implementation for client-server
 //! communication in secured inter-process communication scenarios.
 //!
 //! # Overview
@@ -20,6 +20,19 @@
 //! The IAM system provides:
 //! - **Protocol types**: Message formats for client-server communication
 //! - **Error types**: Error handling for server and client operations
+//! - **Policy types**: Authorization decisions and resource limits
+//! - **Session management**: Client session tracking and resource accounting
+//! - **Segment management**: Shared memory segment lifecycle
+//! - **Server core**: The IAM server implementation
+//!
+//! # Architecture
+//!
+//! The IAM system follows a client-server model where:
+//! 1. Clients connect to the IAM server via a control channel
+//! 2. Clients authenticate via the Hello handshake
+//! 3. Clients request operations (create service, attach, add segment, etc.)
+//! 4. The server evaluates policy and enforces cumulative resource limits
+//! 5. The server grants access by passing handles to clients
 //!
 //! # Protocol
 //!
@@ -34,6 +47,15 @@
 //!
 //! - [`IamServerError`]: Errors that can occur in server operations
 //! - [`IamClientError`]: Errors that can occur in client operations
+//!
+//! # Server
+//!
+//! The [`IamServer`] is the central coordinator that:
+//! - Accepts client connections
+//! - Manages client sessions with [`ClientSession`]
+//! - Enforces policy decisions via [`IamPolicy`]
+//! - Tracks cumulative resource usage per session
+//! - Manages segment lifecycle with [`SegmentManager`]
 //!
 //! # Example
 //!
@@ -55,6 +77,9 @@
 pub mod error;
 pub mod policy;
 pub mod protocol;
+pub mod segment_manager;
+pub mod server;
+pub mod session;
 
 // Re-export error types
 pub use error::{IamClientError, IamServerError};
@@ -70,3 +95,12 @@ pub use protocol::{
     ProtocolVersion, SegmentInfo, SessionId, INVALID_SESSION_ID,
     MAX_ERROR_MESSAGE_LENGTH, MAX_HANDLES_PER_MESSAGE, MAX_SEGMENTS_PER_ATTACH,
 };
+
+// Re-export segment manager types
+pub use segment_manager::{ManagedSegment, SegmentManager};
+
+// Re-export server types
+pub use server::{ControlChannelConnection, ControlChannelListener, IamServer};
+
+// Re-export session types
+pub use session::{ClientSession, PortInfo, SessionResourceUsage};

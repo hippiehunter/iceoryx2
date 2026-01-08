@@ -57,6 +57,9 @@ pub enum IamServerError {
     /// A resource limit has been exceeded.
     ResourceLimitExceeded,
 
+    /// Invalid segment size (zero or exceeds maximum).
+    InvalidSegmentSize,
+
     /// An internal error occurred.
     InternalError,
 }
