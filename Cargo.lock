@@ -1300,6 +1300,7 @@ dependencies = [
  "iceoryx2-pal-configuration",
  "iceoryx2-pal-posix",
  "iceoryx2-pal-testing",
+ "postcard",
  "serde",
  "tiny-fn",
  "toml 0.9.8",

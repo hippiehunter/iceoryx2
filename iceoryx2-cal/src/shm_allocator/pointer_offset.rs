@@ -12,10 +12,12 @@
 
 use core::fmt::Debug;
 
+use serde::{Deserialize, Serialize};
+
 pub type SegmentIdUnderlyingType = u8;
 
 /// Defines the [`SegmentId`] of a [`SharedMemory`](crate::shared_memory::SharedMemory)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentId(SegmentIdUnderlyingType);
 
 impl SegmentId {

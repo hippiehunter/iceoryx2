@@ -517,6 +517,9 @@ pub mod constants;
 /// Handles iceoryx2s global configuration
 pub mod config;
 
+/// Identity and Access Management (IAM) for secured services
+pub mod iam;
+
 /// Central instance that owns all service entities and can handle incoming event in an event loop
 pub mod node;
 

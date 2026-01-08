@@ -19,6 +19,8 @@
 
 use core::fmt::Debug;
 
+use serde::{Deserialize, Serialize};
+
 #[cfg(all(feature = "std", unix))]
 use std::os::unix::io::AsRawFd;
 #[cfg(all(feature = "std", unix))]
@@ -378,7 +380,7 @@ impl PlatformHandle {
 /// assert!(read_write.read);
 /// assert!(read_write.write);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccessRights {
     /// Whether read access is granted.
     pub read: bool,
@@ -607,7 +609,6 @@ mod tests {
     #[cfg(unix)]
     mod unix_tests {
         use super::*;
-        use std::os::unix::io::AsRawFd;
 
         #[test]
         fn test_platform_handle_from_pipe() {

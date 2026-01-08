@@ -57,3 +57,4 @@ tiny-fn = { workspace = true }
 iceoryx2-loggers = { workspace = true }
 iceoryx2-bb-testing = { workspace = true }
 iceoryx2-pal-testing = { workspace = true }
+postcard = { workspace = true }
