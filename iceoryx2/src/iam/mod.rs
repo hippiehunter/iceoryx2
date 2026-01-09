@@ -81,6 +81,7 @@ pub mod protocol;
 pub mod segment_manager;
 pub mod server;
 pub mod session;
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -104,10 +105,10 @@ pub use protocol::{
 pub use segment_manager::{ManagedSegment, SegmentManager};
 
 // Re-export server types
-pub use server::{ControlChannelConnection, ControlChannelListener, IamServer};
+pub use server::IamServer;
 
 // Re-export session types
 pub use session::{ClientSession, PortInfo, SessionResourceUsage};
 
 // Re-export client types
-pub use client::{ClientControlChannelConnection, IamClient};
+pub use client::IamClient;

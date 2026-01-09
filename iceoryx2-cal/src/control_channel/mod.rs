@@ -260,9 +260,9 @@ pub trait ControlChannelClientBuilder<C: ControlChannel>: NamedConceptBuilder<C>
 /// Server-side listener that accepts incoming connections.
 ///
 /// Created by [`ControlChannelListenerBuilder::create()`].
-pub trait ControlChannelListener: Debug + NamedConcept + Sized {
+pub trait ControlChannelListener: Debug + NamedConcept + Sized + Send {
     /// The connection type returned by accept operations.
-    type Connection: ControlChannelConnection;
+    type Connection: ControlChannelConnection + Send;
 
     /// Tries to accept a connection without blocking.
     ///
@@ -284,7 +284,7 @@ pub trait ControlChannelListener: Debug + NamedConcept + Sized {
 /// Server-side connection after accepting a client.
 ///
 /// Provides access to peer credentials and can send/receive handles.
-pub trait ControlChannelConnection: Debug + Sized {
+pub trait ControlChannelConnection: Debug + Sized + Send {
     /// Returns the credentials of the connected peer.
     ///
     /// Uses SO_PEERCRED to get the peer's pid, uid, and gid. This is
@@ -340,7 +340,7 @@ pub trait ControlChannelConnection: Debug + Sized {
 ///
 /// Provides the same capabilities as [`ControlChannelConnection`] but
 /// from the client's perspective.
-pub trait ControlChannelClient: Debug + NamedConcept + Sized {
+pub trait ControlChannelClient: Debug + NamedConcept + Sized + Send {
     /// Returns the credentials of the connected peer (the server).
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError>;
 
@@ -389,11 +389,11 @@ pub trait ControlChannelClient: Debug + NamedConcept + Sized {
 /// client, and their respective builders.
 pub trait ControlChannel: Sized + Debug + NamedConceptMgmt {
     /// The listener type for accepting connections.
-    type Listener: ControlChannelListener;
+    type Listener: ControlChannelListener + 'static;
     /// The connection type for accepted connections.
-    type Connection: ControlChannelConnection;
+    type Connection: ControlChannelConnection + 'static;
     /// The client type for connecting to listeners.
-    type Client: ControlChannelClient;
+    type Client: ControlChannelClient + 'static;
     /// The builder for creating listeners.
     type ListenerBuilder: ControlChannelListenerBuilder<Self>;
     /// The builder for creating clients.

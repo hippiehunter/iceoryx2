@@ -75,6 +75,8 @@ pub enum iox2_pub_sub_open_or_create_error_e {
     O_EXCEEDS_MAX_NUMBER_OF_NODES,
     #[CStr = "is marked for destruction"]
     O_IS_MARKED_FOR_DESTRUCTION,
+    #[CStr = "incompatible security mode"]
+    O_INCOMPATIBLE_SECURITY_MODE,
     #[CStr = "service in corrupted state"]
     C_SERVICE_IN_CORRUPTED_STATE,
     #[CStr = "subscriber buffer must be larger than history size"]
@@ -91,6 +93,12 @@ pub enum iox2_pub_sub_open_or_create_error_e {
     C_OLD_CONNECTION_STILL_ACTIVE,
     #[CStr = "hangs in creation"]
     C_HANGS_IN_CREATION,
+    #[CStr = "IAM server creation failed"]
+    C_IAM_SERVER_CREATION_FAILED,
+    #[CStr = "IAM connection failed"]
+    O_IAM_CONNECTION_FAILED,
+    #[CStr = "IAM handshake failed"]
+    O_IAM_HANDSHAKE_FAILED,
     #[CStr = "same service is created and removed repeatedly"]
     SYSTEM_IN_FLUX,
 }
@@ -147,6 +155,15 @@ impl IntoCInt for PublishSubscribeOpenError {
          PublishSubscribeOpenError::IsMarkedForDestruction => {
              iox2_pub_sub_open_or_create_error_e::O_IS_MARKED_FOR_DESTRUCTION
          }
+         PublishSubscribeOpenError::IncompatibleSecurityMode => {
+             iox2_pub_sub_open_or_create_error_e::O_INCOMPATIBLE_SECURITY_MODE
+         }
+         PublishSubscribeOpenError::IamConnectionFailed => {
+             iox2_pub_sub_open_or_create_error_e::O_IAM_CONNECTION_FAILED
+         }
+         PublishSubscribeOpenError::IamHandshakeFailed => {
+             iox2_pub_sub_open_or_create_error_e::O_IAM_HANDSHAKE_FAILED
+         }
         }) as c_int
     }
 }
@@ -172,6 +189,9 @@ impl IntoCInt for PublishSubscribeCreateError {
             }
          PublishSubscribeCreateError::HangsInCreation => {
              iox2_pub_sub_open_or_create_error_e::C_HANGS_IN_CREATION
+         }
+         PublishSubscribeCreateError::IamServerCreationFailed => {
+             iox2_pub_sub_open_or_create_error_e::C_IAM_SERVER_CREATION_FAILED
          }
         }) as c_int
     }

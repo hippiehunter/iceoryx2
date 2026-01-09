@@ -72,6 +72,8 @@ pub enum iox2_blackboard_open_error_e {
     O_EXCEEDS_MAX_NUMBER_OF_NODES,
     #[CStr = "does not support requested amount of nodes"]
     O_DOES_NOT_SUPPORT_REQUESTED_AMOUNT_OF_NODES,
+    #[CStr = "incompatible security mode"]
+    O_INCOMPATIBLE_SECURITY_MODE,
 }
 
 #[repr(C)]
@@ -129,6 +131,9 @@ impl IntoCInt for BlackboardOpenError {
             }
             BlackboardOpenError::DoesNotSupportRequestedAmountOfNodes => {
                 iox2_blackboard_open_error_e::O_DOES_NOT_SUPPORT_REQUESTED_AMOUNT_OF_NODES
+            }
+            BlackboardOpenError::IncompatibleSecurityMode => {
+                iox2_blackboard_open_error_e::O_INCOMPATIBLE_SECURITY_MODE
             }
         }) as c_int
     }

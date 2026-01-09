@@ -36,23 +36,32 @@
 
 #[cfg(test)]
 mod integration_tests {
+    use alloc::collections::VecDeque;
     use alloc::vec::Vec;
+    use core::time::Duration;
     use std::sync::{Arc, Mutex};
 
     use iceoryx2_bb_posix::unique_system_id::UniqueSystemId;
+    use iceoryx2_bb_system_types::file_name::FileName;
+    use iceoryx2_cal::control_channel::{
+        ControlChannelAcceptError, ControlChannelClient as CalClient,
+        ControlChannelConnection as CalConnection, ControlChannelCredentialsError,
+        ControlChannelListener as CalListener, ControlChannelReceiveError, ControlChannelSendError,
+    };
     use iceoryx2_cal::hash::sha1::Sha1;
+    use iceoryx2_cal::named_concept::NamedConcept;
     use iceoryx2_cal::security::credentials::ProcessCredentials;
     use iceoryx2_cal::security::handle::PlatformHandle;
+    use iceoryx2_cal::serialize::{postcard::Postcard, Serialize as CalSerialize};
     use iceoryx2_cal::shm_allocator::SegmentId;
 
-    use crate::iam::client::{ClientControlChannelConnection, IamClient};
-    use crate::iam::error::{IamClientError, IamServerError};
+    use crate::iam::client::IamClient;
     use crate::iam::policy::{DefaultPolicy, IamPolicy, PolicyDecision, ResourceLimits};
     use crate::iam::protocol::{
-        DenialReason, IamNotification, IamRequest, IamResponse, MessagingPatternKind, PortType,
+        DenialReason, IamRequest, IamResponse, MessagingPatternKind, PortType,
         ProtocolVersion,
     };
-    use crate::iam::server::{ControlChannelConnection, ControlChannelListener, IamServer};
+    use crate::iam::server::IamServer;
     use crate::service::messaging_pattern::MessagingPattern;
     use crate::service::service_id::ServiceId;
     use crate::service::service_name::ServiceName;
@@ -61,140 +70,308 @@ mod integration_tests {
     // Mock Channel Infrastructure
     // ========================================================================
 
-    /// Shared message container for passing between client and server.
-    struct SharedMessages {
-        requests: Mutex<Vec<IamRequest>>,
-        responses: Mutex<Vec<IamResponse>>,
-        /// Track number of handles sent (since PlatformHandle doesn't implement Clone)
+    /// Shared raw byte container for passing between client and server.
+    ///
+    /// This is shared between MockServerChannel and MockClientChannel to simulate
+    /// bidirectional communication. Raw bytes are used to match CAL's interface.
+    struct SharedBytes {
+        /// Raw requests (length-framed serialized IamRequest bytes).
+        requests: Mutex<VecDeque<Vec<u8>>>,
+        /// Raw responses (length-framed serialized IamResponse bytes).
+        responses: Mutex<VecDeque<Vec<u8>>>,
+        /// Track number of handles sent (since PlatformHandle doesn't implement Clone).
         handle_count: Mutex<usize>,
+        /// Current offset into the first request entry (for partial reads).
+        request_offset: Mutex<usize>,
+        /// Current offset into the first response entry (for partial reads).
+        response_offset: Mutex<usize>,
     }
 
-    impl SharedMessages {
+    impl SharedBytes {
         fn new() -> Self {
             Self {
-                requests: Mutex::new(Vec::new()),
-                responses: Mutex::new(Vec::new()),
+                requests: Mutex::new(VecDeque::new()),
+                responses: Mutex::new(VecDeque::new()),
                 handle_count: Mutex::new(0),
+                request_offset: Mutex::new(0),
+                response_offset: Mutex::new(0),
             }
+        }
+
+        /// Queues a typed request to be received by the server.
+        fn push_request(&self, request: &IamRequest) {
+            let payload = Postcard::serialize(request).unwrap();
+            let len = payload.len() as u32;
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&len.to_le_bytes());
+            framed.extend_from_slice(&payload);
+            self.requests.lock().unwrap().push_back(framed);
+        }
+
+        /// Reads all typed responses that have been sent by the server.
+        fn get_responses(&self) -> Vec<IamResponse> {
+            self.responses
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|data| {
+                    if data.len() < 4 {
+                        return None;
+                    }
+                    Postcard::deserialize(&data[4..]).ok()
+                })
+                .collect()
+        }
+
+        /// Clears all responses (for tests that need to check multiple rounds).
+        fn clear_responses(&self) {
+            self.responses.lock().unwrap().clear();
+            *self.response_offset.lock().unwrap() = 0;
         }
     }
 
-    /// Mock channel for the server side.
+    /// Mock channel for the server side that implements CAL's ControlChannelConnection.
     ///
     /// Receives requests from the client and sends responses back.
     struct MockServerChannel {
         credentials: ProcessCredentials,
         /// Shared with client for message passing.
-        shared: Arc<SharedMessages>,
-        /// Closed flag (kept for potential future use in disconnect tests)
-        #[allow(dead_code)]
-        closed: Mutex<bool>,
+        shared: Arc<SharedBytes>,
     }
 
     impl MockServerChannel {
-        fn new(credentials: ProcessCredentials, shared: Arc<SharedMessages>) -> Self {
+        fn new(credentials: ProcessCredentials, shared: Arc<SharedBytes>) -> Self {
             Self {
                 credentials,
                 shared,
-                closed: Mutex::new(false),
             }
         }
     }
 
-    impl ControlChannelConnection for MockServerChannel {
-        fn peer_credentials(&self) -> Result<ProcessCredentials, IamServerError> {
+    impl core::fmt::Debug for MockServerChannel {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("MockServerChannel").finish()
+        }
+    }
+
+    impl CalConnection for MockServerChannel {
+        fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
             Ok(self.credentials.clone())
         }
 
-        fn try_receive_request(&self) -> Result<Option<IamRequest>, IamServerError> {
-            let mut requests = self.shared.requests.lock().unwrap();
-            if requests.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(requests.remove(0)))
-            }
-        }
-
-        fn send_response(&self, response: &IamResponse) -> Result<(), IamServerError> {
-            let mut responses = self.shared.responses.lock().unwrap();
-            responses.push(response.clone());
-            Ok(())
-        }
-
-        fn send_notification(&self, _notification: &IamNotification) -> Result<(), IamServerError> {
-            // For integration tests, we don't test notifications yet
-            Ok(())
-        }
-
-        fn send_handles(&self, handles: &[PlatformHandle]) -> Result<(), IamServerError> {
-            // In a real implementation, handles would be passed via SCM_RIGHTS or DuplicateHandle.
-            // For testing, we just track the count since we don't actually need the handles.
+        fn send_handles(
+            &self,
+            handles: &[&PlatformHandle],
+        ) -> Result<(), ControlChannelSendError> {
             let mut handle_count = self.shared.handle_count.lock().unwrap();
             *handle_count += handles.len();
             Ok(())
+        }
+
+        fn try_send_handles(
+            &self,
+            handles: &[&PlatformHandle],
+        ) -> Result<bool, ControlChannelSendError> {
+            self.send_handles(handles)?;
+            Ok(true)
+        }
+
+        fn receive_handles(
+            &self,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            Ok(None)
+        }
+
+        fn try_receive_handles(
+            &self,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            Ok(None)
+        }
+
+        fn timed_receive_handles(
+            &self,
+            _timeout: Duration,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            Ok(None)
+        }
+
+        fn blocking_receive_handles(
+            &self,
+        ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
+            Ok(Vec::new())
+        }
+
+        fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError> {
+            // Server sends responses
+            self.shared.responses.lock().unwrap().push_back(data.to_vec());
+            Ok(())
+        }
+
+        fn try_send(&self, data: &[u8]) -> Result<u64, ControlChannelSendError> {
+            self.send(data)?;
+            Ok(data.len() as u64)
+        }
+
+        fn receive(&self, buffer: &mut [u8]) -> Result<u64, ControlChannelReceiveError> {
+            // Server receives requests
+            let mut queue = self.shared.requests.lock().unwrap();
+            let mut offset = self.shared.request_offset.lock().unwrap();
+
+            if queue.is_empty() {
+                return Err(ControlChannelReceiveError::WouldBlock);
+            }
+
+            let front = queue.front().unwrap();
+            let remaining = &front[*offset..];
+            let to_copy = core::cmp::min(remaining.len(), buffer.len());
+            buffer[..to_copy].copy_from_slice(&remaining[..to_copy]);
+
+            if *offset + to_copy >= front.len() {
+                queue.pop_front();
+                *offset = 0;
+            } else {
+                *offset += to_copy;
+            }
+
+            Ok(to_copy as u64)
+        }
+
+        fn try_receive(&self, buffer: &mut [u8]) -> Result<u64, ControlChannelReceiveError> {
+            if self.shared.requests.lock().unwrap().is_empty() {
+                return Ok(0);
+            }
+            self.receive(buffer)
         }
     }
 
     /// Mock channel for the client side.
     ///
-    /// Sends requests to the server and receives responses.
+    /// This is a wrapper that provides access to SharedBytes for tests that
+    /// want to directly manipulate the request/response queues.
     struct MockClientChannel {
         /// Shared with server for message passing.
-        /// Public to allow tests to directly inject requests/read responses.
-        pub shared: Arc<SharedMessages>,
-        /// Closed flag
-        closed: Mutex<bool>,
+        pub shared: Arc<SharedBytes>,
     }
 
     impl MockClientChannel {
-        fn new(shared: Arc<SharedMessages>) -> Self {
-            Self {
-                shared,
-                closed: Mutex::new(false),
-            }
+        fn new(shared: Arc<SharedBytes>) -> Self {
+            Self { shared }
         }
     }
 
-    impl ClientControlChannelConnection for MockClientChannel {
-        fn send_request(&self, request: &IamRequest) -> Result<(), IamClientError> {
-            let mut requests = self.shared.requests.lock().unwrap();
-            requests.push(request.clone());
+    impl core::fmt::Debug for MockClientChannel {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("MockClientChannel").finish()
+        }
+    }
+
+    impl NamedConcept for MockClientChannel {
+        fn name(&self) -> &FileName {
+            static NAME: FileName = unsafe { FileName::new_unchecked_const(b"mock_client") };
+            &NAME
+        }
+    }
+
+    impl CalClient for MockClientChannel {
+        fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
+            // Return some default credentials for the "server"
+            Ok(ProcessCredentials::new(9999, 0, 0))
+        }
+
+        fn send_handles(
+            &self,
+            _handles: &[&PlatformHandle],
+        ) -> Result<(), ControlChannelSendError> {
             Ok(())
         }
 
-        fn receive_response(&self) -> Result<IamResponse, IamClientError> {
-            // In a real implementation, this would block until a response is available
-            // For testing, we expect the server to have already processed and sent a response
-            let mut responses = self.shared.responses.lock().unwrap();
-            if responses.is_empty() {
-                Err(IamClientError::ReceiveFailed)
-            } else {
-                Ok(responses.remove(0))
-            }
+        fn try_send_handles(
+            &self,
+            _handles: &[&PlatformHandle],
+        ) -> Result<bool, ControlChannelSendError> {
+            Ok(true)
         }
 
-        fn receive_handles(&self, count: usize) -> Result<Vec<PlatformHandle>, IamClientError> {
-            // In a real implementation, handles would be received via SCM_RIGHTS or DuplicateHandle.
-            // For testing, we check if enough handles were "sent" and return an empty vec.
-            // The actual handles aren't needed for the integration tests.
+        fn receive_handles(
+            &self,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            // Return handles if any were "sent" by the server
             let mut handle_count = self.shared.handle_count.lock().unwrap();
-            if *handle_count < count {
-                return Err(IamClientError::HandleReceiveFailed);
+            if *handle_count > 0 {
+                *handle_count = 0;
+                // Return empty vec - we can't actually pass handles, but track the count
+                Ok(Some(vec![]))
+            } else {
+                Ok(None)
             }
-            *handle_count -= count;
-            // Return empty vec since we can't actually pass handles in this mock
-            // The tests don't verify handle contents, just the protocol flow
-            Ok(Vec::new())
         }
 
-        fn close(&self) {
-            *self.closed.lock().unwrap() = true;
+        fn try_receive_handles(
+            &self,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            self.receive_handles()
+        }
+
+        fn timed_receive_handles(
+            &self,
+            _timeout: Duration,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            self.receive_handles()
+        }
+
+        fn blocking_receive_handles(
+            &self,
+        ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
+            self.receive_handles()
+                .and_then(|opt| opt.ok_or(ControlChannelReceiveError::IoError))
+        }
+
+        fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError> {
+            // Client sends requests
+            self.shared.requests.lock().unwrap().push_back(data.to_vec());
+            Ok(())
+        }
+
+        fn try_send(&self, data: &[u8]) -> Result<u64, ControlChannelSendError> {
+            self.send(data)?;
+            Ok(data.len() as u64)
+        }
+
+        fn receive(&self, buffer: &mut [u8]) -> Result<u64, ControlChannelReceiveError> {
+            // Client receives responses
+            let mut queue = self.shared.responses.lock().unwrap();
+            let mut offset = self.shared.response_offset.lock().unwrap();
+
+            if queue.is_empty() {
+                return Err(ControlChannelReceiveError::WouldBlock);
+            }
+
+            let front = queue.front().unwrap();
+            let remaining = &front[*offset..];
+            let to_copy = core::cmp::min(remaining.len(), buffer.len());
+            buffer[..to_copy].copy_from_slice(&remaining[..to_copy]);
+
+            if *offset + to_copy >= front.len() {
+                queue.pop_front();
+                *offset = 0;
+            } else {
+                *offset += to_copy;
+            }
+
+            Ok(to_copy as u64)
+        }
+
+        fn try_receive(&self, buffer: &mut [u8]) -> Result<u64, ControlChannelReceiveError> {
+            if self.shared.responses.lock().unwrap().is_empty() {
+                return Ok(0);
+            }
+            self.receive(buffer)
         }
     }
 
     /// Mock listener that produces mock server channels.
     struct MockListener {
-        pending_connections: Mutex<Vec<(ProcessCredentials, Arc<SharedMessages>)>>,
+        pending_connections: Mutex<Vec<(ProcessCredentials, Arc<SharedBytes>)>>,
     }
 
     impl MockListener {
@@ -209,7 +386,7 @@ mod integration_tests {
             &self,
             credentials: ProcessCredentials,
         ) -> MockClientChannel {
-            let shared = Arc::new(SharedMessages::new());
+            let shared = Arc::new(SharedBytes::new());
             let client_channel = MockClientChannel::new(Arc::clone(&shared));
 
             // Queue the server connection for acceptance
@@ -222,10 +399,23 @@ mod integration_tests {
         }
     }
 
-    impl ControlChannelListener for MockListener {
+    impl core::fmt::Debug for MockListener {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("MockListener").finish()
+        }
+    }
+
+    impl NamedConcept for MockListener {
+        fn name(&self) -> &FileName {
+            static NAME: FileName = unsafe { FileName::new_unchecked_const(b"mock_listener") };
+            &NAME
+        }
+    }
+
+    impl CalListener for MockListener {
         type Connection = MockServerChannel;
 
-        fn try_accept(&self) -> Result<Option<Self::Connection>, IamServerError> {
+        fn try_accept(&self) -> Result<Option<Self::Connection>, ControlChannelAcceptError> {
             let mut pending = self.pending_connections.lock().unwrap();
             if pending.is_empty() {
                 Ok(None)
@@ -233,6 +423,18 @@ mod integration_tests {
                 let (credentials, shared) = pending.remove(0);
                 Ok(Some(MockServerChannel::new(credentials, shared)))
             }
+        }
+
+        fn timed_accept(
+            &self,
+            _timeout: Duration,
+        ) -> Result<Option<Self::Connection>, ControlChannelAcceptError> {
+            self.try_accept()
+        }
+
+        fn blocking_accept(&self) -> Result<Self::Connection, ControlChannelAcceptError> {
+            self.try_accept()?
+                .ok_or(ControlChannelAcceptError::WouldBlock)
         }
     }
 
@@ -279,20 +481,17 @@ mod integration_tests {
 
         // Send Hello request through shared messages
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         // Server accepts connection and processes request
         server.process().unwrap(); // Accept connection
         server.process().unwrap(); // Process Hello request
 
         // Check response
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::HelloOk {
                 negotiated_version,
@@ -322,17 +521,14 @@ mod integration_tests {
 
         // Get a reference to the shared messages before the client_channel is consumed
         let shared = Arc::clone(&client_channel.shared);
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(request);
-        }
+        shared.push_request(&request);
 
         // Server accepts and processes
         server.process().unwrap();
         server.process().unwrap();
 
         // Check response
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::Denied { reason, .. } => {
                 assert_eq!(*reason, DenialReason::VersionMismatch);
@@ -354,38 +550,32 @@ mod integration_tests {
 
         // Complete handshake (connections always accepted)
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap(); // Accept connection
         server.process().unwrap(); // Process Hello
 
         // Verify handshake succeeded (connections always allowed)
         {
-            let responses = shared.responses.lock().unwrap();
+            let responses = shared.get_responses();
             assert!(matches!(responses[0], IamResponse::HelloOk { .. }));
         }
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Try to attach publisher - should be DENIED due to UID mismatch
         let service_id = create_test_service_id("test/unauthorized");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 8,
-                max_slice_len: 1024,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 8,
+            max_slice_len: 1024,
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::Denied { reason, .. } => {
                 assert_eq!(*reason, DenialReason::Unauthorized);
@@ -407,36 +597,30 @@ mod integration_tests {
 
         // Complete handshake first
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap(); // Accept
         server.process().unwrap(); // Process Hello
 
         // Clear responses
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Send AttachPublisher request
         let service_id = create_test_service_id("test/publisher");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 8,
-                max_slice_len: 1024,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 8,
+            max_slice_len: 1024,
+        });
 
         // Server processes
         server.process().unwrap();
 
         // Check response
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::AttachOk { port_id, .. } => {
                 assert!(*port_id > 0);
@@ -454,31 +638,25 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Send AttachSubscriber request
         let service_id = create_test_service_id("test/subscriber");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachSubscriber {
-                service_id,
-                buffer_size: 16,
-            });
-        }
+        shared.push_request(&IamRequest::AttachSubscriber {
+            service_id,
+            buffer_size: 16,
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::AttachOk { port_id, .. } => {
                 assert!(*port_id > 0);
@@ -496,31 +674,25 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Send AttachServer request
         let service_id = create_test_service_id("test/server");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachServer {
-                service_id,
-                max_active_requests: 10,
-            });
-        }
+        shared.push_request(&IamRequest::AttachServer {
+            service_id,
+            max_active_requests: 10,
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         assert!(matches!(responses[0], IamResponse::AttachOk { .. }));
     }
 
@@ -533,31 +705,25 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Send AttachClient request
         let service_id = create_test_service_id("test/client");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachClient {
-                service_id,
-                max_pending_responses: 5,
-            });
-        }
+        shared.push_request(&IamRequest::AttachClient {
+            service_id,
+            max_pending_responses: 5,
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         assert!(matches!(responses[0], IamResponse::AttachOk { .. }));
     }
 
@@ -573,18 +739,15 @@ mod integration_tests {
 
         // Send AttachPublisher without handshake
         let service_id = create_test_service_id("test/no-handshake");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 8,
-                max_slice_len: 1024,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 8,
+            max_slice_len: 1024,
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::ProtocolError { message } => {
                 assert!(message.contains("Handshake not complete"));
@@ -606,51 +769,42 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Attach a publisher first
         let service_id = create_test_service_id("test/detach");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 8,
-                max_slice_len: 1024,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 8,
+            max_slice_len: 1024,
+        });
 
         server.process().unwrap();
 
         // Get the port ID from the response
         let port_id = {
-            let responses = shared.responses.lock().unwrap();
+            let responses = shared.get_responses();
             match &responses[0] {
                 IamResponse::AttachOk { port_id, .. } => *port_id,
                 _ => panic!("Expected AttachOk"),
             }
         };
 
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Now detach
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Detach { service_id, port_id });
-        }
+        shared.push_request(&IamRequest::Detach { service_id, port_id });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         assert!(matches!(responses[0], IamResponse::DetachOk));
     }
 
@@ -714,32 +868,26 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Try to attach - should be denied
         let service_id = create_test_service_id("test/denied");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 8,
-                max_slice_len: 1024,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 8,
+            max_slice_len: 1024,
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::Denied { reason, message } => {
                 assert_eq!(*reason, DenialReason::PolicyViolation);
@@ -769,50 +917,41 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Attach first publisher - should succeed
         let service_id = create_test_service_id("test/limits");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 0,
-                max_slice_len: 128,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 0,
+            max_slice_len: 128,
+        });
 
         server.process().unwrap();
 
         {
-            let responses = shared.responses.lock().unwrap();
+            let responses = shared.get_responses();
             assert!(matches!(responses[0], IamResponse::AttachOk { .. }));
         }
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Attach second publisher - should fail due to limit
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 0,
-                max_slice_len: 128,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 0,
+            max_slice_len: 128,
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::Denied { reason, .. } => {
                 assert_eq!(*reason, DenialReason::ResourceLimitExceeded);
@@ -842,20 +981,14 @@ mod integration_tests {
         let node_id1 = UniqueSystemId::new().unwrap();
         let node_id2 = UniqueSystemId::new().unwrap();
 
-        {
-            let mut requests = client1_shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id: node_id1,
-            });
-        }
-        {
-            let mut requests = client2_shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id: node_id2,
-            });
-        }
+        client1_shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id: node_id1,
+        });
+        client2_shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id: node_id2,
+        });
 
         // Server accepts and processes both connections
         server.process().unwrap(); // Accept client 1
@@ -867,7 +1000,7 @@ mod integration_tests {
 
         // Both clients should have received HelloOk with different session IDs
         let session_id1 = {
-            let responses = client1_shared.responses.lock().unwrap();
+            let responses = client1_shared.get_responses();
             match &responses[0] {
                 IamResponse::HelloOk { session_id, .. } => *session_id,
                 _ => panic!("Expected HelloOk for client 1"),
@@ -875,7 +1008,7 @@ mod integration_tests {
         };
 
         let session_id2 = {
-            let responses = client2_shared.responses.lock().unwrap();
+            let responses = client2_shared.get_responses();
             match &responses[0] {
                 IamResponse::HelloOk { session_id, .. } => *session_id,
                 _ => panic!("Expected HelloOk for client 2"),
@@ -901,13 +1034,10 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         assert_eq!(server.session_count(), 1);
@@ -917,7 +1047,7 @@ mod integration_tests {
 
         // Get session ID
         let session_id = {
-            let responses = shared.responses.lock().unwrap();
+            let responses = shared.get_responses();
             match &responses[0] {
                 IamResponse::HelloOk { session_id, .. } => *session_id,
                 _ => panic!("Expected HelloOk"),
@@ -939,37 +1069,31 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
 
         let session_id = {
-            let responses = shared.responses.lock().unwrap();
+            let responses = shared.get_responses();
             match &responses[0] {
                 IamResponse::HelloOk { session_id, .. } => *session_id,
                 _ => panic!("Expected HelloOk"),
             }
         };
 
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Attach multiple ports
         let service_id = create_test_service_id("test/tracking");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 0,
-                max_slice_len: 128,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 0,
+            max_slice_len: 128,
+        });
         server.process().unwrap();
 
         // Check resource usage updated
@@ -977,16 +1101,13 @@ mod integration_tests {
         assert_eq!(usage.publisher_count, 1);
         assert_eq!(usage.subscriber_count, 0);
 
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Attach subscriber
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachSubscriber {
-                service_id,
-                buffer_size: 16,
-            });
-        }
+        shared.push_request(&IamRequest::AttachSubscriber {
+            service_id,
+            buffer_size: 16,
+        });
         server.process().unwrap();
 
         let usage = server.get_session_usage(session_id).unwrap();
@@ -1016,19 +1137,16 @@ mod integration_tests {
 
         // Send Hello through shared messages (simulating client.handshake())
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         // Server processes
         server.process().unwrap();
 
         // Check response
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::HelloOk {
                 negotiated_version,
@@ -1053,54 +1171,45 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Attach a publisher first
         let service_id = create_test_service_id("test/segment");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 0,
-                max_slice_len: 128,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 0,
+            max_slice_len: 128,
+        });
 
         server.process().unwrap();
 
         let port_id = {
-            let responses = shared.responses.lock().unwrap();
+            let responses = shared.get_responses();
             match &responses[0] {
                 IamResponse::AttachOk { port_id, .. } => *port_id,
                 _ => panic!("Expected AttachOk"),
             }
         };
 
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Try to add segment
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AddSegment {
-                service_id,
-                port_id,
-                requested_size: 4096,
-            });
-        }
+        shared.push_request(&IamRequest::AddSegment {
+            service_id,
+            port_id,
+            requested_size: 4096,
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         // Currently the server returns ProtocolError because segment creation
         // requires full SegmentManager integration which is not yet complete.
         match &responses[0] {
@@ -1128,31 +1237,25 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Try to ack a retirement that doesn't exist
         let service_id = create_test_service_id("test/retirement");
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AckSegmentRetirement {
-                service_id,
-                segment_id: SegmentId::new(99),
-            });
-        }
+        shared.push_request(&IamRequest::AckSegmentRetirement {
+            service_id,
+            segment_id: SegmentId::new(99),
+        });
 
         server.process().unwrap();
 
-        let responses = shared.responses.lock().unwrap();
+        let responses = shared.get_responses();
         match &responses[0] {
             IamResponse::Denied { reason, .. } => {
                 assert_eq!(*reason, DenialReason::Unauthorized);
@@ -1174,87 +1277,72 @@ mod integration_tests {
 
         // Complete handshake
         let node_id = UniqueSystemId::new().unwrap();
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::Hello {
-                protocol_version: ProtocolVersion::CURRENT,
-                node_id,
-            });
-        }
+        shared.push_request(&IamRequest::Hello {
+            protocol_version: ProtocolVersion::CURRENT,
+            node_id,
+        });
 
         server.process().unwrap();
         server.process().unwrap();
 
         let session_id = {
-            let responses = shared.responses.lock().unwrap();
+            let responses = shared.get_responses();
             match &responses[0] {
                 IamResponse::HelloOk { session_id, .. } => *session_id,
                 _ => panic!("Expected HelloOk"),
             }
         };
 
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Test all port types
         let service_id = create_test_service_id("test/all-ports");
 
         // Publisher
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachPublisher {
-                service_id,
-                history_size: 0,
-                max_slice_len: 128,
-            });
-        }
+        shared.push_request(&IamRequest::AttachPublisher {
+            service_id,
+            history_size: 0,
+            max_slice_len: 128,
+        });
         server.process().unwrap();
         assert!(matches!(
-            shared.responses.lock().unwrap()[0],
+            shared.get_responses()[0],
             IamResponse::AttachOk { .. }
         ));
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Subscriber
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachSubscriber {
-                service_id,
-                buffer_size: 16,
-            });
-        }
+        shared.push_request(&IamRequest::AttachSubscriber {
+            service_id,
+            buffer_size: 16,
+        });
         server.process().unwrap();
         assert!(matches!(
-            shared.responses.lock().unwrap()[0],
+            shared.get_responses()[0],
             IamResponse::AttachOk { .. }
         ));
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Server port
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachServer {
-                service_id,
-                max_active_requests: 10,
-            });
-        }
+        shared.push_request(&IamRequest::AttachServer {
+            service_id,
+            max_active_requests: 10,
+        });
         server.process().unwrap();
         assert!(matches!(
-            shared.responses.lock().unwrap()[0],
+            shared.get_responses()[0],
             IamResponse::AttachOk { .. }
         ));
-        shared.responses.lock().unwrap().clear();
+        shared.clear_responses();
 
         // Client port
-        {
-            let mut requests = shared.requests.lock().unwrap();
-            requests.push(IamRequest::AttachClient {
-                service_id,
-                max_pending_responses: 5,
-            });
-        }
+        shared.push_request(&IamRequest::AttachClient {
+            service_id,
+            max_pending_responses: 5,
+        });
         server.process().unwrap();
         assert!(matches!(
-            shared.responses.lock().unwrap()[0],
+            shared.get_responses()[0],
             IamResponse::AttachOk { .. }
         ));
 

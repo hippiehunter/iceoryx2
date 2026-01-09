@@ -252,6 +252,8 @@ pub mod ipc_threadsafe;
 
 pub(crate) mod config_scheme;
 pub(crate) mod naming_scheme;
+/// Secured service context for IAM-protected services.
+pub(crate) mod secured_context;
 
 use core::fmt::Debug;
 use core::time::Duration;
@@ -287,10 +289,13 @@ use iceoryx2_cal::shared_memory::{SharedMemory, SharedMemoryForPoolAllocator};
 use iceoryx2_cal::shm_allocator::bump_allocator::BumpAllocator;
 use iceoryx2_cal::static_storage::*;
 use iceoryx2_cal::zero_copy_connection::ZeroCopyConnection;
+use iceoryx2_cal::control_channel::ControlChannel;
 use iceoryx2_log::{debug, fail, trace, warn};
 use service_id::ServiceId;
 
 use self::dynamic_config::DeregisterNodeState;
+use self::secured_context::TypeErasedSecuredContext;
+use crate::iam::server::TypeErasedIamServer;
 use self::messaging_pattern::MessagingPattern;
 use self::service_name::ServiceName;
 
@@ -812,6 +817,57 @@ impl ServiceResource for NoResource {
     fn acquire_ownership(&self) {}
 }
 
+/// Security resource for [`ServiceState`].
+///
+/// This enum allows [`ServiceState`] to hold either no security context (for public services)
+/// or a type-erased IAM client/server (for secured services) without exposing the generic
+/// control channel parameter throughout the API.
+#[derive(Debug)]
+pub(crate) enum SecurityResource {
+    /// No security - public service access.
+    None,
+    /// Secured service - opener with IAM client connection.
+    SecuredClient(TypeErasedSecuredContext),
+    /// Secured service - creator hosting IAM server.
+    SecuredServer(TypeErasedIamServer),
+}
+
+impl SecurityResource {
+    /// Returns true if this is a secured resource (client or server).
+    #[inline]
+    pub fn is_secured(&self) -> bool {
+        !matches!(self, SecurityResource::None)
+    }
+
+    /// Returns the secured client context if this is a `SecuredClient`.
+    #[inline]
+    pub fn as_client(&self) -> Option<&TypeErasedSecuredContext> {
+        match self {
+            SecurityResource::SecuredClient(ctx) => Some(ctx),
+            _ => None,
+        }
+    }
+
+    /// Returns the IAM server if this is a `SecuredServer`.
+    #[inline]
+    pub fn as_server(&self) -> Option<&TypeErasedIamServer> {
+        match self {
+            SecurityResource::SecuredServer(server) => Some(server),
+            _ => None,
+        }
+    }
+}
+
+impl ServiceResource for SecurityResource {
+    fn acquire_ownership(&self) {
+        match self {
+            SecurityResource::None => {}
+            SecurityResource::SecuredClient(ctx) => ctx.disconnect(),
+            SecurityResource::SecuredServer(server) => server.shutdown(),
+        }
+    }
+}
+
 /// Represents a service. Used to create or open new services with the
 /// [`crate::node::Node::service_builder()`].
 /// Contains the building blocks a [`Service`] requires to create the underlying resources and
@@ -863,6 +919,11 @@ pub trait Service: Debug + Sized + internal::ServiceInternal<Self> + Clone {
 
     /// Defines the construct used to store the payload data of the blackboard service.
     type BlackboardPayload: SharedMemory<BumpAllocator>;
+
+    /// The control channel used for IAM (Identity and Access Management) communication.
+    /// This is used for secure inter-process communication between the IAM server
+    /// (service creator) and IAM clients (service openers) in secured mode.
+    type ControlChannel: ControlChannel;
 
     /// Checks if a service under a given [`config::Config`] does exist
     ///

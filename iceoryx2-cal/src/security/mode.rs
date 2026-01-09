@@ -15,14 +15,17 @@
 //! This module provides [`SecurityMode`], which determines whether a service operates
 //! in public mode (default, no authentication required) or secured mode (IAM-controlled access).
 
+use iceoryx2_bb_derive_macros::ZeroCopySend;
+use iceoryx2_bb_elementary_traits::zero_copy_send::ZeroCopySend;
 use serde::{Deserialize, Serialize};
 
 /// Determines the security mode of a service.
 ///
 /// - [`SecurityMode::Public`]: Default mode. No authentication required.
 /// - [`SecurityMode::Secured`]: Requires IAM authentication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ZeroCopySend)]
 #[serde(rename_all = "kebab-case")]
+#[repr(C)]
 pub enum SecurityMode {
     /// Public mode - no authentication required.
     #[default]

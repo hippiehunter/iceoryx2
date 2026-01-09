@@ -71,6 +71,8 @@ pub enum iox2_event_open_or_create_error_e {
     O_EXCEEDS_MAX_NUMBER_OF_NODES,
     #[CStr = "is marked for destruction"]
     O_IS_MARKED_FOR_DESTRUCTION,
+    #[CStr = "incompatible security mode"]
+    O_INCOMPATIBLE_SECURITY_MODE,
     #[CStr = "service in corrupted state"]
     C_SERVICE_IN_CORRUPTED_STATE,
     #[CStr = "internal failure"]
@@ -85,6 +87,12 @@ pub enum iox2_event_open_or_create_error_e {
     C_INSUFFICIENT_PERMISSIONS,
     #[CStr = "old connection still active"]
     C_OLD_CONNECTION_STILL_ACTIVE,
+    #[CStr = "IAM server creation failed"]
+    C_IAM_SERVER_CREATION_FAILED,
+    #[CStr = "IAM connection failed"]
+    O_IAM_CONNECTION_FAILED,
+    #[CStr = "IAM handshake failed"]
+    O_IAM_HANDSHAKE_FAILED,
     #[CStr = "same service is created and removed repeatedly"]
     SYSTEM_IN_FLUX,
 }
@@ -141,6 +149,15 @@ impl IntoCInt for EventOpenError {
             EventOpenError::IncompatibleDeadline => {
                 iox2_event_open_or_create_error_e::O_INCOMPATIBLE_DEADLINE
             }
+            EventOpenError::IncompatibleSecurityMode => {
+                iox2_event_open_or_create_error_e::O_INCOMPATIBLE_SECURITY_MODE
+            }
+            EventOpenError::IamConnectionFailed => {
+                iox2_event_open_or_create_error_e::O_IAM_CONNECTION_FAILED
+            }
+            EventOpenError::IamHandshakeFailed => {
+                iox2_event_open_or_create_error_e::O_IAM_HANDSHAKE_FAILED
+            }
         }) as c_int
     }
 }
@@ -164,6 +181,9 @@ impl IntoCInt for EventCreateError {
             }
             EventCreateError::InsufficientPermissions => {
                 iox2_event_open_or_create_error_e::C_INSUFFICIENT_PERMISSIONS
+            }
+            EventCreateError::IamServerCreationFailed => {
+                iox2_event_open_or_create_error_e::C_IAM_SERVER_CREATION_FAILED
             }
         }) as c_int
     }

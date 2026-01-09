@@ -89,6 +89,9 @@ pub enum BlackboardOpenError {
     ExceedsMaxNumberOfNodes,
     /// The [`Service`] supports less [`Node`](crate::node::Node)s than requested.
     DoesNotSupportRequestedAmountOfNodes,
+    /// The [`Service`] was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
 }
 
 impl core::fmt::Display for BlackboardOpenError {
@@ -114,6 +117,9 @@ impl From<ServiceAvailabilityState> for BlackboardOpenError {
             }
             ServiceAvailabilityState::ServiceState(ServiceState::Corrupted) => {
                 BlackboardOpenError::ServiceInCorruptedState
+            }
+            ServiceAvailabilityState::ServiceState(ServiceState::IncompatibleSecurityMode) => {
+                BlackboardOpenError::IncompatibleSecurityMode
             }
         }
     }
@@ -151,7 +157,8 @@ impl From<ServiceAvailabilityState> for BlackboardCreateError {
     fn from(value: ServiceAvailabilityState) -> Self {
         match value {
             ServiceAvailabilityState::IncompatibleKeys
-            | ServiceAvailabilityState::ServiceState(ServiceState::IncompatibleMessagingPattern) => {
+            | ServiceAvailabilityState::ServiceState(ServiceState::IncompatibleMessagingPattern)
+            | ServiceAvailabilityState::ServiceState(ServiceState::IncompatibleSecurityMode) => {
                 BlackboardCreateError::AlreadyExists
             }
             ServiceAvailabilityState::ServiceState(ServiceState::InsufficientPermissions) => {

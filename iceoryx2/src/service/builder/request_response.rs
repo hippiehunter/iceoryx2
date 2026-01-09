@@ -18,6 +18,7 @@ use alloc::format;
 use iceoryx2_bb_elementary::alignment::Alignment;
 use iceoryx2_bb_elementary_traits::zero_copy_send::ZeroCopySend;
 use iceoryx2_cal::dynamic_storage::{DynamicStorageCreateError, DynamicStorageOpenError};
+use iceoryx2_cal::security::mode::SecurityMode;
 use iceoryx2_cal::serialize::Serialize;
 use iceoryx2_cal::static_storage::{StaticStorage, StaticStorageCreateError, StaticStorageLocked};
 use iceoryx2_log::{fail, fatal_panic, warn};
@@ -27,10 +28,19 @@ use crate::service::builder::OpenDynamicStorageFailure;
 use crate::service::dynamic_config::request_response::DynamicConfigSettings;
 use crate::service::dynamic_config::MessagingPatternSettings;
 use crate::service::port_factory::request_response;
+use crate::service::secured_context::iam_endpoint_name;
 use crate::service::static_config::message_type_details::TypeDetail;
 use crate::service::static_config::messaging_pattern::MessagingPattern;
-use crate::service::{self, header, static_config, NoResource};
+use crate::service::{self, header, static_config, SecurityResource};
 use crate::service::{builder, dynamic_config, Service};
+
+use iceoryx2_cal::control_channel::{ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder};
+use iceoryx2_cal::named_concept::NamedConceptBuilder;
+
+use crate::iam::client::IamClient;
+use crate::iam::server::{IamServer, TypeErasedIamServer};
+use crate::iam::DefaultPolicy;
+use crate::service::secured_context::{SecuredServiceContext, TypeErasedSecuredContext};
 
 use super::message_type_details::{MessageTypeDetails, TypeVariant};
 use super::{CustomHeaderMarker, CustomPayloadMarker, ServiceState, RETRY_LIMIT};
@@ -85,6 +95,15 @@ pub enum RequestResponseOpenError {
     IsMarkedForDestruction,
     /// Some underlying resources of the [`Service`] are either missing, corrupted or unaccessible.
     ServiceInCorruptedState,
+    /// The [`Service`] was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
+    /// Failed to connect to the IAM server when opening a secured service.
+    /// This can happen if the service creator has crashed or the control channel is unavailable.
+    IamConnectionFailed,
+    /// The IAM handshake failed when opening a secured service.
+    /// This can happen if the protocol version is incompatible or the server rejected the connection.
+    IamHandshakeFailed,
 }
 
 impl core::fmt::Display for RequestResponseOpenError {
@@ -116,6 +135,9 @@ impl From<ServiceAvailabilityState> for RequestResponseOpenError {
             ServiceAvailabilityState::ServiceState(ServiceState::Corrupted) => {
                 RequestResponseOpenError::ServiceInCorruptedState
             }
+            ServiceAvailabilityState::ServiceState(ServiceState::IncompatibleSecurityMode) => {
+                RequestResponseOpenError::IncompatibleSecurityMode
+            }
         }
     }
 }
@@ -136,6 +158,9 @@ pub enum RequestResponseCreateError {
     HangsInCreation,
     /// Some underlying resources of the [`Service`] are either missing, corrupted or unaccessible.
     ServiceInCorruptedState,
+    /// Failed to create the IAM server for a secured service.
+    /// This can happen if the control channel listener cannot be created.
+    IamServerCreationFailed,
 }
 
 impl core::fmt::Display for RequestResponseCreateError {
@@ -151,7 +176,8 @@ impl From<ServiceAvailabilityState> for RequestResponseCreateError {
         match value {
             ServiceAvailabilityState::IncompatibleRequestType
             | ServiceAvailabilityState::IncompatibleResponseType
-            | ServiceAvailabilityState::ServiceState(ServiceState::IncompatibleMessagingPattern) => {
+            | ServiceAvailabilityState::ServiceState(ServiceState::IncompatibleMessagingPattern)
+            | ServiceAvailabilityState::ServiceState(ServiceState::IncompatibleSecurityMode) => {
                 RequestResponseCreateError::AlreadyExists
             }
             ServiceAvailabilityState::ServiceState(ServiceState::InsufficientPermissions) => {
@@ -763,13 +789,39 @@ impl<
                     service_tag.release_ownership();
                 }
 
+                // Set up IAM server if secured mode is enabled
+                let security_resource = if self.base.shared_node.config().global.node.security.mode
+                    == SecurityMode::Secured
+                {
+                    // Get IAM endpoint name for this service
+                    let endpoint_base = &self.base.shared_node.config().global.node.security.iam.endpoint_base;
+                    let endpoint_name = iam_endpoint_name(&self.base.service_config.service_id(), endpoint_base);
+
+                    // Create the control channel listener for IAM
+                    let listener = <<ServiceType as Service>::ControlChannel as ControlChannel>::ListenerBuilder::new(&endpoint_name)
+                        .create()
+                        .map_err(|e| {
+                            iceoryx2_log::error!("Failed to create IAM listener: {:?}", e);
+                            RequestResponseCreateError::IamServerCreationFailed
+                        })?;
+
+                    // Create IAM server with default policy
+                    let policy = DefaultPolicy::new();
+                    let server = IamServer::new(listener, policy);
+
+                    // Wrap in type-erased container
+                    SecurityResource::SecuredServer(TypeErasedIamServer::new(server))
+                } else {
+                    SecurityResource::None
+                };
+
                 Ok(request_response::PortFactory::new(
                     service::ServiceState::new(
                         self.base.service_config.clone(),
                         self.base.shared_node.clone(),
                         dynamic_config,
                         unlocked_static_details,
-                        NoResource,
+                        security_resource,
                     ),
                 ))
             }
@@ -852,13 +904,45 @@ impl<
                         service_tag.release_ownership();
                     }
 
+                    // Set up IAM client if secured mode is enabled
+                    let security_resource = if self.base.shared_node.config().global.node.security.mode
+                        == SecurityMode::Secured
+                    {
+                        // Get IAM endpoint name for this service
+                        let endpoint_base = &self.base.shared_node.config().global.node.security.iam.endpoint_base;
+                        let endpoint_name = iam_endpoint_name(&static_config.service_id(), endpoint_base);
+
+                        // Connect to the IAM server
+                        let client = <<ServiceType as Service>::ControlChannel as ControlChannel>::ClientBuilder::new(&endpoint_name)
+                            .connect()
+                            .map_err(|e| {
+                                iceoryx2_log::error!("Failed to connect to IAM server: {:?}", e);
+                                RequestResponseOpenError::IamConnectionFailed
+                            })?;
+
+                        // Create IAM client and perform handshake
+                        let mut iam_client = IamClient::new(client);
+                        let node_id = self.base.shared_node.id().unique_system_id();
+                        iam_client.handshake(node_id)
+                            .map_err(|e| {
+                                iceoryx2_log::error!("IAM handshake failed: {:?}", e);
+                                RequestResponseOpenError::IamHandshakeFailed
+                            })?;
+
+                        // Wrap in SecuredServiceContext and type-erased container
+                        let ctx = SecuredServiceContext::new(iam_client, static_config.service_id().clone());
+                        SecurityResource::SecuredClient(TypeErasedSecuredContext::new(ctx))
+                    } else {
+                        SecurityResource::None
+                    };
+
                     return Ok(request_response::PortFactory::new(
                         service::ServiceState::new(
                             static_config,
                             self.base.shared_node.clone(),
                             dynamic_config,
                             static_storage,
-                            NoResource,
+                            security_resource,
                         ),
                     ));
                 }

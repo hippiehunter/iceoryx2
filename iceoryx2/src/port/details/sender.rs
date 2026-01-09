@@ -33,7 +33,7 @@ use crate::port::{DegradationAction, DegradationCallback, LoanError, SendError};
 use crate::prelude::UnableToDeliverStrategy;
 use crate::service::config_scheme::connection_config;
 use crate::service::static_config::message_type_details::{MessageTypeDetails, TypeVariant};
-use crate::service::{NoResource, ServiceState};
+use crate::service::{SecurityResource, ServiceState};
 use crate::{service, service::naming_scheme::connection_name};
 
 use super::channel_management::ChannelManagement;
@@ -115,7 +115,7 @@ pub(crate) struct Sender<Service: service::Service> {
     pub(crate) number_of_samples: usize,
     pub(crate) max_number_of_segments: u8,
     pub(crate) degradation_callback: Option<DegradationCallback<'static>>,
-    pub(crate) service_state: Arc<ServiceState<Service, NoResource>>,
+    pub(crate) service_state: Arc<ServiceState<Service, SecurityResource>>,
     pub(crate) tagger: CyclicTagger,
     pub(crate) loan_counter: AtomicUsize,
     pub(crate) unable_to_deliver_strategy: UnableToDeliverStrategy,

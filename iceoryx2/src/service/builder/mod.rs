@@ -71,6 +71,9 @@ enum ServiceState {
     InsufficientPermissions,
     HangsInCreation,
     Corrupted,
+    /// The service was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
 }
 
 #[repr(C)]
@@ -333,6 +336,18 @@ impl<ServiceType: service::Service> BuilderWithServiceType<ServiceType> {
                     fail!(from self, with ServiceState::IncompatibleMessagingPattern,
                         "{} since the messaging pattern \"{:?}\" does not fit the requested pattern \"{:?}\".",
                         msg, service_config.messaging_pattern(), self.service_config.messaging_pattern());
+                }
+
+                // Validate security mode compatibility:
+                // - A secured node cannot open a public service
+                // - A public node cannot open a secured service
+                let node_mode = self.shared_node.config().global.node.security.mode;
+                let service_mode = service_config.security_mode();
+                if node_mode != service_mode {
+                    fail!(from self, with ServiceState::IncompatibleSecurityMode,
+                        "{} since the service was created with security mode {:?} but the node is configured for {:?}. \
+                         A secured node cannot open a public service and vice versa.",
+                        msg, service_mode, node_mode);
                 }
 
                 Ok(Some((service_config, storage)))

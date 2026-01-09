@@ -96,6 +96,10 @@ pub enum iox2_publisher_create_error_e {
     EXCEEDS_MAX_SUPPORTED_PUBLISHERS = IOX2_OK as isize + 1,
     UNABLE_TO_CREATE_DATA_SEGMENT,
     FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY,
+    #[CStr = "iam authorization denied"]
+    IAM_AUTHORIZATION_DENIED,
+    #[CStr = "iam connection failed"]
+    IAM_CONNECTION_FAILED,
 }
 
 impl IntoCInt for PublisherCreateError {
@@ -109,6 +113,12 @@ impl IntoCInt for PublisherCreateError {
             }
             PublisherCreateError::FailedToDeployThreadsafetyPolicy => {
                 iox2_publisher_create_error_e::FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY
+            }
+            PublisherCreateError::IamAuthorizationDenied => {
+                iox2_publisher_create_error_e::IAM_AUTHORIZATION_DENIED
+            }
+            PublisherCreateError::IamConnectionFailed => {
+                iox2_publisher_create_error_e::IAM_CONNECTION_FAILED
             }
         }) as c_int
     }

@@ -28,7 +28,7 @@ use crate::port::update_connections::ConnectionFailure;
 use crate::port::{DegradationAction, DegradationCallback, ReceiveError};
 use crate::service::naming_scheme::data_segment_name;
 use crate::service::static_config::message_type_details::MessageTypeDetails;
-use crate::service::NoResource;
+use crate::service::SecurityResource;
 use crate::service::ServiceState;
 use crate::service::{self, config_scheme::connection_config, naming_scheme::connection_name};
 
@@ -117,7 +117,7 @@ impl<Service: service::Service> Connection<Service> {
 pub(crate) struct Receiver<Service: service::Service> {
     pub(crate) connections: PolymorphicVec<'static, UnsafeCell<Option<SlotMapKey>>, HeapAllocator>,
     pub(crate) receiver_port_id: u128,
-    pub(crate) service_state: Arc<ServiceState<Service, NoResource>>,
+    pub(crate) service_state: Arc<ServiceState<Service, SecurityResource>>,
     pub(crate) buffer_size: usize,
     pub(crate) tagger: CyclicTagger,
     pub(crate) to_be_removed_connections:

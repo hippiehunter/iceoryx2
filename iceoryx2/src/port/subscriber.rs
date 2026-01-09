@@ -56,7 +56,7 @@ use crate::service::dynamic_config::publish_subscribe::{PublisherDetails, Subscr
 use crate::service::header::publish_subscribe::Header;
 use crate::service::port_factory::subscriber::SubscriberConfig;
 use crate::service::static_config::publish_subscribe::StaticConfig;
-use crate::service::{NoResource, ServiceState};
+use crate::service::{SecurityResource, ServiceState};
 use crate::{raw_sample::RawSample, sample::Sample, service};
 
 use super::details::chunk::Chunk;
@@ -83,6 +83,13 @@ pub enum SubscriberCreateError {
     /// Caused by a failure when instantiating a [`ArcSyncPolicy`] defined in the
     /// [`Service`](crate::service::Service) as `ArcThreadSafetyPolicy`.
     FailedToDeployThreadsafetyPolicy,
+    /// The IAM server denied the attach request for this subscriber.
+    /// This typically occurs when the IAM policy does not allow the requesting
+    /// process to create subscribers on this service.
+    IamAuthorizationDenied,
+    /// Failed to communicate with the IAM server.
+    /// The IAM connection may have been lost or the server may be unavailable.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for SubscriberCreateError {
@@ -160,7 +167,7 @@ impl<
     > Subscriber<Service, Payload, UserHeader>
 {
     pub(crate) fn new(
-        service: Arc<ServiceState<Service, NoResource>>,
+        service: Arc<ServiceState<Service, SecurityResource>>,
         static_config: &StaticConfig,
         config: SubscriberConfig,
     ) -> Result<Self, SubscriberCreateError> {

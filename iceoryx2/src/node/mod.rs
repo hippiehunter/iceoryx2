@@ -230,6 +230,14 @@ impl NodeId {
     pub fn creation_time(&self) -> Time {
         self.0.creation_time()
     }
+
+    /// Returns the inner [`UniqueSystemId`] for IAM handshake.
+    ///
+    /// This is crate-internal because external users should use the public
+    /// `value()`, `pid()`, and `creation_time()` methods instead.
+    pub(crate) fn unique_system_id(&self) -> UniqueSystemId {
+        self.0
+    }
 }
 
 /// The failures that can occur when a [`Node`] is created with the [`NodeBuilder`].

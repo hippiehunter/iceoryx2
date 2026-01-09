@@ -58,6 +58,7 @@ impl crate::service::Service for Service {
     type BlackboardMgmt<KeyType: Send + Sync + Debug + 'static> =
         dynamic_storage::recommended::Ipc<KeyType>;
     type BlackboardPayload = shared_memory::recommended::Ipc<BumpAllocator>;
+    type ControlChannel = control_channel::recommended::Ipc;
 }
 
 impl crate::service::internal::ServiceInternal<Service> for Service {}

@@ -20,14 +20,24 @@ use alloc::format;
 
 use iceoryx2_bb_posix::clock::Time;
 use iceoryx2_cal::dynamic_storage::DynamicStorageCreateError;
+use iceoryx2_cal::security::mode::SecurityMode;
 use iceoryx2_log::{fail, fatal_panic};
 
 use crate::service::builder::OpenDynamicStorageFailure;
 use crate::service::dynamic_config::MessagingPatternSettings;
 use crate::service::port_factory::event;
+use crate::service::secured_context::iam_endpoint_name;
 use crate::service::static_config::messaging_pattern::MessagingPattern;
 use crate::service::*;
 use crate::service::{self, dynamic_config::event::DynamicConfigSettings};
+
+use iceoryx2_cal::control_channel::{ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder};
+use iceoryx2_cal::named_concept::NamedConceptBuilder;
+
+use crate::iam::client::IamClient;
+use crate::iam::server::{IamServer, TypeErasedIamServer};
+use crate::iam::DefaultPolicy;
+use crate::service::secured_context::{SecuredServiceContext, TypeErasedSecuredContext};
 
 use self::attribute::{AttributeSpecifier, AttributeVerifier};
 use builder::RETRY_LIMIT;
@@ -79,6 +89,15 @@ pub enum EventOpenError {
     /// When the call creation call is repeated with a little delay the [`Service`] should be
     /// recreatable.
     IsMarkedForDestruction,
+    /// The [`Service`] was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
+    /// Failed to connect to the IAM server when opening a secured service.
+    /// This can happen if the service creator has crashed or the control channel is unavailable.
+    IamConnectionFailed,
+    /// The IAM handshake failed when opening a secured service.
+    /// This can happen if the protocol version is incompatible or the server rejected the connection.
+    IamHandshakeFailed,
 }
 
 impl core::fmt::Display for EventOpenError {
@@ -98,6 +117,7 @@ impl From<ServiceState> for EventOpenError {
             ServiceState::InsufficientPermissions => EventOpenError::InsufficientPermissions,
             ServiceState::HangsInCreation => EventOpenError::HangsInCreation,
             ServiceState::Corrupted => EventOpenError::ServiceInCorruptedState,
+            ServiceState::IncompatibleSecurityMode => EventOpenError::IncompatibleSecurityMode,
         }
     }
 }
@@ -118,6 +138,9 @@ pub enum EventCreateError {
     HangsInCreation,
     /// The process has insufficient permissions to create the [`Service`].
     InsufficientPermissions,
+    /// Failed to create the IAM server for a secured service.
+    /// This can happen if the control channel listener cannot be created.
+    IamServerCreationFailed,
 }
 
 impl core::fmt::Display for EventCreateError {
@@ -131,7 +154,8 @@ impl core::error::Error for EventCreateError {}
 impl From<ServiceState> for EventCreateError {
     fn from(value: ServiceState) -> Self {
         match value {
-            ServiceState::IncompatibleMessagingPattern => EventCreateError::AlreadyExists,
+            ServiceState::IncompatibleMessagingPattern
+            | ServiceState::IncompatibleSecurityMode => EventCreateError::AlreadyExists,
             ServiceState::InsufficientPermissions => EventCreateError::InsufficientPermissions,
             ServiceState::HangsInCreation => EventCreateError::HangsInCreation,
             ServiceState::Corrupted => EventCreateError::ServiceInCorruptedState,
@@ -442,12 +466,44 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
                         service_tag.release_ownership();
                     }
 
+                    // Set up IAM client if secured mode is enabled
+                    let security_resource = if self.base.shared_node.config().global.node.security.mode
+                        == SecurityMode::Secured
+                    {
+                        // Get IAM endpoint name for this service
+                        let endpoint_base = &self.base.shared_node.config().global.node.security.iam.endpoint_base;
+                        let endpoint_name = iam_endpoint_name(&static_config.service_id(), endpoint_base);
+
+                        // Connect to the IAM server
+                        let client = <<ServiceType as Service>::ControlChannel as ControlChannel>::ClientBuilder::new(&endpoint_name)
+                            .connect()
+                            .map_err(|e| {
+                                iceoryx2_log::error!("Failed to connect to IAM server: {:?}", e);
+                                EventOpenError::IamConnectionFailed
+                            })?;
+
+                        // Create IAM client and perform handshake
+                        let mut iam_client = IamClient::new(client);
+                        let node_id = self.base.shared_node.id().unique_system_id();
+                        iam_client.handshake(node_id)
+                            .map_err(|e| {
+                                iceoryx2_log::error!("IAM handshake failed: {:?}", e);
+                                EventOpenError::IamHandshakeFailed
+                            })?;
+
+                        // Wrap in SecuredServiceContext and type-erased container
+                        let ctx = SecuredServiceContext::new(iam_client, static_config.service_id().clone());
+                        SecurityResource::SecuredClient(TypeErasedSecuredContext::new(ctx))
+                    } else {
+                        SecurityResource::None
+                    };
+
                     return Ok(event::PortFactory::new(service::ServiceState::new(
                         static_config,
                         self.base.shared_node,
                         dynamic_config,
                         static_storage,
-                        NoResource,
+                        security_resource,
                     )));
                 }
             }
@@ -548,12 +604,38 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
                     service_tag.release_ownership();
                 }
 
+                // Set up IAM server if secured mode is enabled
+                let security_resource = if self.base.shared_node.config().global.node.security.mode
+                    == SecurityMode::Secured
+                {
+                    // Get IAM endpoint name for this service
+                    let endpoint_base = &self.base.shared_node.config().global.node.security.iam.endpoint_base;
+                    let endpoint_name = iam_endpoint_name(&self.base.service_config.service_id(), endpoint_base);
+
+                    // Create the control channel listener for IAM
+                    let listener = <<ServiceType as Service>::ControlChannel as ControlChannel>::ListenerBuilder::new(&endpoint_name)
+                        .create()
+                        .map_err(|e| {
+                            iceoryx2_log::error!("Failed to create IAM listener: {:?}", e);
+                            EventCreateError::IamServerCreationFailed
+                        })?;
+
+                    // Create IAM server with default policy
+                    let policy = DefaultPolicy::new();
+                    let server = IamServer::new(listener, policy);
+
+                    // Wrap in type-erased container
+                    SecurityResource::SecuredServer(TypeErasedIamServer::new(server))
+                } else {
+                    SecurityResource::None
+                };
+
                 Ok(event::PortFactory::new(service::ServiceState::new(
                     self.base.service_config.clone(),
                     self.base.shared_node.clone(),
                     dynamic_config,
                     unlocked_static_details,
-                    NoResource,
+                    security_resource,
                 )))
             }
             Some(_) => {

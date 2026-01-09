@@ -61,6 +61,7 @@
 use alloc::vec::Vec;
 
 use iceoryx2_bb_posix::unique_system_id::UniqueSystemId;
+use iceoryx2_cal::control_channel::ControlChannelClient as CalClient;
 use iceoryx2_cal::security::handle::PlatformHandle;
 use iceoryx2_cal::shm_allocator::SegmentId;
 
@@ -69,64 +70,9 @@ use super::protocol::{
     DenialReason, IamRequest, IamResponse, MessagingPatternKind, ProtocolVersion, SegmentInfo,
     SessionId, INVALID_SESSION_ID, MAX_HANDLES_PER_MESSAGE, MAX_SEGMENTS_PER_ATTACH,
 };
+use super::wire::{client_receive_handles, client_receive_message, client_send_message, new_receive_buffer};
 use crate::service::service_id::ServiceId;
 use crate::service::service_name::ServiceName;
-
-// ============================================================================
-// ClientControlChannelConnection Trait
-// ============================================================================
-
-/// Trait for client-side control channel connections.
-///
-/// This trait abstracts the platform-specific control channel implementation
-/// for the client side. The actual implementations are provided by SP2 (Linux)
-/// and SP3 (Windows).
-///
-/// # Responsibilities
-///
-/// Implementations are responsible for:
-/// - Establishing connections to the IAM server
-/// - Sending serialized requests
-/// - Receiving serialized responses
-/// - Receiving handles passed by the server (SCM_RIGHTS, DuplicateHandle)
-///
-/// # Blocking Behavior
-///
-/// Unlike the server-side trait, client methods may block while waiting for
-/// responses. The implementation should handle appropriate timeouts.
-pub trait ClientControlChannelConnection: Send {
-    /// Sends a request to the IAM server.
-    ///
-    /// The implementation is responsible for serializing the request to
-    /// the wire format (e.g., using postcard).
-    fn send_request(&self, request: &IamRequest) -> Result<(), IamClientError>;
-
-    /// Receives a response from the IAM server.
-    ///
-    /// This method may block until a response is available.
-    /// The implementation is responsible for deserializing the response from
-    /// the wire format (e.g., using postcard).
-    fn receive_response(&self) -> Result<IamResponse, IamClientError>;
-
-    /// Receives handles passed by the server.
-    ///
-    /// This method should be called after receiving a response that indicates
-    /// handles are being passed (handle_count > 0).
-    ///
-    /// # Arguments
-    ///
-    /// * `count` - The number of handles to receive
-    ///
-    /// # Returns
-    ///
-    /// A vector of platform handles received from the server.
-    fn receive_handles(&self, count: usize) -> Result<Vec<PlatformHandle>, IamClientError>;
-
-    /// Closes the connection to the server.
-    ///
-    /// After this call, the connection should not be used.
-    fn close(&self);
-}
 
 // ============================================================================
 // ConnectionState
@@ -155,7 +101,7 @@ enum ConnectionState {
 ///
 /// # Type Parameters
 ///
-/// * `C` - The control channel connection type
+/// * `C` - The CAL control channel client type
 ///
 /// # Connection Lifecycle
 ///
@@ -166,12 +112,13 @@ enum ConnectionState {
 ///
 /// # Drop Behavior
 ///
-/// When dropped, if the client is in the `Active` state, a Goodbye message
-/// would be sent to cleanly close the session. The current implementation
-/// simply closes the connection.
-pub struct IamClient<C: ClientControlChannelConnection> {
-    /// The control channel connection to the server.
-    connection: C,
+/// When dropped, if the client is in the `Active` state, the connection
+/// is closed automatically through Drop.
+pub struct IamClient<C: CalClient> {
+    /// The control channel connection to the server (None if disconnected).
+    connection: Option<C>,
+    /// Reusable buffer for receiving messages.
+    receive_buffer: Vec<u8>,
     /// The session ID assigned during handshake.
     session_id: SessionId,
     /// The negotiated protocol version.
@@ -180,7 +127,7 @@ pub struct IamClient<C: ClientControlChannelConnection> {
     state: ConnectionState,
 }
 
-impl<C: ClientControlChannelConnection> IamClient<C> {
+impl<C: CalClient> IamClient<C> {
     /// Creates a new IAM client with the given connection.
     ///
     /// The client is created in the `Connected` state. You must call
@@ -188,7 +135,7 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     ///
     /// # Arguments
     ///
-    /// * `connection` - The control channel connection to the IAM server
+    /// * `connection` - The CAL control channel client to the IAM server
     ///
     /// # Returns
     ///
@@ -196,7 +143,8 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     #[must_use]
     pub fn new(connection: C) -> Self {
         Self {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: INVALID_SESSION_ID,
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Connected,
@@ -262,15 +210,18 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
             return Err(IamClientError::HandshakeFailed);
         }
 
+        // Get connection reference (split borrow to allow mutable access to receive_buffer)
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         // Send Hello request
         let request = IamRequest::Hello {
             protocol_version: ProtocolVersion::CURRENT,
             node_id,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
         // Receive response
-        let response = self.connection.receive_response()?;
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
 
         match response {
             IamResponse::HelloOk {
@@ -314,7 +265,8 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     /// If the client is already disconnected, this method does nothing.
     pub fn disconnect(&mut self) {
         if self.state != ConnectionState::Disconnected {
-            self.connection.close();
+            // Drop the connection by taking it (closes via Drop)
+            self.connection = None;
             self.state = ConnectionState::Disconnected;
             self.session_id = INVALID_SESSION_ID;
         }
@@ -348,19 +300,21 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     ) -> Result<ServiceId, IamClientError> {
         self.ensure_active()?;
 
+        // Get connection reference (split borrow to allow mutable access to receive_buffer)
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         let request = IamRequest::CreateService {
             service_name: service_name.clone(),
             messaging_pattern,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
-        let response = self.connection.receive_response()?;
-        self.handle_create_service_response(response)
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+        Self::handle_create_service_response(response)
     }
 
     /// Handles the response to a CreateService request.
     fn handle_create_service_response(
-        &self,
         response: IamResponse,
     ) -> Result<ServiceId, IamClientError> {
         match response {
@@ -404,15 +358,18 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.ensure_active()?;
 
+        // Get connection reference (split borrow to allow mutable access to receive_buffer)
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         let request = IamRequest::AttachPublisher {
             service_id: *service_id,
             history_size,
             max_slice_len,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
-        let response = self.connection.receive_response()?;
-        self.handle_attach_response(response)
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+        Self::handle_attach_response(conn, response)
     }
 
     /// Attaches as a subscriber to a service.
@@ -442,14 +399,16 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.ensure_active()?;
 
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         let request = IamRequest::AttachSubscriber {
             service_id: *service_id,
             buffer_size,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
-        let response = self.connection.receive_response()?;
-        self.handle_attach_response(response)
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+        Self::handle_attach_response(conn, response)
     }
 
     /// Attaches as a server to a request-response service.
@@ -479,14 +438,16 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.ensure_active()?;
 
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         let request = IamRequest::AttachServer {
             service_id: *service_id,
             max_active_requests,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
-        let response = self.connection.receive_response()?;
-        self.handle_attach_response(response)
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+        Self::handle_attach_response(conn, response)
     }
 
     /// Attaches as a client to a request-response service.
@@ -516,19 +477,21 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.ensure_active()?;
 
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         let request = IamRequest::AttachClient {
             service_id: *service_id,
             max_pending_responses,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
-        let response = self.connection.receive_response()?;
-        self.handle_attach_response(response)
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+        Self::handle_attach_response(conn, response)
     }
 
     /// Handles the response to an attach request.
     fn handle_attach_response(
-        &self,
+        conn: &C,
         response: IamResponse,
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         match response {
@@ -547,7 +510,7 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
 
                 // Receive handles if any
                 let handles = if handle_count > 0 {
-                    let received = self.connection.receive_handles(handle_count)?;
+                    let received = client_receive_handles(conn)?;
                     if received.len() != handle_count {
                         return Err(IamClientError::HandleReceiveFailed);
                     }
@@ -582,13 +545,15 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     pub fn detach(&mut self, service_id: &ServiceId, port_id: u128) -> Result<(), IamClientError> {
         self.ensure_active()?;
 
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         let request = IamRequest::Detach {
             service_id: *service_id,
             port_id,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
-        let response = self.connection.receive_response()?;
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
 
         match response {
             IamResponse::DetachOk => Ok(()),
@@ -633,14 +598,16 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     ) -> Result<(SegmentId, usize, Vec<PlatformHandle>), IamClientError> {
         self.ensure_active()?;
 
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         let request = IamRequest::AddSegment {
             service_id: *service_id,
             port_id,
             requested_size,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
-        let response = self.connection.receive_response()?;
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
 
         match response {
             IamResponse::AddSegmentOk {
@@ -655,7 +622,7 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
 
                 // Receive handles if any
                 let handles = if handle_count > 0 {
-                    let received = self.connection.receive_handles(handle_count)?;
+                    let received = client_receive_handles(conn)?;
                     if received.len() != handle_count {
                         return Err(IamClientError::HandleReceiveFailed);
                     }
@@ -698,13 +665,15 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     ) -> Result<(), IamClientError> {
         self.ensure_active()?;
 
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
         let request = IamRequest::AckSegmentRetirement {
             service_id: *service_id,
             segment_id,
         };
-        self.connection.send_request(&request)?;
+        client_send_message(conn, &request)?;
 
-        let response = self.connection.receive_response()?;
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
 
         match response {
             IamResponse::AckOk => Ok(()),
@@ -728,7 +697,7 @@ impl<C: ClientControlChannelConnection> IamClient<C> {
     }
 }
 
-impl<C: ClientControlChannelConnection> Drop for IamClient<C> {
+impl<C: CalClient> Drop for IamClient<C> {
     fn drop(&mut self) {
         // Disconnect if still connected
         self.disconnect();
@@ -738,94 +707,210 @@ impl<C: ClientControlChannelConnection> Drop for IamClient<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::VecDeque;
     use alloc::vec;
     use core::cell::RefCell;
+    use core::time::Duration;
+    use iceoryx2_bb_system_types::file_name::FileName;
+    use iceoryx2_cal::control_channel::{
+        ControlChannelClient, ControlChannelCredentialsError, ControlChannelReceiveError,
+        ControlChannelSendError,
+    };
+    use iceoryx2_cal::named_concept::NamedConcept;
+    use iceoryx2_cal::security::credentials::ProcessCredentials;
+    use iceoryx2_cal::serialize::{postcard::Postcard, Serialize as CalSerialize};
 
     // ========================================================================
     // Mock Types for Testing
     // ========================================================================
 
-    /// Mock connection for testing.
+    /// Mock connection for testing that implements CAL's ControlChannelClient trait.
+    ///
+    /// This mock stores raw bytes rather than typed messages, matching the actual
+    /// CAL interface. Responses are queued as length-framed serialized bytes.
     struct MockConnection {
-        /// Requests that have been sent.
-        sent_requests: RefCell<Vec<IamRequest>>,
-        /// Responses to return (FIFO queue).
-        responses_to_return: RefCell<Vec<IamResponse>>,
+        /// Raw bytes that have been sent via send().
+        sent_data: RefCell<Vec<Vec<u8>>>,
+        /// Raw bytes to return on receive (FIFO queue).
+        /// Each entry is a complete framed message (4-byte length prefix + payload).
+        receive_queue: RefCell<VecDeque<Vec<u8>>>,
+        /// Current position within the first receive_queue entry (for partial reads).
+        receive_offset: RefCell<usize>,
         /// Handles to return on next receive_handles call.
         handles_to_return: RefCell<Vec<PlatformHandle>>,
-        /// Whether the connection has been closed.
-        closed: RefCell<bool>,
+        /// Credentials to return from peer_credentials().
+        credentials: ProcessCredentials,
         /// Error to return on send (if any).
-        send_error: RefCell<Option<IamClientError>>,
+        send_error: RefCell<Option<ControlChannelSendError>>,
         /// Error to return on receive (if any).
-        receive_error: RefCell<Option<IamClientError>>,
+        receive_error: RefCell<Option<ControlChannelReceiveError>>,
     }
 
     impl MockConnection {
         fn new() -> Self {
             Self {
-                sent_requests: RefCell::new(Vec::new()),
-                responses_to_return: RefCell::new(Vec::new()),
+                sent_data: RefCell::new(Vec::new()),
+                receive_queue: RefCell::new(VecDeque::new()),
+                receive_offset: RefCell::new(0),
                 handles_to_return: RefCell::new(Vec::new()),
-                closed: RefCell::new(false),
+                credentials: ProcessCredentials::new(1234, 1000, 1000),
                 send_error: RefCell::new(None),
                 receive_error: RefCell::new(None),
             }
         }
 
+        /// Queues a response to be received by the client.
+        /// The response is serialized and length-framed.
         fn add_response(&self, response: IamResponse) {
-            self.responses_to_return.borrow_mut().push(response);
+            let payload = Postcard::serialize(&response).unwrap();
+            let len = payload.len() as u32;
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&len.to_le_bytes());
+            framed.extend_from_slice(&payload);
+            self.receive_queue.borrow_mut().push_back(framed);
         }
 
         fn set_send_error(&self, error: IamClientError) {
-            *self.send_error.borrow_mut() = Some(error);
+            let cal_error = match error {
+                IamClientError::SendFailed => ControlChannelSendError::IoError,
+                _ => ControlChannelSendError::InternalFailure,
+            };
+            *self.send_error.borrow_mut() = Some(cal_error);
         }
 
         fn set_receive_error(&self, error: IamClientError) {
-            *self.receive_error.borrow_mut() = Some(error);
+            let cal_error = match error {
+                IamClientError::ReceiveFailed => ControlChannelReceiveError::IoError,
+                _ => ControlChannelReceiveError::InternalFailure,
+            };
+            *self.receive_error.borrow_mut() = Some(cal_error);
         }
 
+        /// Returns the requests that have been sent, deserializing from raw bytes.
         fn get_sent_requests(&self) -> Vec<IamRequest> {
-            self.sent_requests.borrow().clone()
-        }
-
-        #[allow(dead_code)]
-        fn is_closed(&self) -> bool {
-            *self.closed.borrow()
+            self.sent_data
+                .borrow()
+                .iter()
+                .filter_map(|data| {
+                    // Skip the 4-byte length prefix and deserialize the payload
+                    if data.len() < 4 {
+                        return None;
+                    }
+                    Postcard::deserialize(&data[4..]).ok()
+                })
+                .collect()
         }
     }
 
-    impl ClientControlChannelConnection for MockConnection {
-        fn send_request(&self, request: &IamRequest) -> Result<(), IamClientError> {
-            if let Some(error) = self.send_error.borrow_mut().take() {
-                return Err(error);
-            }
-            self.sent_requests.borrow_mut().push(request.clone());
+    impl core::fmt::Debug for MockConnection {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("MockConnection").finish()
+        }
+    }
+
+    impl NamedConcept for MockConnection {
+        fn name(&self) -> &FileName {
+            static NAME: FileName = unsafe { FileName::new_unchecked_const(b"mock_connection") };
+            &NAME
+        }
+    }
+
+    impl ControlChannelClient for MockConnection {
+        fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
+            Ok(self.credentials.clone())
+        }
+
+        fn send_handles(
+            &self,
+            _handles: &[&PlatformHandle],
+        ) -> Result<(), ControlChannelSendError> {
             Ok(())
         }
 
-        fn receive_response(&self) -> Result<IamResponse, IamClientError> {
+        fn try_send_handles(
+            &self,
+            _handles: &[&PlatformHandle],
+        ) -> Result<bool, ControlChannelSendError> {
+            Ok(true)
+        }
+
+        fn receive_handles(
+            &self,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            let handles = self.handles_to_return.borrow_mut().drain(..).collect::<Vec<_>>();
+            if handles.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(handles))
+            }
+        }
+
+        fn try_receive_handles(
+            &self,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            self.receive_handles()
+        }
+
+        fn timed_receive_handles(
+            &self,
+            _timeout: Duration,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            self.receive_handles()
+        }
+
+        fn blocking_receive_handles(
+            &self,
+        ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
+            self.receive_handles()
+                .and_then(|opt| opt.ok_or(ControlChannelReceiveError::IoError))
+        }
+
+        fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError> {
+            if let Some(error) = self.send_error.borrow_mut().take() {
+                return Err(error);
+            }
+            self.sent_data.borrow_mut().push(data.to_vec());
+            Ok(())
+        }
+
+        fn try_send(&self, data: &[u8]) -> Result<u64, ControlChannelSendError> {
+            self.send(data)?;
+            Ok(data.len() as u64)
+        }
+
+        fn receive(&self, buffer: &mut [u8]) -> Result<u64, ControlChannelReceiveError> {
             if let Some(error) = self.receive_error.borrow_mut().take() {
                 return Err(error);
             }
-            let mut responses = self.responses_to_return.borrow_mut();
-            if responses.is_empty() {
-                Err(IamClientError::ReceiveFailed)
+
+            let mut queue = self.receive_queue.borrow_mut();
+            let offset = *self.receive_offset.borrow();
+
+            if queue.is_empty() {
+                return Err(ControlChannelReceiveError::WouldBlock);
+            }
+
+            let front = queue.front().unwrap();
+            let remaining = &front[offset..];
+            let to_copy = core::cmp::min(remaining.len(), buffer.len());
+            buffer[..to_copy].copy_from_slice(&remaining[..to_copy]);
+
+            if offset + to_copy >= front.len() {
+                // Finished this message, move to next
+                queue.pop_front();
+                *self.receive_offset.borrow_mut() = 0;
             } else {
-                Ok(responses.remove(0)) // FIFO: remove from front
+                *self.receive_offset.borrow_mut() = offset + to_copy;
             }
+
+            Ok(to_copy as u64)
         }
 
-        fn receive_handles(&self, count: usize) -> Result<Vec<PlatformHandle>, IamClientError> {
-            let mut handles = self.handles_to_return.borrow_mut();
-            if handles.len() < count {
-                return Err(IamClientError::HandleReceiveFailed);
+        fn try_receive(&self, buffer: &mut [u8]) -> Result<u64, ControlChannelReceiveError> {
+            if self.receive_queue.borrow().is_empty() {
+                return Ok(0);
             }
-            Ok(handles.drain(..count).collect())
-        }
-
-        fn close(&self) {
-            *self.closed.borrow_mut() = true;
+            self.receive(buffer)
         }
     }
 
@@ -1026,7 +1111,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1046,7 +1132,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1079,7 +1166,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1117,7 +1205,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1148,7 +1237,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1177,7 +1267,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1204,7 +1295,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1230,7 +1322,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1257,7 +1350,8 @@ mod tests {
         connection.add_response(IamResponse::DetachOk);
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1303,7 +1397,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1333,7 +1428,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1360,7 +1456,8 @@ mod tests {
         connection.add_response(IamResponse::AckOk);
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1385,7 +1482,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1435,7 +1533,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1468,7 +1567,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1496,7 +1596,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1525,7 +1626,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1562,7 +1664,7 @@ mod tests {
         let node_id = UniqueSystemId::new().unwrap();
         client.handshake(node_id).unwrap();
 
-        let requests = client.connection.get_sent_requests();
+        let requests = client.connection.as_ref().unwrap().get_sent_requests();
         assert_eq!(requests.len(), 1);
 
         match &requests[0] {
@@ -1592,7 +1694,8 @@ mod tests {
         });
 
         let mut client = IamClient {
-            connection,
+            connection: Some(connection),
+            receive_buffer: new_receive_buffer(),
             session_id: SessionId::from_value(42),
             protocol_version: ProtocolVersion::CURRENT,
             state: ConnectionState::Active,
@@ -1602,7 +1705,7 @@ mod tests {
             .create_service(&service_name, MessagingPatternKind::PublishSubscribe)
             .unwrap();
 
-        let requests = client.connection.get_sent_requests();
+        let requests = client.connection.as_ref().unwrap().get_sent_requests();
         assert_eq!(requests.len(), 1);
 
         match &requests[0] {

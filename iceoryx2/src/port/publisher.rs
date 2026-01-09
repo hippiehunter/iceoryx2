@@ -138,7 +138,7 @@ use crate::service::naming_scheme::data_segment_name;
 use crate::service::port_factory::publisher::LocalPublisherConfig;
 use crate::service::static_config::message_type_details::TypeVariant;
 use crate::service::static_config::publish_subscribe;
-use crate::service::{self, NoResource, ServiceState};
+use crate::service::{self, SecurityResource, ServiceState};
 
 use super::details::data_segment::{DataSegment, DataSegmentType};
 use super::details::segment_state::SegmentState;
@@ -159,6 +159,13 @@ pub enum PublisherCreateError {
     /// Caused by a failure when instantiating a [`ArcSyncPolicy`] defined in the
     /// [`Service`](crate::service::Service) as `ArcThreadSafetyPolicy`.
     FailedToDeployThreadsafetyPolicy,
+    /// The IAM server denied the attach request for this publisher.
+    /// This typically occurs when the IAM policy does not allow the requesting
+    /// process to create publishers on this service.
+    IamAuthorizationDenied,
+    /// Failed to communicate with the IAM server.
+    /// The IAM connection may have been lost or the server may be unavailable.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for PublisherCreateError {
@@ -363,7 +370,7 @@ impl<
     > Publisher<Service, Payload, UserHeader>
 {
     pub(crate) fn new(
-        service: Arc<ServiceState<Service, NoResource>>,
+        service: Arc<ServiceState<Service, SecurityResource>>,
         static_config: &publish_subscribe::StaticConfig,
         config: LocalPublisherConfig,
     ) -> Result<Self, PublisherCreateError> {

@@ -71,8 +71,12 @@
 //! server.process()?;
 //! ```
 
+use alloc::vec::Vec;
 use std::collections::HashMap;
 
+use iceoryx2_cal::control_channel::{
+    ControlChannelConnection as CalConnection, ControlChannelListener as CalListener,
+};
 use iceoryx2_cal::security::credentials::ProcessCredentials;
 use iceoryx2_cal::security::handle::PlatformHandle;
 use iceoryx2_cal::security::AccessRights;
@@ -86,89 +90,25 @@ use super::protocol::{
 };
 use super::segment_manager::SegmentManager;
 use super::session::{ClientSession, SessionResourceUsage};
-
-// ============================================================================
-// ControlChannel Trait (Placeholder for SP2/SP3)
-// ============================================================================
-
-/// Trait for control channel connections.
-///
-/// This trait abstracts the platform-specific control channel implementation.
-/// The actual implementations are provided by SP2 (Linux) and SP3 (Windows).
-///
-/// # Responsibilities
-///
-/// Implementations are responsible for:
-/// - Secure credential retrieval from the OS (SCM_CREDENTIALS, ImpersonateNamedPipeClient)
-/// - Secure handle passing (SCM_RIGHTS, DuplicateHandle)
-/// - Message serialization/deserialization (e.g., using postcard)
-/// - Framing and buffering
-///
-/// # Safety
-///
-/// Implementations must ensure that:
-/// - Credentials are obtained securely from the OS, not self-reported
-/// - Handle passing uses secure mechanisms
-pub trait ControlChannelConnection: Send {
-    /// Returns the peer's process credentials.
-    ///
-    /// This must be obtained securely from the OS, not self-reported.
-    fn peer_credentials(&self) -> Result<ProcessCredentials, IamServerError>;
-
-    /// Tries to receive a request without blocking.
-    ///
-    /// The implementation is responsible for deserializing the request from
-    /// the wire format (e.g., using postcard).
-    ///
-    /// Returns `Ok(Some(request))` if a complete request was received,
-    /// `Ok(None)` if no data is available (would block), or an error.
-    fn try_receive_request(&self) -> Result<Option<IamRequest>, IamServerError>;
-
-    /// Sends a response to the peer.
-    ///
-    /// The implementation is responsible for serializing the response to
-    /// the wire format (e.g., using postcard).
-    fn send_response(&self, response: &IamResponse) -> Result<(), IamServerError>;
-
-    /// Sends a notification to the peer.
-    ///
-    /// The implementation is responsible for serializing the notification to
-    /// the wire format (e.g., using postcard).
-    fn send_notification(&self, notification: &IamNotification) -> Result<(), IamServerError>;
-
-    /// Sends handles to the peer.
-    fn send_handles(&self, handles: &[PlatformHandle]) -> Result<(), IamServerError>;
-}
-
-/// Trait for control channel listeners.
-///
-/// This trait abstracts the platform-specific listener implementation.
-pub trait ControlChannelListener: Send {
-    /// The connection type produced by this listener.
-    type Connection: ControlChannelConnection;
-
-    /// Tries to accept a connection without blocking.
-    ///
-    /// Returns `Ok(Some(connection))` if a client connected,
-    /// `Ok(None)` if no pending connections, or an error.
-    fn try_accept(&self) -> Result<Option<Self::Connection>, IamServerError>;
-}
+use super::wire::{
+    new_receive_buffer, peer_credentials, send_handles, send_message, try_receive_message,
+};
 
 // ============================================================================
 // SessionEntry
 // ============================================================================
 
 /// Entry in the sessions map combining session state and connection.
-struct SessionEntry<C: ControlChannelConnection> {
+struct SessionEntry<C: CalConnection> {
     /// The client session state.
     session: ClientSession,
-    /// The connection to the client.
+    /// The connection to the client (CAL type stored directly).
     connection: C,
     /// Whether the handshake has completed.
     handshake_complete: bool,
 }
 
-impl<C: ControlChannelConnection> SessionEntry<C> {
+impl<C: CalConnection> SessionEntry<C> {
     fn new(session: ClientSession, connection: C) -> Self {
         Self {
             session,
@@ -185,7 +125,7 @@ impl<C: ControlChannelConnection> SessionEntry<C> {
 /// The IAM server for secured inter-process communication.
 ///
 /// The server is parameterized over:
-/// - `L: ControlChannelListener` - The listener type for accepting connections
+/// - `L: CalListener` - The CAL listener type for accepting connections
 /// - `P: IamPolicy` - The policy for authorization decisions
 ///
 /// # Responsibilities
@@ -201,7 +141,7 @@ impl<C: ControlChannelConnection> SessionEntry<C> {
 /// `IamServer` is `Send` but not `Sync`. It is designed to run in a single thread
 /// that calls `process()` periodically. For multi-threaded scenarios, each thread
 /// should have its own server instance.
-pub struct IamServer<L: ControlChannelListener, P: IamPolicy> {
+pub struct IamServer<L: CalListener, P: IamPolicy> {
     /// The listener for accepting new connections.
     listener: L,
     /// Active sessions indexed by session ID.
@@ -212,9 +152,11 @@ pub struct IamServer<L: ControlChannelListener, P: IamPolicy> {
     policy: P,
     /// Counter for generating unique port IDs.
     port_counter: u128,
+    /// Shared receive buffer for deserializing messages.
+    receive_buffer: Vec<u8>,
 }
 
-impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
+impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
     /// Creates a new IAM server with the given listener and policy.
     ///
     /// # Arguments
@@ -228,6 +170,7 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
             segment_manager: SegmentManager::new(),
             policy,
             port_counter: 0,
+            receive_buffer: new_receive_buffer(),
         }
     }
 
@@ -275,7 +218,11 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
         let mut processed = 0;
 
         // Accept new connections
-        while let Some(connection) = self.listener.try_accept()? {
+        while let Some(connection) = self
+            .listener
+            .try_accept()
+            .map_err(|_| IamServerError::AcceptFailed)?
+        {
             self.handle_new_connection(connection)?;
         }
 
@@ -296,15 +243,15 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
 
     /// Handles a new client connection.
     fn handle_new_connection(&mut self, connection: L::Connection) -> Result<(), IamServerError> {
-        // Get peer credentials from the OS
-        let credentials = connection.peer_credentials()?;
+        // Get peer credentials from the OS using wire helper
+        let credentials = peer_credentials(&connection)?;
 
         // Check if connection is allowed by policy
         let decision = self.policy.authorize_connect(&credentials);
         if let PolicyDecision::Deny { reason, message } = decision {
-            // Send denial and close
+            // Send denial and close using wire helper
             let response = IamResponse::Denied { reason, message };
-            let _ = self.send_response(&connection, &response);
+            let _ = send_message(&connection, &response);
             return Ok(());
         }
 
@@ -321,14 +268,16 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
     fn process_session_requests(&mut self, session_id: SessionId) -> Result<usize, IamServerError> {
         let mut processed = 0;
 
-        // Try to receive a request
+        // Try to receive a request using wire helper
         let request = {
             let entry = self
                 .sessions
                 .get(&session_id)
                 .ok_or(IamServerError::SessionNotFound)?;
 
-            match entry.connection.try_receive_request() {
+            // Use wire helper to receive and deserialize request
+            match try_receive_message::<_, IamRequest>(&entry.connection, &mut self.receive_buffer)
+            {
                 Ok(Some(req)) => req,
                 Ok(None) => return Ok(0), // No data available
                 Err(e) => return Err(e),
@@ -921,16 +870,16 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
     // Response/Handle Sending
     // ========================================================================
 
-    /// Sends a response to a specific connection.
-    fn send_response(
+    /// Sends a response to a specific connection using wire helper.
+    fn send_response_to_connection(
         &self,
         connection: &L::Connection,
         response: &IamResponse,
     ) -> Result<(), IamServerError> {
-        connection.send_response(response)
+        send_message(connection, response)
     }
 
-    /// Sends a response to a session.
+    /// Sends a response to a session using wire helper.
     fn send_response_to_session(
         &self,
         session_id: SessionId,
@@ -941,10 +890,10 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
             .get(&session_id)
             .ok_or(IamServerError::SessionNotFound)?;
 
-        entry.connection.send_response(response)
+        send_message(&entry.connection, response)
     }
 
-    /// Sends handles to a session.
+    /// Sends handles to a session using wire helper.
     fn send_handles_to_session(
         &self,
         session_id: SessionId,
@@ -955,7 +904,7 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
             .get(&session_id)
             .ok_or(IamServerError::SessionNotFound)?;
 
-        entry.connection.send_handles(handles)
+        send_handles(&entry.connection, handles)
     }
 
     // ========================================================================
@@ -1053,8 +1002,8 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
     ) -> Result<(), IamServerError> {
         for session_id in session_ids {
             if let Some(entry) = self.sessions.get(session_id) {
-                // Ignore individual send failures
-                let _ = entry.connection.send_notification(notification);
+                // Ignore individual send failures, use wire helper
+                let _ = send_message(&entry.connection, notification);
             }
         }
 
@@ -1062,62 +1011,351 @@ impl<L: ControlChannelListener, P: IamPolicy> IamServer<L, P> {
     }
 }
 
+// ============================================================================
+// Type Erasure for IamServer
+// ============================================================================
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+/// Type-erased trait for IAM server operations.
+///
+/// This trait hides the generic parameters (`L: CalListener`, `P: IamPolicy`)
+/// to allow storing the server in non-generic service state.
+/// Must be `Send + Sync` since it's stored in `Arc<ServiceState>`.
+pub(crate) trait ErasedIamServer: Send + Sync {
+    /// Processes pending connections and requests.
+    ///
+    /// Returns the number of requests processed.
+    fn process(&self) -> Result<usize, IamServerError>;
+
+    /// Shuts down the server, clearing all sessions.
+    ///
+    /// After shutdown, `process()` will return 0 immediately.
+    fn shutdown(&self);
+
+    /// Returns true if the server has active sessions.
+    fn has_active_sessions(&self) -> bool;
+}
+
+/// Inner wrapper that provides interior mutability for IamServer.
+struct IamServerInner<L: CalListener, P: IamPolicy> {
+    server: Mutex<Option<IamServer<L, P>>>,
+}
+
+impl<L, P> ErasedIamServer for IamServerInner<L, P>
+where
+    L: CalListener + Send + 'static,
+    L::Connection: Send,
+    P: IamPolicy + Send + 'static,
+{
+    fn process(&self) -> Result<usize, IamServerError> {
+        let mut guard = self.server.lock().map_err(|_| IamServerError::InternalError)?;
+        match guard.as_mut() {
+            Some(server) => server.process(),
+            None => Ok(0), // Already shut down
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Ok(mut guard) = self.server.lock() {
+            // Take the server to drop it, clearing all sessions
+            let _ = guard.take();
+        }
+    }
+
+    fn has_active_sessions(&self) -> bool {
+        self.server
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|s| s.session_count() > 0))
+            .unwrap_or(false)
+    }
+}
+
+/// Type-erased IAM server container with background processing.
+///
+/// This wrapper hides the generic parameters of [`IamServer`] to allow storing
+/// it in non-generic service state structures. It automatically spawns a
+/// background thread to process IAM requests, allowing client connections
+/// to be handled asynchronously.
+///
+/// # Thread Safety
+///
+/// `TypeErasedIamServer` is `Send` and the underlying server operations are
+/// protected by a Mutex. The background thread continuously processes
+/// connections and requests.
+///
+/// # Lifecycle
+///
+/// When dropped, the server signals the background thread to stop and waits
+/// for it to complete before returning.
+pub(crate) struct TypeErasedIamServer {
+    inner: Arc<dyn ErasedIamServer>,
+    shutdown_flag: Arc<AtomicBool>,
+    processing_thread: Option<JoinHandle<()>>,
+}
+
+/// How often to poll for new connections/requests (in milliseconds).
+const PROCESSING_INTERVAL_MS: u64 = 10;
+
+impl TypeErasedIamServer {
+    /// Creates a new type-erased IAM server with background processing.
+    ///
+    /// Spawns a background thread that continuously processes connections
+    /// and requests from IAM clients.
+    pub fn new<L, P>(server: IamServer<L, P>) -> Self
+    where
+        L: CalListener + Send + 'static,
+        L::Connection: Send,
+        P: IamPolicy + Send + 'static,
+    {
+        let inner: Arc<dyn ErasedIamServer> = Arc::new(IamServerInner {
+            server: Mutex::new(Some(server)),
+        });
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+        // Clone for the processing thread
+        let inner_clone = Arc::clone(&inner);
+        let shutdown_clone = Arc::clone(&shutdown_flag);
+
+        // Spawn background processing thread
+        let processing_thread = thread::spawn(move || {
+            while !shutdown_clone.load(Ordering::Relaxed) {
+                // Process pending connections and requests
+                if let Err(_e) = inner_clone.process() {
+                    // Log error but continue processing
+                    // In production, we might want to limit error rates
+                }
+                // Sleep briefly to avoid busy-waiting
+                thread::sleep(Duration::from_millis(PROCESSING_INTERVAL_MS));
+            }
+        });
+
+        Self {
+            inner,
+            shutdown_flag,
+            processing_thread: Some(processing_thread),
+        }
+    }
+
+    /// Processes pending connections and requests manually.
+    ///
+    /// This method is called automatically by the background thread,
+    /// but can also be called manually for immediate processing.
+    ///
+    /// # Returns
+    ///
+    /// The number of requests processed, or an error.
+    pub fn process(&self) -> Result<usize, IamServerError> {
+        self.inner.process()
+    }
+
+    /// Shuts down the server, clearing all sessions.
+    ///
+    /// This stops the background processing thread and clears all sessions.
+    /// Called automatically when the service is dropped.
+    pub fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        self.inner.shutdown()
+    }
+
+    /// Returns true if the server has active sessions.
+    pub fn has_active_sessions(&self) -> bool {
+        self.inner.has_active_sessions()
+    }
+}
+
+impl Drop for TypeErasedIamServer {
+    fn drop(&mut self) {
+        // Signal the processing thread to stop
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+
+        // Wait for the processing thread to finish
+        if let Some(thread) = self.processing_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl std::fmt::Debug for TypeErasedIamServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypeErasedIamServer")
+            .field("has_active_sessions", &self.has_active_sessions())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::iam::DefaultPolicy;
+    use core::time::Duration;
+    use iceoryx2_bb_system_types::file_name::FileName;
+    use iceoryx2_cal::control_channel::{
+        ControlChannelAcceptError, ControlChannelCredentialsError, ControlChannelReceiveError,
+        ControlChannelSendError,
+    };
+    use iceoryx2_cal::named_concept::NamedConcept;
+    use iceoryx2_cal::serialize::{postcard::Postcard, Serialize as CalSerialize};
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     // ========================================================================
     // Mock Types for Testing
     // ========================================================================
 
-    /// Mock connection for testing.
+    /// Mock connection for testing that implements CAL's ControlChannelConnection trait.
+    ///
+    /// This mock stores raw bytes rather than typed messages, matching the actual
+    /// CAL interface. Requests/responses are serialized with length framing.
     struct MockConnection {
         credentials: ProcessCredentials,
-        received_responses: Arc<Mutex<Vec<IamResponse>>>,
-        request_to_receive: Arc<Mutex<Option<IamRequest>>>,
+        /// Raw bytes sent by the server (responses serialized with length prefix).
+        sent_data: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// Raw bytes to return on receive (requests serialized with length prefix).
+        receive_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        /// Current position within the first receive_queue entry (for partial reads).
+        receive_offset: Arc<Mutex<usize>>,
     }
 
     impl MockConnection {
         fn new(credentials: ProcessCredentials) -> Self {
             Self {
                 credentials,
-                received_responses: Arc::new(Mutex::new(Vec::new())),
-                request_to_receive: Arc::new(Mutex::new(None)),
+                sent_data: Arc::new(Mutex::new(Vec::new())),
+                receive_queue: Arc::new(Mutex::new(VecDeque::new())),
+                receive_offset: Arc::new(Mutex::new(0)),
             }
         }
 
+        /// Queues a request to be received by the server (simulating client sending).
         #[allow(dead_code)]
         fn set_receive_request(&self, request: IamRequest) {
-            *self.request_to_receive.lock().unwrap() = Some(request);
+            let payload = Postcard::serialize(&request).unwrap();
+            let len = payload.len() as u32;
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&len.to_le_bytes());
+            framed.extend_from_slice(&payload);
+            self.receive_queue.lock().unwrap().push_back(framed);
+        }
+
+        /// Returns the responses that have been sent, deserializing from raw bytes.
+        #[allow(dead_code)]
+        fn get_sent_responses(&self) -> Vec<IamResponse> {
+            self.sent_data
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|data| {
+                    // Skip the 4-byte length prefix and deserialize the payload
+                    if data.len() < 4 {
+                        return None;
+                    }
+                    Postcard::deserialize(&data[4..]).ok()
+                })
+                .collect()
         }
     }
 
-    impl ControlChannelConnection for MockConnection {
-        fn peer_credentials(&self) -> Result<ProcessCredentials, IamServerError> {
+    impl core::fmt::Debug for MockConnection {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("MockConnection").finish()
+        }
+    }
+
+    impl CalConnection for MockConnection {
+        fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
             Ok(self.credentials.clone())
         }
 
-        fn try_receive_request(&self) -> Result<Option<IamRequest>, IamServerError> {
-            Ok(self.request_to_receive.lock().unwrap().take())
-        }
-
-        fn send_response(&self, response: &IamResponse) -> Result<(), IamServerError> {
-            self.received_responses.lock().unwrap().push(response.clone());
+        fn send_handles(
+            &self,
+            handles: &[&PlatformHandle],
+        ) -> Result<(), ControlChannelSendError> {
+            // We can't clone handles, but for testing we track how many were "sent"
+            let _ = handles;
             Ok(())
         }
 
-        fn send_notification(&self, _notification: &IamNotification) -> Result<(), IamServerError> {
+        fn try_send_handles(
+            &self,
+            handles: &[&PlatformHandle],
+        ) -> Result<bool, ControlChannelSendError> {
+            self.send_handles(handles)?;
+            Ok(true)
+        }
+
+        fn receive_handles(
+            &self,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            Ok(None)
+        }
+
+        fn try_receive_handles(
+            &self,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            Ok(None)
+        }
+
+        fn timed_receive_handles(
+            &self,
+            _timeout: Duration,
+        ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
+            Ok(None)
+        }
+
+        fn blocking_receive_handles(
+            &self,
+        ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
+            Ok(Vec::new())
+        }
+
+        fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError> {
+            self.sent_data.lock().unwrap().push(data.to_vec());
             Ok(())
         }
 
-        fn send_handles(&self, _handles: &[PlatformHandle]) -> Result<(), IamServerError> {
-            Ok(())
+        fn try_send(&self, data: &[u8]) -> Result<u64, ControlChannelSendError> {
+            self.send(data)?;
+            Ok(data.len() as u64)
+        }
+
+        fn receive(&self, buffer: &mut [u8]) -> Result<u64, ControlChannelReceiveError> {
+            let mut queue = self.receive_queue.lock().unwrap();
+            let mut offset = self.receive_offset.lock().unwrap();
+
+            if queue.is_empty() {
+                return Err(ControlChannelReceiveError::WouldBlock);
+            }
+
+            let front = queue.front().unwrap();
+            let remaining = &front[*offset..];
+            let to_copy = core::cmp::min(remaining.len(), buffer.len());
+            buffer[..to_copy].copy_from_slice(&remaining[..to_copy]);
+
+            if *offset + to_copy >= front.len() {
+                // Finished this message, move to next
+                queue.pop_front();
+                *offset = 0;
+            } else {
+                *offset += to_copy;
+            }
+
+            Ok(to_copy as u64)
+        }
+
+        fn try_receive(&self, buffer: &mut [u8]) -> Result<u64, ControlChannelReceiveError> {
+            if self.receive_queue.lock().unwrap().is_empty() {
+                return Ok(0);
+            }
+            self.receive(buffer)
         }
     }
 
-    /// Mock listener for testing.
+    /// Mock listener for testing that implements CAL's ControlChannelListener trait.
     struct MockListener {
         pending_connections: Arc<Mutex<Vec<MockConnection>>>,
     }
@@ -1134,11 +1372,36 @@ mod tests {
         }
     }
 
-    impl ControlChannelListener for MockListener {
+    impl core::fmt::Debug for MockListener {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("MockListener").finish()
+        }
+    }
+
+    impl NamedConcept for MockListener {
+        fn name(&self) -> &FileName {
+            static NAME: FileName = unsafe { FileName::new_unchecked_const(b"mock_listener") };
+            &NAME
+        }
+    }
+
+    impl CalListener for MockListener {
         type Connection = MockConnection;
 
-        fn try_accept(&self) -> Result<Option<Self::Connection>, IamServerError> {
+        fn try_accept(&self) -> Result<Option<Self::Connection>, ControlChannelAcceptError> {
             Ok(self.pending_connections.lock().unwrap().pop())
+        }
+
+        fn timed_accept(
+            &self,
+            _timeout: Duration,
+        ) -> Result<Option<Self::Connection>, ControlChannelAcceptError> {
+            self.try_accept()
+        }
+
+        fn blocking_accept(&self) -> Result<Self::Connection, ControlChannelAcceptError> {
+            self.try_accept()?
+                .ok_or(ControlChannelAcceptError::WouldBlock)
         }
     }
 
@@ -1206,16 +1469,21 @@ mod tests {
 
         // Add connection with UID 1000 (not authorized)
         let conn = MockConnection::new(ProcessCredentials::new(1234, 1000, 1000));
-        let received_responses = conn.received_responses.clone();
+        let sent_data = conn.sent_data.clone();
         server.listener.add_connection(conn);
 
         // Process - should reject and not add session
         server.process().unwrap();
 
         // Connection was rejected - check that a denial was sent
-        let responses = received_responses.lock().unwrap();
-        if !responses.is_empty() {
-            assert!(matches!(responses[0], IamResponse::Denied { .. }));
+        let raw_responses = sent_data.lock().unwrap();
+        if !raw_responses.is_empty() {
+            // Deserialize the response from raw bytes (skip 4-byte length prefix)
+            if raw_responses[0].len() > 4 {
+                if let Ok(response) = Postcard::deserialize::<IamResponse>(&raw_responses[0][4..]) {
+                    assert!(matches!(response, IamResponse::Denied { .. }));
+                }
+            }
         }
     }
 

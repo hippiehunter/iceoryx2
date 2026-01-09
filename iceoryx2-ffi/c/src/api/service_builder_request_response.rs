@@ -95,6 +95,8 @@ pub enum iox2_request_response_open_or_create_error_e {
     O_IS_MARKED_FOR_DESTRUCTION,
     #[CStr = "service in corrupted state"]
     O_SERVICE_IN_CORRUPTED_STATE,
+    #[CStr = "incompatible security mode"]
+    O_INCOMPATIBLE_SECURITY_MODE,
     #[CStr = "already exists"]
     C_ALREADY_EXISTS,
     #[CStr = "internal failure"]
@@ -107,6 +109,12 @@ pub enum iox2_request_response_open_or_create_error_e {
     C_HANGS_IN_CREATION,
     #[CStr = "service in corrupted state"]
     C_SERVICE_IN_CORRUPTED_STATE,
+    #[CStr = "IAM server creation failed"]
+    C_IAM_SERVER_CREATION_FAILED,
+    #[CStr = "IAM connection failed"]
+    O_IAM_CONNECTION_FAILED,
+    #[CStr = "IAM handshake failed"]
+    O_IAM_HANDSHAKE_FAILED,
     #[CStr = "system in flux"]
     SYSTEM_IN_FLUX,
 }
@@ -135,6 +143,9 @@ impl IntoCInt for RequestResponseOpenError {
             RequestResponseOpenError::InternalFailure => iox2_request_response_open_or_create_error_e::O_INTERNAL_FAILURE,
             RequestResponseOpenError::IsMarkedForDestruction => iox2_request_response_open_or_create_error_e::O_IS_MARKED_FOR_DESTRUCTION,
             RequestResponseOpenError::ServiceInCorruptedState => iox2_request_response_open_or_create_error_e::O_SERVICE_IN_CORRUPTED_STATE,
+            RequestResponseOpenError::IncompatibleSecurityMode => iox2_request_response_open_or_create_error_e::O_INCOMPATIBLE_SECURITY_MODE,
+            RequestResponseOpenError::IamConnectionFailed => iox2_request_response_open_or_create_error_e::O_IAM_CONNECTION_FAILED,
+            RequestResponseOpenError::IamHandshakeFailed => iox2_request_response_open_or_create_error_e::O_IAM_HANDSHAKE_FAILED,
         }) as c_int
     }
 }
@@ -159,6 +170,9 @@ impl IntoCInt for RequestResponseCreateError {
             }
             RequestResponseCreateError::ServiceInCorruptedState => {
                 iox2_request_response_open_or_create_error_e::C_SERVICE_IN_CORRUPTED_STATE
+            }
+            RequestResponseCreateError::IamServerCreationFailed => {
+                iox2_request_response_open_or_create_error_e::C_IAM_SERVER_CREATION_FAILED
             }
         }) as c_int
     }
