@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use iceoryx2_bb_concurrency::atomic::AtomicU64;
 use iceoryx2_bb_container::flatmap::RelocatableFlatMap;
 use iceoryx2_bb_container::queue::RelocatableContainer;
-use iceoryx2_bb_container::string::*;
+use iceoryx2_bb_container::string::String;
 use iceoryx2_bb_container::vector::relocatable_vec::*;
 use iceoryx2_bb_derive_macros::ZeroCopySend;
 use iceoryx2_bb_elementary::static_assert::static_assert_eq;
@@ -457,7 +457,7 @@ impl<
                     TypeDetail::new::<KeyType>(message_type_details::TypeVariant::FixedSize);
             }
             Some(details) => {
-                self.config_details_mut().type_details = details.clone();
+                self.config_details_mut().type_details = *details;
             }
         }
     }
@@ -732,7 +732,7 @@ impl<
                                 };
                                 (*self.builder.internals[i].value_writer)(mem.data_ptr);
                                 // write offset to value in payload_shm to entries vector
-                                let res = entry.entries.push(Entry{type_details: self.builder.internals[i].value_type_details.clone(), offset: AtomicU64::new(mem.offset.offset() as u64)});
+                                let res = entry.entries.push(Entry{type_details: self.builder.internals[i].value_type_details, offset: AtomicU64::new(mem.offset.offset() as u64)});
                                 if res.is_err() {
                                     error!(from self, "Writing the value offset to the blackboard management segment failed.");
                                     return false
@@ -780,7 +780,7 @@ impl<
 impl<ServiceType: service::Service> Creator<CustomKeyMarker, ServiceType> {
     #[doc(hidden)]
     pub unsafe fn __internal_set_key_type_details(mut self, value: &TypeDetail) -> Self {
-        self.builder.override_key_type = Some(value.clone());
+        self.builder.override_key_type = Some(*value);
         self
     }
 
@@ -801,7 +801,7 @@ impl<ServiceType: service::Service> Creator<CustomKeyMarker, ServiceType> {
         value_details: TypeDetail,
         value_cleanup: Box<dyn FnMut()>,
     ) -> Self {
-        let key_type_details = match self.builder.override_key_type.clone() {
+        let key_type_details = match self.builder.override_key_type {
             None => {
                 fatal_panic!(from self, "The key type details were not set when __internal_add was called!")
             }
@@ -925,7 +925,7 @@ impl<
                                 msg, existing_settings.max_nodes, required_settings.max_nodes);
         }
 
-        Ok(existing_settings.clone())
+        Ok(*existing_settings)
     }
 
     /// Opens an existing [`Service`].
@@ -1000,7 +1000,7 @@ impl<
                     };
 
                     self.builder.base.service_config.messaging_pattern =
-                        MessagingPattern::Blackboard(blackboard_static_config.clone());
+                        MessagingPattern::Blackboard(blackboard_static_config);
 
                     let name =
                         blackboard_name(self.builder.base.service_config.service_id().as_str());
@@ -1077,7 +1077,7 @@ impl<
 impl<ServiceType: service::Service> Opener<CustomKeyMarker, ServiceType> {
     #[doc(hidden)]
     pub unsafe fn __internal_set_key_type_details(mut self, value: &TypeDetail) -> Self {
-        self.builder.override_key_type = Some(value.clone());
+        self.builder.override_key_type = Some(*value);
         self
     }
 }

@@ -14,6 +14,7 @@
 
 pub mod atomic;
 pub mod cell;
+pub mod lazy_lock;
 pub mod spin_lock;
 
 #[cfg(not(feature = "std"))]

@@ -162,7 +162,7 @@ payload data segment
   [`true`|`false`]: Defines if the request buffer of the service safely
   overflows.
 * `defaults.request-response.enable-safe-overflow-for-responses` -
-  [`true`|`false`]: Defines if the request buffer of the service safely
+  [`true`|`false`]: Defines if the response buffer of the service safely
   overflows.
 * `defaults.request-response.max-active-requests-per-client` - [int]:
   The maximum of active requests a server can hold per client
@@ -242,7 +242,7 @@ pub mod settings {
 }
 ```
 
-To configure the build to use the custom settings, the following must be done:
+The build steps are as follows:
 
 1. Set environment variable with absolute path to the configuration file:
 
@@ -275,8 +275,8 @@ Similar to the platform configuration, users may want to use a completely
 different platform abstraction (from those in
 `iceoryx2/iceoryx2-pal/posix/src`) for a specific operating system.
 
-To achieve this, the environment variable `IOX2_CUSTOM_POSIX_PLATFORM_PATH` can be
-utilized.
+To achieve this, the environment variable `IOX2_CUSTOM_POSIX_PLATFORM_PATH` can
+be utilized.
 
 The first step is to prepare the customized platform at some location (which
 can be outside of the `iceoryx2` workspace).

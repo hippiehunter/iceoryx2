@@ -25,7 +25,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::process::*;
 //! use iceoryx2_bb_posix::scheduler::*;
@@ -57,10 +57,10 @@ use crate::{
     signal::Signal,
 };
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ProcessExecutablePathError {
+enum_gen! { ProcessExecutablePathError
+  entry:
     ContainsInvalidCharacters,
-    UnableToRead,
+    UnableToRead
 }
 
 enum_gen! { ProcessSendSignalError

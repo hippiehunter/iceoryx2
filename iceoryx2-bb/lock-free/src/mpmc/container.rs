@@ -25,7 +25,7 @@
 //! # Example
 //!
 //! ```
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_lock_free::mpmc::container::*;
 //!
@@ -142,7 +142,7 @@ impl<T: Copy + Debug> ContainerState<T> {
     /// **Note:** The index of a value never changes as long as it is stored inside the container.
     ///
     /// ```
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_lock_free::mpmc::container::*;
     ///
@@ -462,8 +462,8 @@ impl<T: Copy + Debug, const CAPACITY: usize> Default for FixedSizeContainer<T, C
             container: unsafe { Container::new_uninit(CAPACITY) },
             next_free_index: core::array::from_fn(|i| UnsafeCell::new(i as u32 + 1)),
             next_free_index_plus_one: UnsafeCell::new(CAPACITY as u32 + 1),
-            active_index: core::array::from_fn(|_| AtomicU64::new(0)),
-            data: core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
+            active_index: [const { AtomicU64::new(0) }; CAPACITY],
+            data: [const { UnsafeCell::new(MaybeUninit::uninit()) }; CAPACITY],
         };
 
         let allocator = BumpAllocator::new(new_self.next_free_index.as_mut_ptr().cast());
@@ -501,7 +501,7 @@ impl<T: Copy + Debug, const CAPACITY: usize> FixedSizeContainer<T, CAPACITY> {
     /// [`None`], otherwise [`Some`] containing the the index value to the underlying element.
     ///
     /// ```
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_lock_free::mpmc::container::*;
     ///
@@ -547,7 +547,7 @@ impl<T: Copy + Debug, const CAPACITY: usize> FixedSizeContainer<T, CAPACITY> {
     /// If the state has changed it returns true, otherwise false.
     ///
     /// ```
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_lock_free::mpmc::container::*;
     ///

@@ -22,7 +22,7 @@
 //!  # Example
 //!
 //!  ```
-//!  # extern crate iceoryx2_loggers;
+//!  # extern crate iceoryx2_bb_loggers;
 //!
 //!  use iceoryx2_bb_lock_free::mpmc::bit_set::*;
 //!
@@ -97,7 +97,7 @@ pub mod details {
         /// Create a new [`BitSet`] with data located in the heap.
         ///
         /// ```
-        /// # extern crate iceoryx2_loggers;
+        /// # extern crate iceoryx2_bb_loggers;
         ///
         /// use iceoryx2_bb_lock_free::mpmc::bit_set::*;
         /// let bitset = BitSet::new(123);
@@ -310,7 +310,7 @@ impl<const CAPACITY: usize> Default for FixedSizeBitSet<CAPACITY> {
     fn default() -> Self {
         let mut new_self = Self {
             bitset: unsafe { RelocatableBitSet::new_uninit(CAPACITY) },
-            data: core::array::from_fn(|_| details::BitsetElement::new(0)),
+            data: [const { details::BitsetElement::new(0) }; CAPACITY],
         };
 
         let allocator = BumpAllocator::new(new_self.data.as_mut_ptr().cast());

@@ -14,7 +14,6 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use iceoryx2::prelude::*;
-use iceoryx2_log::cout;
 
 fn main() -> Result<(), Box<dyn core::error::Error>> {
     set_log_level_from_env_or(LogLevel::Info);
@@ -30,7 +29,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             &AttributeVerifier::new()
                 .require(&"camera_resolution".try_into()?, &"3840x2160".try_into()?)?,
         )
-        .map_err(|e| cout!("camera_resolution: 3840x2160 -> {:?}", e));
+        .map_err(|e| coutln!("camera_resolution: 3840x2160 -> {:?}", e));
 
     let _incompatible_service = node
         .service_builder(&"Service/With/Properties".try_into()?)
@@ -39,7 +38,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             // the opening of the service will fail since the key is not defined.
             &AttributeVerifier::new().require_key(&"camera_type".try_into()?)?,
         )
-        .map_err(|e| cout!("camera_type -> {:?}", e));
+        .map_err(|e| coutln!("camera_type -> {:?}", e));
 
     Ok(())
 }

@@ -303,10 +303,10 @@ impl<
             base: self.base.clone(),
             override_request_alignment: self.override_request_alignment,
             override_response_alignment: self.override_response_alignment,
-            override_request_payload_type: self.override_request_payload_type.clone(),
-            override_response_payload_type: self.override_response_payload_type.clone(),
-            override_request_header_type: self.override_request_header_type.clone(),
-            override_response_header_type: self.override_response_header_type.clone(),
+            override_request_payload_type: self.override_request_payload_type,
+            override_response_payload_type: self.override_response_payload_type,
+            override_request_header_type: self.override_request_header_type,
+            override_response_header_type: self.override_response_header_type,
             verify_enable_safe_overflow_for_requests: self.verify_enable_safe_overflow_for_requests,
             verify_enable_safe_overflow_for_responses: self
                 .verify_enable_safe_overflow_for_responses,
@@ -668,7 +668,7 @@ impl<
                 msg, existing_configuration.max_nodes, required_configuration.max_nodes);
         }
 
-        Ok(existing_configuration.clone())
+        Ok(*existing_configuration)
     }
 
     fn is_service_available(
@@ -956,7 +956,7 @@ impl<
                     };
 
                     self.base.service_config.messaging_pattern =
-                        MessagingPattern::RequestResponse(request_response_static_config.clone());
+                        MessagingPattern::RequestResponse(request_response_static_config);
 
                     if let Some(service_tag) = service_tag {
                         service_tag.release_ownership();
@@ -1057,25 +1057,25 @@ impl<
         if let Some(details) = &self.override_request_payload_type {
             self.config_details_mut()
                 .request_message_type_details
-                .payload = details.clone();
+                .payload = *details;
         }
 
         if let Some(details) = &self.override_request_header_type {
             self.config_details_mut()
                 .request_message_type_details
-                .user_header = details.clone();
+                .user_header = *details;
         }
 
         if let Some(details) = &self.override_response_payload_type {
             self.config_details_mut()
                 .response_message_type_details
-                .payload = details.clone();
+                .payload = *details;
         }
 
         if let Some(details) = &self.override_response_header_type {
             self.config_details_mut()
                 .response_message_type_details
-                .user_header = details.clone();
+                .user_header = *details;
         }
 
         if let Some(alignment) = self.override_request_alignment {
@@ -1660,7 +1660,7 @@ impl<ServiceType: Service>
         mut self,
         value: &TypeDetail,
     ) -> Self {
-        self.override_request_payload_type = Some(value.clone());
+        self.override_request_payload_type = Some(*value);
         self
     }
 
@@ -1669,13 +1669,13 @@ impl<ServiceType: Service>
         mut self,
         value: &TypeDetail,
     ) -> Self {
-        self.override_response_payload_type = Some(value.clone());
+        self.override_response_payload_type = Some(*value);
         self
     }
 
     #[doc(hidden)]
     pub unsafe fn __internal_set_request_header_type_details(mut self, value: &TypeDetail) -> Self {
-        self.override_request_header_type = Some(value.clone());
+        self.override_request_header_type = Some(*value);
         self
     }
 
@@ -1684,7 +1684,7 @@ impl<ServiceType: Service>
         mut self,
         value: &TypeDetail,
     ) -> Self {
-        self.override_response_header_type = Some(value.clone());
+        self.override_response_header_type = Some(*value);
         self
     }
 }

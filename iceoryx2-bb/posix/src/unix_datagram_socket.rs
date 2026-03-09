@@ -18,7 +18,7 @@
 //! ## Transfer data
 //!
 //! ```
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::unix_datagram_socket::*;
 //! use iceoryx2_bb_posix::permission::*;
@@ -47,7 +47,7 @@
 //! ## Transfer [`SocketCred`]s
 //!
 //! ```ignore
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::unix_datagram_socket::*;
 //! use iceoryx2_bb_posix::socket_ancillary::*;
@@ -80,7 +80,7 @@
 //! ## Transfer [`FileDescriptor`]s
 //!
 //! ```no_run
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::unix_datagram_socket::*;
 //! use iceoryx2_bb_posix::socket_ancillary::*;
@@ -146,8 +146,8 @@ use crate::{config::UNIX_DOMAIN_SOCKET_PATH_LENGTH, file::*, permission::Permiss
 pub use crate::creation_mode::CreationMode;
 use iceoryx2_pal_posix::*;
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum UnixDatagramCreationError {
+enum_gen! { UnixDatagramCreationError
+  entry:
     SocketNameTooLong,
     InsufficientPermissions,
     InsufficientResources,
@@ -156,7 +156,7 @@ pub enum UnixDatagramCreationError {
     SystemWideFileHandleLimitReached,
     DatagramProtocolNotSupported,
     UnixDomainSocketsNotSupported,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
 enum_gen! {
@@ -263,26 +263,26 @@ enum_gen! {
     UnixDatagramSetSocketOptionError
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum UnixDatagramSetSocketOptionError {
+enum_gen! { UnixDatagramSetSocketOptionError
+  entry:
     InsufficientMemory,
     InsufficientResources,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum UnixDatagramGetSocketOptionError {
+enum_gen! { UnixDatagramGetSocketOptionError
+  entry:
     InsufficientPermissions,
     InsufficientResources,
     SocketHasBeenShutDown,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum UnixDatagramSetPropertyError {
+enum_gen! { UnixDatagramSetPropertyError
+  entry:
     Interrupt,
     WouldCauseOverflow,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
 enum_gen! {

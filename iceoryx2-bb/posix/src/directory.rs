@@ -15,7 +15,7 @@
 //!
 //! # Examples
 //! ```
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::directory::*;
 //! use iceoryx2_bb_system_types::path::Path;
@@ -67,15 +67,15 @@ enum_gen! { DirectoryOpenError
     UnknownError(i32)
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum DirectoryStatError {
+enum_gen! { DirectoryStatError
+  entry:
     InsufficientPermissions,
     IOerror,
     DoesNotExist,
     PathPrefixIsNotADirectory,
     DataOverflowInStatStruct,
     LoopInSymbolicLinks,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
 enum_gen! { DirectoryReadError
@@ -126,14 +126,14 @@ enum_gen! { DirectoryRemoveError
     FileRemoveError
 }
 
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum DirectoryAccessError {
+enum_gen! { DirectoryAccessError
+  entry:
     InsufficientPermissions,
     IOerror,
     PathPrefixIsNotADirectory,
     DataOverflowInStatStruct,
     LoopInSymbolicLinks,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
 enum_gen! {
@@ -155,7 +155,7 @@ enum_gen! {
 /// # Example
 ///
 /// ```
-/// # extern crate iceoryx2_loggers;
+/// # extern crate iceoryx2_bb_loggers;
 ///
 /// use iceoryx2_bb_posix::directory::*;
 /// use iceoryx2_bb_system_types::path::Path;

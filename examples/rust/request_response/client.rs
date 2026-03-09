@@ -17,7 +17,6 @@ use alloc::boxed::Box;
 
 use examples_common::TransmissionData;
 use iceoryx2::prelude::*;
-use iceoryx2_log::cout;
 
 const CYCLE_TIME: Duration = Duration::from_secs(1);
 
@@ -37,13 +36,13 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     let mut response_counter: u64 = 0;
 
     // sending first request by using slower, inefficient copy API
-    cout!("send request {request_counter} ...");
+    coutln!("send request {request_counter} ...");
     let mut pending_response = client.send_copy(request_counter)?;
 
     while node.wait(CYCLE_TIME).is_ok() {
         // acquire all responses to our request from our buffer that were sent by the servers
         while let Some(response) = pending_response.receive()? {
-            cout!("  received response {response_counter}: {:?}", *response);
+            coutln!("  received response {response_counter}: {:?}", *response);
             response_counter += 1;
         }
 
@@ -54,10 +53,10 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
 
         pending_response = request.send()?;
 
-        cout!("send request {request_counter} ...");
+        coutln!("send request {request_counter} ...");
     }
 
-    cout!("exit");
+    coutln!("exit");
 
     Ok(())
 }

@@ -12,7 +12,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-set(IOX2_VERSION 0.8.0)
+set(IOX2_VERSION 0.8.999)
 project(iceoryx2-cxx VERSION ${IOX2_VERSION} LANGUAGES CXX)
 
 set(PREFIX iceoryx2/v${CMAKE_PROJECT_VERSION})
@@ -83,6 +83,7 @@ add_library(iceoryx2-cxx-object-lib OBJECT
     src/static_config_publish_subscribe.cpp
     src/static_config_request_response.cpp
     src/subscriber_details.cpp
+    src/type_variant.cpp
     src/unique_port_id.cpp
     src/waitset.cpp
     src/writer_details.cpp

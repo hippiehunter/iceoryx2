@@ -16,7 +16,6 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use iceoryx2::prelude::*;
-use iceoryx2_log::cout;
 
 const CYCLE_TIME: Duration = Duration::from_secs(1);
 
@@ -43,7 +42,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
 
     let publisher = service.publisher_builder().create()?;
 
-    cout!("defined service attributes: {:?}", service.attributes());
+    coutln!("defined service attributes: {:?}", service.attributes());
 
     while node.wait(CYCLE_TIME).is_ok() {
         let sample = publisher.loan_uninit()?;
@@ -51,7 +50,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         sample.send()?;
     }
 
-    cout!("exit");
+    coutln!("exit");
 
     Ok(())
 }

@@ -19,7 +19,7 @@
 //! ## Application (That Shall Be Monitored)
 //!
 //! ```
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::process_state::*;
 //!
@@ -73,7 +73,7 @@
 //! ## Watchdog (Process That Monitors The State Of Other Processes)
 //!
 //! ```
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::process_state::*;
 //!
@@ -117,7 +117,7 @@
 //! ## Cleanup (Process That Removes Stale Resources)
 //!
 //! ```
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::process_state::*;
 //!
@@ -167,9 +167,10 @@ pub enum ProcessState {
     CleaningUp,
 }
 
-/// Defines all errors that can occur when a new [`ProcessGuard`] is created.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ProcessGuardCreateError {
+enum_gen! {
+    /// Defines all errors that can occur when a new [`ProcessGuard`] is created.
+    ProcessGuardCreateError
+  entry:
     InsufficientPermissions,
     IsDirectory,
     InvalidDirectory,
@@ -179,18 +180,18 @@ pub enum ProcessGuardCreateError {
     ContractViolation,
     Interrupt,
     InvalidCleanerPathName,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-enum ProcessGuardLockError {
+enum_gen! { ProcessGuardLockError
+  entry:
     OwnedByAnotherProcess,
     Interrupt,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
 enum_gen! {
-/// Defines all errors that can occur when a stale [`ProcessGuard`] is removed.
+    /// Defines all errors that can occur when a stale [`ProcessGuard`] is removed.
     ProcessGuardRemoveError
   entry:
     InsufficientPermissions,
@@ -202,18 +203,19 @@ enum_gen! {
     FileRemoveError
 }
 
-/// Defines all errors that can occur when a new [`ProcessMonitor`] is created.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum ProcessMonitorCreateError {
+enum_gen! {
+    /// Defines all errors that can occur when a new [`ProcessMonitor`] is created.
+    ProcessMonitorCreateError
+  entry:
     InsufficientPermissions,
     Interrupt,
     IsDirectory,
     InvalidCleanerPathName,
-    UnknownError,
+    UnknownError
 }
 
 enum_gen! {
-/// Defines all errors that can occur in [`ProcessMonitor::state()`].
+    /// Defines all errors that can occur in [`ProcessMonitor::state()`].
     ProcessMonitorStateError
   entry:
     CorruptedState,
@@ -224,9 +226,10 @@ enum_gen! {
     ProcessMonitorCreateError
 }
 
-/// Defines all errors that can occur when a new [`ProcessCleaner`] is created.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum ProcessCleanerCreateError {
+enum_gen! {
+    /// Defines all errors that can occur when a new [`ProcessCleaner`] is created.
+    ProcessCleanerCreateError
+  entry:
     ProcessIsStillAlive,
     OwnedByAnotherProcess,
     Interrupt,
@@ -235,12 +238,12 @@ pub enum ProcessCleanerCreateError {
     UnableToOpenCleanerFile,
     InvalidCleanerPathName,
     DoesNotExist,
-    UnknownError,
+    UnknownError
 }
 
 /// The builder of the [`ProcessGuard`]
 /// ```
-/// # extern crate iceoryx2_loggers;
+/// # extern crate iceoryx2_bb_loggers;
 ///
 /// use iceoryx2_bb_posix::process_state::*;
 ///
@@ -299,7 +302,7 @@ impl ProcessGuardBuilder {
     /// `path`s.
     ///
     /// ```
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_posix::process_state::*;
     ///
@@ -491,7 +494,7 @@ impl ProcessGuardBuilder {
 /// is in scope. When it goes out of scope the process is no longer monitorable.
 ///
 /// ```
-/// # extern crate iceoryx2_loggers;
+/// # extern crate iceoryx2_bb_loggers;
 /// use iceoryx2_bb_posix::process_state::*;
 ///
 /// let process_state_path = FilePath::new(b"process_state_file").unwrap();
@@ -583,7 +586,7 @@ impl ProcessGuard {
 /// # Example
 ///
 /// ```
-/// # extern crate iceoryx2_loggers;
+/// # extern crate iceoryx2_bb_loggers;
 ///
 /// use iceoryx2_bb_posix::process_state::*;
 ///
@@ -650,7 +653,7 @@ impl ProcessMonitor {
     /// # Example
     ///
     /// ```
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_posix::process_state::*;
     ///
@@ -689,7 +692,7 @@ impl ProcessMonitor {
     /// # Example
     ///
     /// ```
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_posix::process_state::*;
     ///
@@ -849,7 +852,7 @@ impl ProcessMonitor {
 /// [`ProcessCleaner`] guard can be acquired by another process again.
 ///
 /// ```no_run
-/// # extern crate iceoryx2_loggers;
+/// # extern crate iceoryx2_bb_loggers;
 ///
 /// use iceoryx2_bb_posix::process_state::*;
 ///

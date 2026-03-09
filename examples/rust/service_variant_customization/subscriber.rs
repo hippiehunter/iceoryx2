@@ -19,7 +19,6 @@ use custom_service_variant::CustomServiceVariant;
 
 use examples_common::TransmissionData;
 use iceoryx2::prelude::*;
-use iceoryx2_log::cout;
 
 const CYCLE_TIME: Duration = Duration::from_secs(1);
 
@@ -34,15 +33,15 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
 
     let subscriber = service.subscriber_builder().create()?;
 
-    cout!("Subscriber ready to receive data!");
+    coutln!("Subscriber ready to receive data!");
 
     while node.wait(CYCLE_TIME).is_ok() {
         while let Some(sample) = subscriber.receive()? {
-            cout!("received: {:?}", *sample);
+            coutln!("received: {:?}", *sample);
         }
     }
 
-    cout!("exit");
+    coutln!("exit");
 
     Ok(())
 }

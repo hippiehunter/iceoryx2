@@ -21,7 +21,6 @@ use clap::Parser;
 
 use examples_common::TransmissionData;
 use iceoryx2::prelude::*;
-use iceoryx2_log::cout;
 
 const CYCLE_TIME: Duration = Duration::from_secs(1);
 
@@ -67,7 +66,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
 
         sample.send()?;
 
-        cout!(
+        coutln!(
             "[domain: \"{}\", service: \"{}\"] Send sample {} ...",
             args.domain,
             args.service,
@@ -75,7 +74,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         );
     }
 
-    cout!("exit");
+    coutln!("exit");
 
     Ok(())
 }

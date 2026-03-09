@@ -15,7 +15,7 @@
 //!
 //! # Examples
 //! ```no_run
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_posix::file::*;
 //! use iceoryx2_bb_system_types::file_path::FilePath;
@@ -75,14 +75,6 @@ enum_gen! { FileRemoveError
     UnknownError(i32)
 }
 
-impl core::fmt::Display for FileRemoveError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileRemoveError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileRemoveError {}
-
 enum_gen! { FileAccessError
   entry:
     LoopInSymbolicLinks,
@@ -90,14 +82,6 @@ enum_gen! { FileAccessError
     InsufficientPermissions,
     UnknownError(i32)
 }
-
-impl core::fmt::Display for FileAccessError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileAccessError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileAccessError {}
 
 enum_gen! { FileCreationError
   entry:
@@ -127,14 +111,6 @@ enum_gen! { FileCreationError
     FileRemoveError
 }
 
-impl core::fmt::Display for FileCreationError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileCreationError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileCreationError {}
-
 enum_gen! { FileOpenError
   entry:
     InsufficientPermissions,
@@ -151,83 +127,43 @@ enum_gen! { FileOpenError
     UnknownError(i32)
 }
 
-impl core::fmt::Display for FileOpenError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileOpenError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileOpenError {}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum FileTruncateError {
+enum_gen! { FileTruncateError
+  entry:
     Interrupt,
     SizeTooBig,
     IOerror,
     FileNotOpenedForWriting,
     ReadOnlyFilesystem,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
-impl core::fmt::Display for FileTruncateError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileTruncateError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileTruncateError {}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum FileStatError {
+enum_gen! { FileStatError
+  entry:
     InvalidFileDescriptor,
     IOerror,
     FileTooBig,
     UnknownFileType,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
-impl core::fmt::Display for FileStatError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileStatError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileStatError {}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum FileSetPermissionError {
+enum_gen! { FileSetPermissionError
+  entry:
     InvalidFileDescriptor,
     InsufficientPermissions,
     ReadOnlyFilesystem,
-    UnknownError(i32),
+    UnknownError(i32)
 }
 
-impl core::fmt::Display for FileSetPermissionError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileSetPermissionError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileSetPermissionError {}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum FileSetOwnerError {
+enum_gen! { FileSetOwnerError
+  entry:
     InvalidFileDescriptor,
     InsufficientPermissions,
     ReadOnlyFilesystem,
     InvalidId,
     IOerror,
     Interrupt,
-    UnknownError(i32),
+    UnknownError(i32)
 }
-
-impl core::fmt::Display for FileSetOwnerError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileSetOwnerError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileSetOwnerError {}
 
 enum_gen! { FileReadError
   entry:
@@ -245,29 +181,13 @@ enum_gen! { FileReadError
     FileStatError
 }
 
-impl core::fmt::Display for FileReadError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileReadError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileReadError {}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum FileOffsetError {
+enum_gen! { FileOffsetError
+  entry:
     InvalidFileDescriptor,
     FileTooBig,
     DoesNotSupportSeeking,
-    UnknownError(i32),
+    UnknownError(i32)
 }
-
-impl core::fmt::Display for FileOffsetError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileOffsetError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileOffsetError {}
 
 enum_gen! { FileWriteError
   entry:
@@ -283,29 +203,13 @@ enum_gen! { FileWriteError
     FileOffsetError
 }
 
-impl core::fmt::Display for FileWriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileWriteError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileWriteError {}
-
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
-pub enum FileSyncError {
+enum_gen! { FileSyncError
+  entry:
     Interrupt,
     NotSupported,
     IOerror,
-    UnknownError(i32),
+    UnknownError(i32)
 }
-
-impl core::fmt::Display for FileSyncError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileSyncError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileSyncError {}
 
 enum_gen! {
     /// The FileError enum is a generalization when one doesn't require the fine-grained error
@@ -320,14 +224,6 @@ enum_gen! {
     Credentials <= FileSetOwnerError; FileSetPermissionError,
     Stat <= FileStatError
 }
-
-impl core::fmt::Display for FileError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "FileError::{self:?}")
-    }
-}
-
-impl core::error::Error for FileError {}
 
 impl From<()> for FileStatError {
     fn from(_: ()) -> Self {
@@ -351,7 +247,7 @@ pub enum FileReadLineState {
 /// # Examples
 /// ## Open existing file for reading
 /// ```
-/// # extern crate iceoryx2_loggers;
+/// # extern crate iceoryx2_bb_loggers;
 ///
 /// use iceoryx2_bb_posix::file::*;
 /// use iceoryx2_bb_system_types::file_path::FilePath;
@@ -445,7 +341,7 @@ impl FileCreationBuilder {
     ///
     /// # Examples
     /// ```no_run
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_posix::file::*;
     /// use iceoryx2_bb_system_types::file_path::FilePath;
@@ -467,7 +363,7 @@ impl FileCreationBuilder {
     ///
     /// # Examples
     /// ```no_run
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_posix::file::*;
     /// use iceoryx2_bb_posix::user::UserExt;
@@ -490,7 +386,7 @@ impl FileCreationBuilder {
     ///
     /// # Examples
     /// ```no_run
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_posix::file::*;
     /// use iceoryx2_bb_posix::group::*;
@@ -519,8 +415,8 @@ impl FileCreationBuilder {
         let mut file = File::create(&self.config)?;
         fail!(from self.config, when file.set_permission(self.config.permission), "Failed to set permissions.");
 
-        if self.config.truncate_size.is_some() {
-            fail!(from self.config, when File::truncate(&file, self.config.truncate_size.unwrap()), "Failed to truncate file size.");
+        if let Some(size) = self.config.truncate_size {
+            fail!(from self.config, when File::truncate(&file, size), "Failed to truncate file size.");
         }
 
         if self.config.owner.is_some() || self.config.group.is_some() {
@@ -557,10 +453,7 @@ pub struct File {
 impl Drop for File {
     fn drop(&mut self) {
         if self.has_ownership.load(Ordering::Relaxed) {
-            if let Err(e) = self.set_permission(Permission::ALL) {
-                warn!(from self,
-                    "Unable to adjust the files permission as preparation to remove the file ({e:?}).");
-            }
+            let set_permission_result = self.set_permission(Permission::ALL);
 
             match &self.path {
                 None => {
@@ -568,6 +461,10 @@ impl Drop for File {
                 }
                 Some(p) => match File::remove(p) {
                     Ok(false) | Err(_) => {
+                        if let Err(e) = set_permission_result {
+                            warn!(from self,
+                                  "Unable to adjust the files permission as preparation to remove the file ({e:?}).");
+                        }
                         warn!(from self, "Failed to remove owned file");
                     }
                     Ok(true) => (),

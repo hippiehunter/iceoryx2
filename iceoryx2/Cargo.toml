@@ -15,9 +15,9 @@ version = { workspace = true }
 default = ["std"]
 std = [
   "iceoryx2-log/std",
-  "iceoryx2-loggers/std",
-  "iceoryx2-loggers/console",
   "iceoryx2-cal/std",
+  "iceoryx2-bb-loggers/std",
+  "iceoryx2-bb-loggers/console",
   "iceoryx2-bb-concurrency/std",
   "iceoryx2-bb-posix/std",
 ]
@@ -26,28 +26,22 @@ std = [
 # This shall not be used in production and is meant to be enabled in a docker environment
 # with inconsistent user configuration.
 dev_permissions = ["iceoryx2-cal/dev_permissions"]
-# Use https://crates.io/crates/libc for the platform abstraction. This simplifies
-# cross-compilation since bindgen is not required anymore. Unfortunately, the libc crate
-# does not offer all the functionality iceoryx2 requires on all of the supported
-# platforms. Therefore, only a subset of the supported platforms will work with this
-# feature flag.
-libc_platform = ["iceoryx2-bb-posix/libc_platform"]
 
 [dependencies]
+iceoryx2-log = { workspace = true }
+iceoryx2-bb-print = { workspace = true }
+iceoryx2-bb-loggers = { workspace = true }
 iceoryx2-bb-concurrency = { workspace = true }
 iceoryx2-bb-container = { workspace = true }
 iceoryx2-bb-derive-macros = { workspace = true }
 iceoryx2-bb-system-types = { workspace = true }
 iceoryx2-bb-lock-free = { workspace = true }
-iceoryx2-log = { workspace = true }
-iceoryx2-loggers = { workspace = true }
 iceoryx2-bb-memory = { workspace = true }
 iceoryx2-bb-posix = { workspace = true }
 iceoryx2-bb-elementary = { workspace = true }
 iceoryx2-bb-elementary-traits = { workspace = true }
 iceoryx2-cal = { workspace = true }
 iceoryx2-pal-configuration = { workspace = true }
-iceoryx2-pal-posix = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -55,7 +49,7 @@ toml = { workspace = true }
 tiny-fn = { workspace = true }
 
 [dev-dependencies]
-iceoryx2-loggers = { workspace = true }
+iceoryx2-bb-loggers = { workspace = true }
 iceoryx2-bb-testing = { workspace = true }
 iceoryx2-pal-testing = { workspace = true }
 postcard = { workspace = true }

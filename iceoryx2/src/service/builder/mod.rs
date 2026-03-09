@@ -101,14 +101,6 @@ enum_gen! {
     DynamicStorageOpenError
 }
 
-impl core::fmt::Display for OpenDynamicStorageFailure {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "OpenDynamicStorageFailure::{self:?}")
-    }
-}
-
-impl core::error::Error for OpenDynamicStorageFailure {}
-
 enum_gen! {
 #[doc(hidden)]
     ReadStaticStorageFailure
@@ -116,14 +108,6 @@ enum_gen! {
     StaticStorageOpenError,
     StaticStorageReadError
 }
-
-impl core::fmt::Display for ReadStaticStorageFailure {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "ReadStaticStorageFailure::{self:?}")
-    }
-}
-
-impl core::error::Error for ReadStaticStorageFailure {}
 
 /// Builder to create or open [`Service`]s
 ///
@@ -140,7 +124,7 @@ pub struct Builder<S: Service> {
 impl<S: Service> Builder<S> {
     pub(crate) fn new(name: &ServiceName, shared_node: Arc<SharedNode<S>>) -> Self {
         Self {
-            name: name.clone(),
+            name: *name,
             shared_node,
             _phantom_s: PhantomData,
         }

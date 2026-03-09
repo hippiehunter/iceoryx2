@@ -39,7 +39,7 @@
 //! zero copy inter-process communication.
 //!
 //! ```
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_container::string::*;
 //! use iceoryx2_bb_container::vector::*;
@@ -74,7 +74,7 @@
 //! ensure that required memory is always available.
 //!
 //! ```
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //!
 //! use iceoryx2_bb_container::queue::*;
 //!
@@ -109,6 +109,10 @@ pub mod flatmap;
 
 /// A trait that defines the interface of a string and several string variants.
 pub mod string;
+
+/// Implementation of an [`Option`] that has a stable memory layout and is
+/// shared memory compatible.
+pub mod relocatable_option;
 
 #[doc(hidden)]
 pub(crate) mod vec;

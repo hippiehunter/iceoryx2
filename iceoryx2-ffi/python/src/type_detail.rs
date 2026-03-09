@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use crate::{type_name::TypeName, type_variant::TypeVariant};
 use iceoryx2::testing;
 
-#[pyclass(str = "{0:?}", eq)]
+#[pyclass(str = "{0:?}", eq, from_py_object)]
 /// Contains all type details required to connect to a `Service`
 #[derive(PartialEq, Clone)]
 pub struct TypeDetail(
@@ -44,7 +44,7 @@ impl TypeDetail {
     /// always the same size like an `uint64_t` or `TypeVariant::Dynamic` when it is a dynamic
     /// array or vector
     pub fn type_variant(&self, value: &TypeVariant) -> Self {
-        let mut this = self.0.clone();
+        let mut this = self.0;
 
         testing::type_detail_set_variant(&mut this, (value.clone()).into());
         Self(this)
@@ -52,21 +52,21 @@ impl TypeDetail {
 
     /// Sets the unique `TypeName` of the type
     pub fn type_name(&self, name: &TypeName) -> Self {
-        let mut this = self.0.clone();
+        let mut this = self.0;
         testing::type_detail_set_name(&mut this, name.0);
         Self(this)
     }
 
     /// Sets the size of the type
     pub fn size(&self, size: usize) -> Self {
-        let mut this = self.0.clone();
+        let mut this = self.0;
         testing::type_detail_set_size(&mut this, size);
         Self(this)
     }
 
     /// Sets the alignment of the type
     pub fn alignment(&self, alignment: usize) -> Self {
-        let mut this = self.0.clone();
+        let mut this = self.0;
         testing::type_detail_set_alignment(&mut this, alignment);
         Self(this)
     }

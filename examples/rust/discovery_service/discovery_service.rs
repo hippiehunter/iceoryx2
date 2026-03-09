@@ -14,8 +14,6 @@ extern crate alloc;
 use alloc::boxed::Box;
 
 use iceoryx2::prelude::*;
-use iceoryx2_log::cerr;
-use iceoryx2_log::cout;
 use iceoryx2_services_discovery::*;
 use service_discovery::Discovery;
 
@@ -29,7 +27,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         .publish_subscribe::<service_discovery::Payload>()
         .open()
         .inspect_err(|_| {
-            cerr!("Unable to open service discovery service. Was it started?");
+            cerrln!("Unable to open service discovery service. Was it started?");
         })?;
 
     let subscriber = publish_subscribe.subscriber_builder().create()?;
@@ -39,7 +37,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
         .event()
         .open()
         .inspect_err(|_| {
-            cerr!("unable to open service discovery service. Was it started?");
+            cerrln!("unable to open service discovery service. Was it started?");
         })?;
     let listener = event.listener_builder().create()?;
 
@@ -47,7 +45,7 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
     let guard = waitset.attach_notification(&listener)?;
     let attachment = WaitSetAttachmentId::from_guard(&guard);
 
-    cout!("Discovery service ready!");
+    coutln!("Discovery service ready!");
 
     let on_event = |attachment_id: WaitSetAttachmentId<ipc::Service>| {
         if attachment_id == attachment {
@@ -58,10 +56,10 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             while let Ok(Some(sample)) = subscriber.receive() {
                 match sample.payload() {
                     Discovery::Added(details) => {
-                        cout!("Added: {:?}", details.name());
+                        coutln!("Added: {:?}", details.name());
                     }
                     Discovery::Removed(details) => {
-                        cout!("Removed: {:?}", details.name());
+                        coutln!("Removed: {:?}", details.name());
                     }
                 }
             }

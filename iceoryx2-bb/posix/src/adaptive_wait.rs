@@ -20,7 +20,7 @@
 //!
 //! # Examples
 //! ```ignore
-//! # extern crate iceoryx2_loggers;
+//! # extern crate iceoryx2_bb_loggers;
 //! use iceoryx2_bb_posix::adaptive_wait::*;
 //! use iceoryx2_bb_posix::clock::*;
 //!
@@ -35,6 +35,7 @@
 //! ```
 
 use core::fmt::Debug;
+use core::fmt::Display;
 use core::time::Duration;
 
 use crate::clock::*;
@@ -86,6 +87,14 @@ impl<T: Debug> From<T> for AdaptiveTimedWaitWhileError<T> {
     }
 }
 
+impl<T: Debug> Display for AdaptiveTimedWaitWhileError<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "AdaptiveTimedWaitWhileError::{:?}", self)
+    }
+}
+
+impl<T: Debug> core::error::Error for AdaptiveTimedWaitWhileError<T> {}
+
 /// AdaptiveWait is a building block which can be integrated into busy loops to make
 /// them less CPU consuming. The strategy is that for [`ADAPTIVE_WAIT_YIELD_REPETITIONS`] the
 /// wait call will yield and then it will increase its waiting time to
@@ -131,7 +140,7 @@ impl AdaptiveWait {
     ///
     /// # Examples
     /// ```
-    /// extern crate iceoryx2_loggers;
+    /// extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_posix::adaptive_wait::*;
     ///
@@ -160,7 +169,7 @@ impl AdaptiveWait {
     /// # Examples
     ///
     /// ```
-    /// # extern crate iceoryx2_loggers;
+    /// # extern crate iceoryx2_bb_loggers;
     ///
     /// use iceoryx2_bb_posix::adaptive_wait::*;
     /// use core::time::Duration;

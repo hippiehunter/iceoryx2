@@ -20,7 +20,6 @@ use alloc::sync::Arc;
 use iceoryx2::prelude::*;
 use iceoryx2_bb_posix::clock::nanosleep;
 use iceoryx2_bb_posix::thread::{ThreadBuilder, ThreadName};
-use iceoryx2_log::cout;
 
 static KEEP_RUNNING: AtomicBool = AtomicBool::new(true);
 const CYCLE_TIME: Duration = Duration::from_secs(1);
@@ -53,21 +52,21 @@ fn main() -> Result<(), Box<dyn core::error::Error>> {
             while KEEP_RUNNING.load(Ordering::Relaxed) {
                 nanosleep(CYCLE_TIME).unwrap();
                 if let Some(sample) = in_thread_subscriber.receive().unwrap() {
-                    cout!("[thread] received: {}", sample.payload());
+                    coutln!("[thread] received: {}", sample.payload());
                 }
             }
         })?;
 
     while node.wait(CYCLE_TIME).is_ok() {
         if let Some(sample) = subscriber.receive()? {
-            cout!("[main] received: {}", sample.payload());
+            coutln!("[main] received: {}", sample.payload());
         }
     }
 
     KEEP_RUNNING.store(false, Ordering::Relaxed);
     drop(other_thread);
 
-    cout!("exit");
+    coutln!("exit");
 
     Ok(())
 }

@@ -12,6 +12,7 @@
 
 mod details;
 mod discovery;
+mod hz;
 mod list;
 mod listen;
 mod notify;
@@ -22,6 +23,7 @@ mod subscribe;
 
 pub(crate) use details::*;
 pub(crate) use discovery::*;
+pub(crate) use hz::*;
 pub(crate) use list::*;
 pub(crate) use listen::*;
 pub(crate) use notify::*;
@@ -84,7 +86,6 @@ pub(crate) fn get_pubsub_service_types(
             .publish_subscribe()
             .message_type_details()
             .user_header
-            .clone()
     };
 
     let payload = unsafe {
@@ -94,7 +95,6 @@ pub(crate) fn get_pubsub_service_types(
             .publish_subscribe()
             .message_type_details()
             .payload
-            .clone()
     };
 
     let system_header = TypeDetail::new::<Header>(TypeVariant::FixedSize);

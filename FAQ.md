@@ -26,8 +26,9 @@
         * [Maximum File-Descriptor Limit Exceeded](#maximum-file-descriptor-limit-exceeded)
     * [Losing Data](#losing-data)
     * [Losing Dynamic Data](#losing-dynamic-data)
-    * [`iceoryx2-ffi-c` does not contain this feature: libc_platform](#iceoryx2-ffi-c-does-not-contain-this-feature-libc_platform)
+    * [`iceoryx2-ffi-c` does not contain this feature](#iceoryx2-ffi-c-does-not-contain-this-feature)
     * [Service In Corrupted state](#service-in-corrupted-state)
+    * [Unable To Connect Due To `IncompatibleTypes`](#unable-to-connect-due-to-incompatibletypes)
 
 ## Tips And Tricks
 
@@ -168,7 +169,7 @@ details, see the [event example](examples/rust/event).
 
 The `iceoryx2` crate automatically configures the console logger as the
 default logger backend, however it is possible to change this using feature
-flags on the `iceoryx2-loggers` crate.
+flags on the `iceoryx2-bb-loggers` crate.
 
 The following loggers are available:
 
@@ -181,19 +182,19 @@ The following loggers are available:
 The feature can be set in a project's `Cargo.toml`:
 
 ```toml
-iceoryx2-loggers = { version = "0.1.0", features = ["std", "file"]}
+iceoryx2-bb-loggers = { version = "0.1.0", features = ["std", "file"]}
 ```
 
 Or specified when building the crate:
 
 ```console
-cargo build --features iceoryx2-loggers/std -features iceoryx2-loggers/file
+cargo build --features iceoryx2-bb-loggers/std -features iceoryx2-bb-loggers/file
 ```
 
 Alternatively, a custom logger backend can be set at runtime at the very
 beginning of your application:
 
-```
+```rust
 use iceoryx2::prelude::*;
 
 static LOGGER: MyLogger = MyLogger::new();
@@ -301,7 +302,7 @@ environment variable `IOX2_LOG_LEVEL` or set the log level directly in the code.
 ### Linking Error - undefined symbol `__internal_default_logger`
 
 The logger front-end retrieves the selected default logger by calling
-a function provided by the `iceoryx2-loggers` crate. If this crate is not
+a function provided by the `iceoryx2-bb-loggers` crate. If this crate is not
 linked against when building an application, a linking error of this form will
 be encountered:
 
@@ -313,14 +314,14 @@ If using the `iceoryx2` crate as a dependency, this is handled automatically,
 however if using a lower-level crate (such as `iceoryx2-cal` or one from
 `iceoryx2-bb`) the following is required:
 
-1. Include `iceoryx2-loggers` as a dependency with the corresponding feature
+1. Include `iceoryx2-bb-loggers` as a dependency with the corresponding feature
    for your platform:
     ```toml
-    iceoryx2-loggers = { version = "x.y.z", features = ["std", "console"] }
+    iceoryx2-bb-loggers = { version = "x.y.z", features = ["std", "console"] }
     ```
 1. Ensure the crate is linked to even if not used:
     ```rust
-    extern crate iceoryx2_loggers;
+    extern crate iceoryx2_bb_loggers;
     ```
 
 ### Encountered a SEGFAULT
@@ -561,12 +562,12 @@ To circumvent this, you could use the size of the last sent sample as
 `initial_max_slice_len` and use the `Static` allocation strategy.
 
 <!-- markdownlint-disable MD044 'c' needs to be lower-case -->
-### `iceoryx2-ffi-c` Does Not Contain This Feature: `libc_platform`
+### `iceoryx2-ffi-c` Does Not Contain This Feature
 <!-- markdownlint-enable MD044 -->
 
 In order to use the `iceoryx2` feature flags when building the `iceoryx2-ffi-c`
 crate standalone, you needs to prefix the feature with `iceoryx2/`,
-e.g. `--features iceoryx2/libc_platform.`.
+e.g. `--features iceoryx2/dev_permissions`.
 
 ### Service In Corrupted State
 
@@ -575,3 +576,25 @@ This error can have multiple causes.
 1. Crashed processes cleaned up resources incompletely, see: [Remove Stale Resources](#remove-stale-resources)
 2. The processes are compiled with two incompatible iceoryx2 versions.
 3. Two service variants were used that are not compatible.
+
+### Unable To Connect Due To `IncompatibleTypes`
+
+In Rust, payload data types must be defined in a separate library. If they are
+only placed in a separate file and imported in each binary with
+`use crate::my_type::MyType`, their fully qualified type name includes the
+binary crate itself. As a result, Rust and iceoryx2 treat them as two distinct
+types originating from two different binaries. Consequently, iceoryx2 will not
+establish a connection between them.
+
+The cleanest solution is to move all shared types into a dedicated library
+crate and make all communicating binaries dependent on this library, as is the
+case in [Rust examples common](examples/rust/_examples_common).
+
+A hacky workaround is to use the `#[type_name("MyType")]` attribute provided by
+the `ZeroCopySend` derive macro:
+
+```rust
+#[derive(Debug, ZeroCopySend)]
+#[type_name("MyType")]
+pub struct MyType {}
+```

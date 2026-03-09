@@ -497,8 +497,6 @@
 //!  * `dev_permissions` - The permissions of all resources will be set to read, write, execute
 //!    for everyone. This shall not be used in production and is meant to be enabled in a docker
 //!    environment with inconsistent user configuration.
-//!  * `libc_platform` - Uses the [libc crate](https://crates.io/crates/libc) for the platform
-//!    abstraction to simplify cross compilation. Works currently only for Linux based targets.
 //!
 //! # Custom Configuration
 //!
@@ -509,7 +507,7 @@
 //! [GitHub config folder](https://github.com/eclipse-iceoryx/iceoryx2/tree/main/config).
 
 extern crate alloc;
-extern crate iceoryx2_loggers;
+extern crate iceoryx2_bb_loggers;
 
 /// Constants that define limits and properties of an iceoryx2 system
 pub mod constants;

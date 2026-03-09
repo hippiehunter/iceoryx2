@@ -31,10 +31,12 @@ CRATES_TO_PUBLISH=(
     iceoryx2-pal-testing
     iceoryx2-pal-concurrency-sync
     iceoryx2-pal-posix
+    iceoryx2-pal-print
     iceoryx2-pal-os-api
     iceoryx2-log-types
-    iceoryx2-loggers
     iceoryx2-log
+    iceoryx2-bb-print
+    iceoryx2-bb-loggers
     iceoryx2-bb-conformance-test-macros
     iceoryx2-bb-elementary-traits
     iceoryx2-bb-testing
@@ -66,6 +68,7 @@ CRATES_TO_IGNORE=(
     benchmark-publish-subscribe
     benchmark-request-response
     benchmark-queue
+    component-tests_rust
     example
     iceoryx2-ffi-c
     iceoryx2-ffi-macros
@@ -189,13 +192,11 @@ list_crates_to_publish() {
 }
 
 publish() {
-    # NOTE: while 'cargo publish --workspace' is now stable, we still publish
-    #       the crates separately from a known list pro prevent accidentally
-    #       publishing a crate not intended to be published
-    for CRATE in ${CRATES_TO_PUBLISH[@]}; do
-        echo -e "${C_BLUE}${CRATE}${C_OFF}"
-        cargo publish -p ${CRATE}
+    local EXCLUDE_ARGS=""
+    for CRATE in "${CRATES_TO_IGNORE[@]}"; do
+        EXCLUDE_ARGS+="--exclude $CRATE "
     done
+    cargo publish --workspace ${EXCLUDE_ARGS}
 }
 
 if [[ ${DO_SANITY_CHECKS} == true ]]; then

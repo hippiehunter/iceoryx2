@@ -489,7 +489,7 @@ impl<
             loan_counter: AtomicUsize::new(0),
             sender_max_borrowed_samples: static_config.max_loaned_requests,
             unable_to_deliver_strategy: client_factory.config.unable_to_deliver_strategy,
-            message_type_details: static_config.request_message_type_details.clone(),
+            message_type_details: static_config.request_message_type_details,
             // all requests are sent via one channel, only the responses require different
             // channels to guarantee that one response does not fill the buffer of another
             // response.
@@ -524,7 +524,7 @@ impl<
                     .expect("Heap allocator provides memory."),
             )),
             degradation_callback: client_factory.response_degradation_callback,
-            message_type_details: static_config.response_message_type_details.clone(),
+            message_type_details: static_config.response_message_type_details,
             receiver_max_borrowed_samples: static_config
                 .max_borrowed_responses_per_pending_response,
             enable_safe_overflow: static_config.enable_safe_overflow_for_responses,
@@ -727,6 +727,7 @@ impl<
         let user_header_ptr: *mut RequestHeader = chunk.user_header.cast();
         unsafe {
             header_ptr.write(service::header::request_response::RequestHeader {
+                node_id: *client_shared_state.request_sender.shared_node.id(),
                 client_id: self.id(),
                 channel_id,
                 request_id: self.request_id_counter.fetch_add(1, Ordering::Relaxed),
@@ -1005,6 +1006,7 @@ impl<
         let header_ptr = chunk.header as *mut header::request_response::RequestHeader;
         unsafe {
             header_ptr.write(header::request_response::RequestHeader {
+                node_id: *client_shared_state.request_sender.shared_node.id(),
                 client_id: self.id(),
                 channel_id,
                 request_id: self.request_id_counter.fetch_add(1, Ordering::Relaxed),

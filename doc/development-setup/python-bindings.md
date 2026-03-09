@@ -42,9 +42,13 @@ poetry --project iceoryx2-ffi/python check-formatting
 # Fix some issues automatically
 poetry --project iceoryx2-ffi/python fix-imports
 poetry --project iceoryx2-ffi/python fix-formatting
+```
 
-# Update dependency (for instance when a security issue occurs)
+### Security Issue: Update Dependency
+
+```sh
 poetry --project iceoryx2-ffi/python update urllib3
+poetry --project doc/api/python update urllib3
 ```
 
 ## Run Examples

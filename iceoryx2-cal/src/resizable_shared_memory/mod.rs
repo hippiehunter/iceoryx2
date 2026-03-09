@@ -176,6 +176,7 @@ impl From<HandleBasedOpenError> for ResizableSharedMemoryError {
     }
 }
 
+
 /// Creates a [`ResizableSharedMemoryView`] to an existing [`ResizableSharedMemory`] and maps the
 /// [`ResizableSharedMemory`] read-only into the process space.
 pub trait ResizableSharedMemoryViewBuilder<
