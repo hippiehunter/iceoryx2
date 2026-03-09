@@ -60,6 +60,12 @@ pub enum IamServerError {
     /// Invalid segment size (zero or exceeds maximum).
     InvalidSegmentSize,
 
+    /// Invalid configuration provided for segment creation.
+    InvalidConfiguration,
+
+    /// Segment creation is not supported by this service type.
+    SegmentCreationNotSupported,
+
     /// An internal error occurred.
     InternalError,
 }
@@ -98,6 +104,9 @@ pub enum IamClientError {
 
     /// Failed to receive a handle from the server.
     HandleReceiveFailed,
+
+    /// Failed to send a handle to the server.
+    HandleSendFailed,
 
     /// The operation timed out.
     Timeout,
@@ -203,6 +212,9 @@ mod tests {
 
         let error = IamClientError::HandleReceiveFailed;
         assert_eq!(format!("{}", error), "IamClientError::HandleReceiveFailed");
+
+        let error = IamClientError::HandleSendFailed;
+        assert_eq!(format!("{}", error), "IamClientError::HandleSendFailed");
 
         let error = IamClientError::Timeout;
         assert_eq!(format!("{}", error), "IamClientError::Timeout");

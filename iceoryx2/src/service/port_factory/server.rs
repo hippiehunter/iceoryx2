@@ -69,6 +69,13 @@ pub enum ServerCreateError {
     /// [`ArcSyncPolicy`](iceoryx2_cal::arc_sync_policy::ArcSyncPolicy) defined in the
     /// [`Service`](crate::service::Service) as `ArcThreadSafetyPolicy`.
     FailedToDeployThreadsafetyPolicy,
+    /// The IAM server denied the attach request for this server.
+    /// This typically occurs when the IAM policy does not allow the requesting
+    /// process to create servers on this service.
+    IamAuthorizationDenied,
+    /// Failed to communicate with the IAM server.
+    /// The IAM connection may have been lost or the server may be unavailable.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for ServerCreateError {

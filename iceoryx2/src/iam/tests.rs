@@ -1205,20 +1205,25 @@ mod integration_tests {
             service_id,
             port_id,
             requested_size: 4096,
+            bucket_size: 64,
+            bucket_align: 8,
         });
 
         server.process().unwrap();
 
         let responses = shared.get_responses();
-        // Currently the server returns ProtocolError because segment creation
-        // requires full SegmentManager integration which is not yet complete.
+        // The default test server uses NoSegmentFactory, so segment creation
+        // returns Denied with "not supported" message.
+        assert!(!responses.is_empty(), "Expected a response from AddSegment");
         match &responses[0] {
-            IamResponse::ProtocolError { message } => {
-                assert!(message.contains("not yet implemented"));
+            IamResponse::Denied { reason, message } => {
+                // NoSegmentFactory returns SegmentCreationNotSupported
+                assert_eq!(*reason, DenialReason::InvalidRequest);
+                assert!(message.contains("not supported"));
             }
             IamResponse::AddSegmentOk { .. } => {
-                // If full implementation is added, this would be the success case
-                panic!("AddSegment succeeded - test needs to be updated to verify proper behavior");
+                // If a real factory is used, this would be the success case
+                panic!("AddSegment succeeded - test should use NoSegmentFactory");
             }
             _ => panic!("Unexpected response: {:?}", responses[0]),
         }

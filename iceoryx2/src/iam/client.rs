@@ -70,7 +70,10 @@ use super::protocol::{
     DenialReason, IamRequest, IamResponse, MessagingPatternKind, ProtocolVersion, SegmentInfo,
     SessionId, INVALID_SESSION_ID, MAX_HANDLES_PER_MESSAGE, MAX_SEGMENTS_PER_ATTACH,
 };
-use super::wire::{client_receive_handles, client_receive_message, client_send_message, new_receive_buffer};
+use super::wire::{
+    client_receive_handles, client_receive_message, client_send_handles, client_send_message,
+    new_receive_buffer,
+};
 use crate::service::service_id::ServiceId;
 use crate::service::service_name::ServiceName;
 
@@ -595,6 +598,8 @@ impl<C: CalClient> IamClient<C> {
         service_id: &ServiceId,
         port_id: u128,
         requested_size: usize,
+        bucket_size: usize,
+        bucket_align: usize,
     ) -> Result<(SegmentId, usize, Vec<PlatformHandle>), IamClientError> {
         self.ensure_active()?;
 
@@ -604,6 +609,8 @@ impl<C: CalClient> IamClient<C> {
             service_id: *service_id,
             port_id,
             requested_size,
+            bucket_size,
+            bucket_align,
         };
         client_send_message(conn, &request)?;
 
@@ -680,6 +687,287 @@ impl<C: CalClient> IamClient<C> {
             IamResponse::Denied { .. } => Err(IamClientError::RequestDenied),
             IamResponse::ProtocolError { .. } => Err(IamClientError::ProtocolError),
             _ => Err(IamClientError::ProtocolError),
+        }
+    }
+
+    // ========================================================================
+    // Segment Handle Registration & Request
+    // ========================================================================
+
+    /// Registers a producer's segment handle with the IAM server.
+    ///
+    /// After creating an anonymous shared memory segment, the producer
+    /// (publisher/server) sends the handle to the IAM server so it can
+    /// be brokered to authorized consumers.
+    ///
+    /// # Arguments
+    ///
+    /// * `service_id` - The service this segment belongs to
+    /// * `port_id` - The producer port that owns the segment
+    /// * `segment_size` - The size of the segment in bytes
+    /// * `handle` - The platform handle for the anonymous segment
+    ///
+    /// # Returns
+    ///
+    /// The segment ID assigned by the IAM server.
+    pub fn register_segment(
+        &mut self,
+        service_id: &ServiceId,
+        port_id: u128,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<SegmentId, IamClientError> {
+        self.ensure_active()?;
+
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
+        let request = IamRequest::RegisterSegment {
+            service_id: *service_id,
+            port_id,
+            segment_size,
+            handle_count: 1,
+        };
+        client_send_message(conn, &request)?;
+
+        // Send the handle to the server via SCM_RIGHTS (Unix) or equivalent
+        let clone = handle
+            .try_clone()
+            .map_err(|_| IamClientError::HandleSendFailed)?;
+        client_send_handles(conn, &[clone])?;
+
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+
+        match response {
+            IamResponse::RegisterSegmentOk { segment_id } => Ok(segment_id),
+            IamResponse::Denied { .. } => Err(IamClientError::RequestDenied),
+            IamResponse::ProtocolError { .. } => Err(IamClientError::ProtocolError),
+            _ => Err(IamClientError::ProtocolError),
+        }
+    }
+
+    /// Requests a segment handle for a sender port's data segment.
+    ///
+    /// Consumers (subscriber/client) use this to obtain handles to producer
+    /// data segments brokered through the IAM server.
+    ///
+    /// # Arguments
+    ///
+    /// * `service_id` - The service the port belongs to
+    /// * `sender_port_id` - The producer port whose segment handle is requested
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some((segment_info, handle)))` if the handle is available,
+    /// `Ok(None)` if the producer has not yet registered its segment,
+    /// or an error on communication failure.
+    pub fn request_segment_handle(
+        &mut self,
+        service_id: &ServiceId,
+        sender_port_id: u128,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError> {
+        self.ensure_active()?;
+
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
+        let request = IamRequest::RequestSegmentHandle {
+            service_id: *service_id,
+            sender_port_id,
+        };
+        client_send_message(conn, &request)?;
+
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+
+        match response {
+            IamResponse::SegmentHandleOk {
+                segment_info,
+                handle_count,
+            } => {
+                if handle_count == 0 || handle_count > MAX_HANDLES_PER_MESSAGE {
+                    return Err(IamClientError::ProtocolError);
+                }
+                let handles = client_receive_handles(conn)?;
+                if handles.is_empty() {
+                    return Err(IamClientError::HandleReceiveFailed);
+                }
+                let handle = handles.into_iter().next().unwrap();
+                Ok(Some((segment_info, handle)))
+            }
+            IamResponse::SegmentHandleNotFound => Ok(None),
+            IamResponse::Denied { .. } => Err(IamClientError::RequestDenied),
+            IamResponse::ProtocolError { .. } => Err(IamClientError::ProtocolError),
+            _ => Err(IamClientError::ProtocolError),
+        }
+    }
+
+    /// Registers a dynamic segment handle at a specific index with the IAM server.
+    ///
+    /// Dynamic segments use indexes (0 for initial, 1+ for reallocations) to track
+    /// multiple segments per port. The producer (publisher/server) sends the handle
+    /// to the IAM server so it can be brokered to authorized consumers.
+    ///
+    /// # Arguments
+    ///
+    /// * `service_id` - The service this segment belongs to
+    /// * `port_id` - The producer port that owns the segment
+    /// * `segment_index` - The index within the dynamic segment set (0-based)
+    /// * `segment_size` - The size of the segment in bytes
+    /// * `handle` - The platform handle for the anonymous segment
+    ///
+    /// # Returns
+    ///
+    /// The segment index that was registered.
+    pub fn register_dynamic_segment(
+        &mut self,
+        service_id: &ServiceId,
+        port_id: u128,
+        segment_index: u8,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<u8, IamClientError> {
+        self.ensure_active()?;
+
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
+        let request = IamRequest::RegisterDynamicSegment {
+            service_id: *service_id,
+            port_id,
+            segment_id: segment_index,
+            segment_size,
+            handle_count: 1,
+        };
+        client_send_message(conn, &request)?;
+
+        // Send the handle to the server via SCM_RIGHTS (Unix) or equivalent
+        let clone = handle
+            .try_clone()
+            .map_err(|_| IamClientError::HandleSendFailed)?;
+        client_send_handles(conn, &[clone])?;
+
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+
+        match response {
+            IamResponse::RegisterDynamicSegmentOk { segment_id } => Ok(segment_id),
+            IamResponse::Denied { .. } => Err(IamClientError::RequestDenied),
+            IamResponse::ProtocolError { .. } => Err(IamClientError::ProtocolError),
+            _ => Err(IamClientError::ProtocolError),
+        }
+    }
+
+    /// Requests a specific dynamic segment handle by index from a sender port.
+    ///
+    /// Consumers (subscriber/client) use this to obtain handles to specific segments
+    /// within a producer's dynamic segment set, identified by the segment index.
+    ///
+    /// # Arguments
+    ///
+    /// * `service_id` - The service the port belongs to
+    /// * `sender_port_id` - The producer port whose segment handle is requested
+    /// * `segment_index` - The index of the dynamic segment (0-based)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some((segment_info, handle)))` if the handle is available
+    /// * `Ok(None)` if the producer has not yet registered this segment index
+    ///   (race condition - retry later)
+    /// * Error on communication failure
+    pub fn request_dynamic_segment_handle(
+        &mut self,
+        service_id: &ServiceId,
+        sender_port_id: u128,
+        segment_index: u8,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError> {
+        self.ensure_active()?;
+
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
+        let request = IamRequest::RequestDynamicSegmentHandle {
+            service_id: *service_id,
+            sender_port_id,
+            segment_id: segment_index,
+        };
+        client_send_message(conn, &request)?;
+
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+
+        match response {
+            IamResponse::DynamicSegmentHandleOk {
+                segment_info,
+                handle_count,
+            } => {
+                if handle_count == 0 || handle_count > MAX_HANDLES_PER_MESSAGE {
+                    return Err(IamClientError::ProtocolError);
+                }
+                let handles = client_receive_handles(conn)?;
+                if handles.is_empty() {
+                    return Err(IamClientError::HandleReceiveFailed);
+                }
+                let handle = handles.into_iter().next().unwrap();
+                Ok(Some((segment_info, handle)))
+            }
+            IamResponse::DynamicSegmentPending => Ok(None),
+            IamResponse::Denied { .. } => Err(IamClientError::RequestDenied),
+            IamResponse::ProtocolError { .. } => Err(IamClientError::ProtocolError),
+            _ => Err(IamClientError::ProtocolError),
+        }
+    }
+
+    // ========================================================================
+    // Notification Operations
+    // ========================================================================
+
+    /// Tries to receive a pending notification without blocking.
+    ///
+    /// This method polls for server-pushed notifications such as:
+    /// - `SegmentUpdate`: A producer added a new segment
+    /// - `SegmentRetiring`: A producer is retiring a segment
+    /// - `PortJoined`/`PortLeft`: Connection topology changes
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some((notification, handles)))` - A notification was received along with
+    ///   any associated handles (e.g., segment handles for SegmentUpdate)
+    /// * `Ok(None)` - No notification is pending
+    /// * `Err(...)` - An error occurred during receive
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// while let Some((notif, handles)) = client.try_receive_notification()? {
+    ///     if let IamNotification::SegmentUpdate { segment_id, .. } = notif {
+    ///         // Process the new segment handle
+    ///     }
+    /// }
+    /// ```
+    pub fn try_receive_notification(
+        &mut self,
+    ) -> Result<Option<(super::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError> {
+        self.ensure_active()?;
+
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+
+        // Try non-blocking receive
+        let notification: Option<super::protocol::IamNotification> =
+            super::wire::client_try_receive_message(conn, &mut self.receive_buffer)?;
+
+        match notification {
+            Some(notif) => {
+                // Check if notification has associated handles
+                let handle_count = match &notif {
+                    super::protocol::IamNotification::SegmentUpdate { handle_count, .. } => {
+                        *handle_count
+                    }
+                    _ => 0,
+                };
+
+                let handles = if handle_count > 0 {
+                    super::wire::client_try_receive_handles(conn)?.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                Ok(Some((notif, handles)))
+            }
+            None => Ok(None),
         }
     }
 
@@ -1404,7 +1692,7 @@ mod tests {
             state: ConnectionState::Active,
         };
 
-        let result = client.add_segment(&service_id, 123, 8192);
+        let result = client.add_segment(&service_id, 123, 8192, 1024, 8);
         assert!(result.is_ok());
 
         let (segment_id, size, handles) = result.unwrap();
@@ -1435,7 +1723,7 @@ mod tests {
             state: ConnectionState::Active,
         };
 
-        let result = client.add_segment(&service_id, 123, 8192);
+        let result = client.add_segment(&service_id, 123, 8192, 1024, 8);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), IamClientError::RequestDenied);
     }
@@ -1603,7 +1891,7 @@ mod tests {
             state: ConnectionState::Active,
         };
 
-        let result = client.add_segment(&service_id, 123, 8192);
+        let result = client.add_segment(&service_id, 123, 8192, 1024, 8);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), IamClientError::ProtocolError);
     }

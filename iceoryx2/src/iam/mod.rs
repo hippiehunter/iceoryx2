@@ -74,10 +74,13 @@
 //! assert!(client_version.is_compatible_with(&server_version));
 //! ```
 
+pub mod audit;
 pub mod client;
+pub mod configured_policy;
 pub mod error;
 pub mod policy;
 pub mod protocol;
+pub mod segment_factory;
 pub mod segment_manager;
 pub mod server;
 pub mod session;
@@ -85,6 +88,12 @@ pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests;
+
+// Re-export audit types
+pub use audit::{AuditEvent, AuditEventKind, AuditLogger, FileAuditLogger};
+
+// Re-export configured policy types
+pub use configured_policy::{ConfiguredPolicy, PolicyLoader};
 
 // Re-export error types
 pub use error::{IamClientError, IamServerError};

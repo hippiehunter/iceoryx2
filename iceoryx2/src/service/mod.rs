@@ -811,12 +811,6 @@ pub trait ServiceResource {
     fn acquire_ownership(&self);
 }
 
-#[derive(Debug)]
-pub(crate) struct NoResource;
-impl ServiceResource for NoResource {
-    fn acquire_ownership(&self) {}
-}
-
 /// Security resource for [`ServiceState`].
 ///
 /// This enum allows [`ServiceState`] to hold either no security context (for public services)
@@ -833,26 +827,11 @@ pub(crate) enum SecurityResource {
 }
 
 impl SecurityResource {
-    /// Returns true if this is a secured resource (client or server).
-    #[inline]
-    pub fn is_secured(&self) -> bool {
-        !matches!(self, SecurityResource::None)
-    }
-
     /// Returns the secured client context if this is a `SecuredClient`.
     #[inline]
     pub fn as_client(&self) -> Option<&TypeErasedSecuredContext> {
         match self {
             SecurityResource::SecuredClient(ctx) => Some(ctx),
-            _ => None,
-        }
-    }
-
-    /// Returns the IAM server if this is a `SecuredServer`.
-    #[inline]
-    pub fn as_server(&self) -> Option<&TypeErasedIamServer> {
-        match self {
-            SecurityResource::SecuredServer(server) => Some(server),
             _ => None,
         }
     }
@@ -873,7 +852,7 @@ impl ServiceResource for SecurityResource {
 /// Contains the building blocks a [`Service`] requires to create the underlying resources and
 /// establish communication.
 #[allow(private_bounds)]
-pub trait Service: Debug + Sized + internal::ServiceInternal<Self> + Clone {
+pub trait Service: Debug + Sized + internal::ServiceInternal<Self> + Clone + 'static {
     /// Every service name will be hashed, to allow arbitrary [`ServiceName`]s with as less
     /// restrictions as possible. The hash of the [`ServiceName`] is the [`Service`]s uuid.
     type ServiceNameHasher: Hash;
@@ -889,7 +868,10 @@ pub trait Service: Debug + Sized + internal::ServiceInternal<Self> + Clone {
     type DynamicStorage: DynamicStorage<DynamicConfig>;
 
     /// The memory used to store the payload.
-    type SharedMemory: SharedMemoryForPoolAllocator;
+    ///
+    /// The `Send + Sync + 'static` bounds are required for IAM-managed dynamic segment
+    /// creation, where the segment factory must be stored in a type-erased container.
+    type SharedMemory: SharedMemoryForPoolAllocator + Send + Sync + 'static;
 
     /// The dynamic memory used to store dynamic payload
     type ResizableSharedMemory: ResizableSharedMemoryForPoolAllocator<Self::SharedMemory>;

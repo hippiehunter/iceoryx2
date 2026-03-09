@@ -50,6 +50,8 @@ use iceoryx2_cal::security::handle::PlatformHandle;
 
 use iceoryx2_cal::control_channel::ControlChannelClient as CalClient;
 
+use iceoryx2_cal::shm_allocator::SegmentId;
+
 use crate::iam::client::IamClient;
 use crate::iam::error::IamClientError;
 use crate::iam::protocol::{SegmentInfo, SessionId};
@@ -107,6 +109,75 @@ pub(crate) trait ErasedSecuredContext: Send + Sync {
 
     /// Returns the service ID this context is associated with.
     fn service_id(&self) -> &ServiceId;
+
+    /// Registers a producer's segment handle with the IAM server.
+    fn register_segment(
+        &self,
+        port_id: u128,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<SegmentId, IamClientError>;
+
+    /// Requests a segment handle for a sender port's data segment.
+    fn request_segment_handle(
+        &self,
+        sender_port_id: u128,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError>;
+
+    /// Registers a dynamic segment handle at a specific index with the IAM server.
+    fn register_dynamic_segment(
+        &self,
+        port_id: u128,
+        segment_index: u8,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<u8, IamClientError>;
+
+    /// Requests a specific dynamic segment handle by index from a sender port.
+    fn request_dynamic_segment_handle(
+        &self,
+        sender_port_id: u128,
+        segment_index: u8,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError>;
+
+    /// Requests a new segment to be created by the IAM server.
+    ///
+    /// Called by producers when they receive a [`NeedSegment`] error during allocation.
+    /// The IAM server creates an anonymous segment and returns a handle for it.
+    ///
+    /// # Arguments
+    ///
+    /// * `port_id` - The port requesting the segment
+    /// * `requested_size` - The minimum requested size for the new segment
+    ///
+    /// # Returns
+    ///
+    /// On success, returns a tuple of:
+    /// - The assigned segment ID
+    /// - The actual size allocated
+    /// - Platform handles for the segment
+    ///
+    /// [`NeedSegment`]: crate::port::details::data_segment::DataSegmentAllocationError::NeedSegment
+    fn add_segment(
+        &self,
+        port_id: u128,
+        requested_size: usize,
+        bucket_size: usize,
+        bucket_align: usize,
+    ) -> Result<(SegmentId, usize, Vec<PlatformHandle>), IamClientError>;
+
+    /// Tries to receive a pending notification without blocking.
+    ///
+    /// This is used by consumers to proactively receive segment handles
+    /// pushed by the IAM server when producers add new segments.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Some((notification, handles)))` - A notification was received
+    /// * `Ok(None)` - No notification is pending
+    fn try_receive_notification(
+        &self,
+    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError>;
 }
 
 /// Type-erased wrapper for `SecuredServiceContext`.
@@ -175,24 +246,67 @@ impl TypeErasedSecuredContext {
         self.inner.attach_client(max_pending_responses)
     }
 
-    /// Returns true if the IAM client is active.
-    pub fn is_active(&self) -> bool {
-        self.inner.is_active()
-    }
-
-    /// Returns the session ID.
-    pub fn session_id(&self) -> SessionId {
-        self.inner.session_id()
-    }
-
-    /// Returns the service ID this context is associated with.
-    pub fn service_id(&self) -> &ServiceId {
-        self.inner.service_id()
-    }
-
     /// Disconnects from the IAM server.
     pub fn disconnect(&self) {
         self.inner.disconnect();
+    }
+
+    /// Registers a producer's segment handle with the IAM server.
+    pub fn register_segment(
+        &self,
+        port_id: u128,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<SegmentId, IamClientError> {
+        self.inner.register_segment(port_id, segment_size, handle)
+    }
+
+    /// Requests a segment handle for a sender port's data segment.
+    pub fn request_segment_handle(
+        &self,
+        sender_port_id: u128,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError> {
+        self.inner.request_segment_handle(sender_port_id)
+    }
+
+    /// Registers a dynamic segment handle at a specific index with the IAM server.
+    pub fn register_dynamic_segment(
+        &self,
+        port_id: u128,
+        segment_index: u8,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<u8, IamClientError> {
+        self.inner
+            .register_dynamic_segment(port_id, segment_index, segment_size, handle)
+    }
+
+    /// Requests a specific dynamic segment handle by index from a sender port.
+    pub fn request_dynamic_segment_handle(
+        &self,
+        sender_port_id: u128,
+        segment_index: u8,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError> {
+        self.inner
+            .request_dynamic_segment_handle(sender_port_id, segment_index)
+    }
+
+    /// Requests a new segment to be created by the IAM server.
+    pub fn add_segment(
+        &self,
+        port_id: u128,
+        requested_size: usize,
+        bucket_size: usize,
+        bucket_align: usize,
+    ) -> Result<(SegmentId, usize, Vec<PlatformHandle>), IamClientError> {
+        self.inner.add_segment(port_id, requested_size, bucket_size, bucket_align)
+    }
+
+    /// Tries to receive a pending notification without blocking.
+    pub fn try_receive_notification(
+        &self,
+    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError> {
+        self.inner.try_receive_notification()
     }
 }
 
@@ -398,6 +512,84 @@ impl<C: CalClient> SecuredServiceContext<C> {
     pub fn disconnect(&self) {
         self.client.lock().unwrap().disconnect();
     }
+
+    /// Registers a producer's segment handle with the IAM server.
+    pub fn register_segment(
+        &self,
+        port_id: u128,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<SegmentId, IamClientError> {
+        self.client
+            .lock()
+            .unwrap()
+            .register_segment(&self.service_id, port_id, segment_size, handle)
+    }
+
+    /// Requests a segment handle for a sender port's data segment.
+    pub fn request_segment_handle(
+        &self,
+        sender_port_id: u128,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError> {
+        self.client
+            .lock()
+            .unwrap()
+            .request_segment_handle(&self.service_id, sender_port_id)
+    }
+
+    /// Registers a dynamic segment handle at a specific index with the IAM server.
+    pub fn register_dynamic_segment(
+        &self,
+        port_id: u128,
+        segment_index: u8,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<u8, IamClientError> {
+        self.client.lock().unwrap().register_dynamic_segment(
+            &self.service_id,
+            port_id,
+            segment_index,
+            segment_size,
+            handle,
+        )
+    }
+
+    /// Requests a specific dynamic segment handle by index from a sender port.
+    pub fn request_dynamic_segment_handle(
+        &self,
+        sender_port_id: u128,
+        segment_index: u8,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError> {
+        self.client.lock().unwrap().request_dynamic_segment_handle(
+            &self.service_id,
+            sender_port_id,
+            segment_index,
+        )
+    }
+
+    /// Requests a new segment to be created by the IAM server.
+    ///
+    /// Called by producers when they receive a `NeedSegment` error during allocation.
+    /// The IAM server creates an anonymous segment and returns a handle for it.
+    pub fn add_segment(
+        &self,
+        port_id: u128,
+        requested_size: usize,
+        bucket_size: usize,
+        bucket_align: usize,
+    ) -> Result<(SegmentId, usize, Vec<PlatformHandle>), IamClientError> {
+        self.client
+            .lock()
+            .unwrap()
+            .add_segment(&self.service_id, port_id, requested_size, bucket_size, bucket_align)
+    }
+
+    /// Tries to receive a pending notification without blocking.
+    pub fn try_receive_notification(
+        &self,
+    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError> {
+        self.client.lock().unwrap().try_receive_notification()
+    }
 }
 
 impl<C: CalClient> ServiceResource for SecuredServiceContext<C> {
@@ -455,6 +647,56 @@ impl<C: CalClient + Send + 'static> ErasedSecuredContext
 
     fn service_id(&self) -> &ServiceId {
         SecuredServiceContext::service_id(self)
+    }
+
+    fn register_segment(
+        &self,
+        port_id: u128,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<SegmentId, IamClientError> {
+        SecuredServiceContext::register_segment(self, port_id, segment_size, handle)
+    }
+
+    fn request_segment_handle(
+        &self,
+        sender_port_id: u128,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError> {
+        SecuredServiceContext::request_segment_handle(self, sender_port_id)
+    }
+
+    fn register_dynamic_segment(
+        &self,
+        port_id: u128,
+        segment_index: u8,
+        segment_size: usize,
+        handle: &PlatformHandle,
+    ) -> Result<u8, IamClientError> {
+        SecuredServiceContext::register_dynamic_segment(self, port_id, segment_index, segment_size, handle)
+    }
+
+    fn request_dynamic_segment_handle(
+        &self,
+        sender_port_id: u128,
+        segment_index: u8,
+    ) -> Result<Option<(SegmentInfo, PlatformHandle)>, IamClientError> {
+        SecuredServiceContext::request_dynamic_segment_handle(self, sender_port_id, segment_index)
+    }
+
+    fn add_segment(
+        &self,
+        port_id: u128,
+        requested_size: usize,
+        bucket_size: usize,
+        bucket_align: usize,
+    ) -> Result<(SegmentId, usize, Vec<PlatformHandle>), IamClientError> {
+        SecuredServiceContext::add_segment(self, port_id, requested_size, bucket_size, bucket_align)
+    }
+
+    fn try_receive_notification(
+        &self,
+    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError> {
+        SecuredServiceContext::try_receive_notification(self)
     }
 }
 

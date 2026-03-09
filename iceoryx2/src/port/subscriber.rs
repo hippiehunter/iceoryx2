@@ -50,6 +50,7 @@ use iceoryx2_cal::dynamic_storage::DynamicStorage;
 use iceoryx2_cal::zero_copy_connection::ChannelId;
 use iceoryx2_log::{fail, warn};
 
+use crate::iam::error::IamClientError;
 use crate::port::update_connections::UpdateConnections;
 use crate::service::builder::CustomPayloadMarker;
 use crate::service::dynamic_config::publish_subscribe::{PublisherDetails, SubscriberDetails};
@@ -173,6 +174,27 @@ impl<
     ) -> Result<Self, SubscriberCreateError> {
         let msg = "Failed to create Subscriber port";
         let origin = "Subscriber::new()";
+
+        // For secured services, request authorization from the IAM server before creating the port.
+        // The IAM server verifies the process credentials and policy before allowing attachment.
+        if let Some(ctx) = service.additional_resource.as_client() {
+            let buffer_size = config.buffer_size.unwrap_or(static_config.subscriber_max_buffer_size);
+            match ctx.attach_subscriber(buffer_size) {
+                Ok((_port_id, _segments, _handles)) => {
+                    // IAM authorization successful. In a future iteration, the returned handles
+                    // will be used to open segments instead of creating them by name.
+                }
+                Err(IamClientError::RequestDenied) => {
+                    fail!(from origin, with SubscriberCreateError::IamAuthorizationDenied,
+                        "{} since the IAM server denied the attach request.", msg);
+                }
+                Err(e) => {
+                    fail!(from origin, with SubscriberCreateError::IamConnectionFailed,
+                        "{} since communication with the IAM server failed: {:?}.", msg, e);
+                }
+            }
+        }
+
         let subscriber_id = UniqueSubscriberId::new();
 
         let publisher_list = &service.dynamic_storage.get().publish_subscribe().publishers;

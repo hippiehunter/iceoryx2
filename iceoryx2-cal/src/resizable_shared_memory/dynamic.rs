@@ -414,7 +414,7 @@ where
     }
 
     fn add_segment_from_handle(
-        &mut self,
+        &self,
         segment_id: SegmentId,
         handle: PlatformHandle,
         access: AccessRights,
@@ -451,7 +451,7 @@ where
         Ok(())
     }
 
-    fn retire_segment(&mut self, segment_id: SegmentId) -> Result<(), ResizableSharedMemoryError> {
+    fn retire_segment(&self, segment_id: SegmentId) -> Result<(), ResizableSharedMemoryError> {
         let msg = "Unable to retire shared memory segment";
         let key = SlotMapKey::new(segment_id.value() as usize);
         let shared_memory_map = unsafe { &mut *self.shared_memory_map.get() };
@@ -748,13 +748,29 @@ where
             || e == ShmAllocationError::ExceedsMaxSupportedAlignment
             || e == ShmAllocationError::AllocationError(AllocationError::SizeTooLarge)
         {
-            if state.shared_state.allocation_strategy == AllocationStrategy::Static {
-                fail!(from self, with e.into(),
-                                    "{msg} since there is not enough memory left ({:?}) and the allocation strategy {:?} forbids reallocation.",
-                                    e, state.shared_state.allocation_strategy);
-            } else {
-                self.create_resized_segment(shm, layout)?;
-                Ok(())
+            match state.shared_state.allocation_strategy {
+                AllocationStrategy::Static => {
+                    fail!(from self, with e.into(),
+                        "{msg} since there is not enough memory left ({:?}) and the allocation strategy {:?} forbids reallocation.",
+                        e, state.shared_state.allocation_strategy);
+                }
+                AllocationStrategy::IamManaged => {
+                    // Calculate the recommended segment size based on allocator hints
+                    let adjusted_segment_setup = shm.allocator().resize_hint(
+                        layout,
+                        state.shared_state.allocation_strategy,
+                    );
+                    fail!(from self, with ResizableShmAllocationError::NeedSegment {
+                        requested_size: adjusted_segment_setup.payload_size,
+                    },
+                    "{msg} since the allocation strategy {:?} requires external segment creation. \
+                     Request a segment of at least {} bytes from the IAM server.",
+                    state.shared_state.allocation_strategy, adjusted_segment_setup.payload_size);
+                }
+                _ => {
+                    self.create_resized_segment(shm, layout)?;
+                    Ok(())
+                }
             }
         } else {
             fail!(from self, with e.into(), "{msg} due to {:?}.", e);
@@ -843,5 +859,53 @@ where
 
     unsafe fn deallocate(&self, offset: PointerOffset, layout: Layout) {
         self.perform_deallocation(offset, |entry| entry.shm.deallocate(offset, layout));
+    }
+
+    fn add_segment(
+        &self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        _config: &Allocator::Configuration,
+    ) -> Result<(), ResizableSharedMemoryError> {
+        let msg = "Unable to add shared memory segment from handle";
+        let key = SlotMapKey::new(segment_id.value() as usize);
+        let state = self.state_mut();
+
+        if state.shared_memory_map.contains(key) {
+            fail!(from self, with ResizableSharedMemoryError::SegmentAlreadyExists,
+                "{} since the segment id {:?} is already mapped.", msg, segment_id);
+        }
+
+        // Open the segment from the handle. The segment was created by IAM with write access,
+        // so we open with read-write access as the owner.
+        let shm = Self::segment_builder(
+            &state.builder_config.base_name,
+            &state.builder_config.shm,
+            segment_id,
+        )
+        .has_ownership(true)  // Owner takes ownership for cleanup
+        .timeout(Duration::ZERO)
+        .open_from_handle(handle, AccessRights::read_write(), &state.builder_config.shm)
+        .map_err(ResizableSharedMemoryError::from)?;
+
+        // Clean up old segment if it's empty
+        match state.shared_memory_map.get(state.current_idx) {
+            Some(segment) => {
+                if segment.chunk_count.load(Ordering::Relaxed) == 0 {
+                    state.shared_memory_map.remove(state.current_idx);
+                }
+            }
+            None => {
+                // No current segment - this is fine, we're adding the first one
+            }
+        }
+
+        if !state.shared_memory_map.insert_at(key, ShmEntry::new(shm)) {
+            fail!(from self, with ResizableSharedMemoryError::InvalidSegmentId,
+                "{} since the segment id {:?} is out of range.", msg, segment_id);
+        }
+        state.current_idx = key;
+
+        Ok(())
     }
 }

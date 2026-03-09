@@ -91,6 +91,7 @@ use iceoryx2_cal::dynamic_storage::DynamicStorage;
 use iceoryx2_cal::zero_copy_connection::ChannelId;
 use iceoryx2_log::{fail, warn};
 
+use crate::iam::error::IamClientError;
 use crate::port::update_connections::UpdateConnections;
 use crate::prelude::UnableToDeliverStrategy;
 use crate::service::builder::CustomPayloadMarker;
@@ -289,9 +290,29 @@ impl<
     ) -> Result<Self, ServerCreateError> {
         let msg = "Failed to create Server port";
         let origin = "Server::new()";
-        let server_id = UniqueServerId::new();
         let service = &server_factory.factory.service;
         let static_config = server_factory.factory.static_config();
+
+        // For secured services, request authorization from the IAM server before creating the port.
+        // The IAM server verifies the process credentials and policy before allowing attachment.
+        let secured_ctx = service.additional_resource.as_client();
+        if let Some(ctx) = secured_ctx {
+            match ctx.attach_server(static_config.max_active_requests_per_client) {
+                Ok((_port_id, _segments, _handles)) => {
+                    // IAM authorization successful.
+                }
+                Err(IamClientError::RequestDenied) => {
+                    fail!(from origin, with ServerCreateError::IamAuthorizationDenied,
+                        "{} since the IAM server denied the attach request.", msg);
+                }
+                Err(e) => {
+                    fail!(from origin, with ServerCreateError::IamConnectionFailed,
+                        "{} since communication with the IAM server failed: {:?}.", msg, e);
+                }
+            }
+        }
+
+        let server_id = UniqueServerId::new();
         let number_of_requests_per_client =
             unsafe { service.static_config.messaging_pattern.request_response() }
                 .required_amount_of_chunks_per_client_data_segment(
@@ -356,26 +377,66 @@ impl<
         let sample_layout = static_config
             .response_message_type_details
             .sample_layout(server_factory.config.initial_max_slice_len);
-        let data_segment = match data_segment_type {
-            DataSegmentType::Static => DataSegment::<Service>::create_static_segment(
-                &segment_name,
-                sample_layout,
-                global_config,
-                number_of_responses,
-            ),
-            DataSegmentType::Dynamic => DataSegment::<Service>::create_dynamic_segment(
-                &segment_name,
-                sample_layout,
-                global_config,
-                number_of_responses,
-                server_factory.config.allocation_strategy,
-            ),
-        };
 
-        let data_segment = fail!(from origin,
-            when data_segment,
-            with ServerCreateError::UnableToCreateDataSegment,
-            "{} since the server data segment could not be created.", msg);
+        // In secured mode with static segments, create anonymous segments and register
+        // the handle with IAM for brokering to clients.
+        let is_secured = service.additional_resource.as_client().is_some();
+        let data_segment = if is_secured && data_segment_type == DataSegmentType::Static {
+            let (segment, handle) = fail!(from origin,
+                when DataSegment::<Service>::create_anonymous_static_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_responses,
+                ),
+                with ServerCreateError::UnableToCreateDataSegment,
+                "{} since the anonymous server data segment could not be created.", msg);
+
+            if let Some(ctx) = service.additional_resource.as_client() {
+                let segment_size = sample_layout.size() * number_of_responses + sample_layout.align() - 1;
+                if let Err(e) = ctx.register_segment(
+                    server_id.value(),
+                    segment_size,
+                    &handle,
+                ) {
+                    warn!(from origin,
+                        "Failed to register server segment handle with IAM server: {:?}. \
+                         Clients will not be able to open this segment via IAM.", e);
+                }
+            }
+            segment
+        } else if is_secured && data_segment_type == DataSegmentType::Dynamic {
+            // IAM-managed dynamic segments for server responses
+            fail!(from origin,
+                when DataSegment::<Service>::create_dynamic_segment_iam_managed(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_responses,
+                ),
+                with ServerCreateError::UnableToCreateDataSegment,
+                "{} since the IAM-managed dynamic server data segment could not be created.", msg)
+        } else {
+            let result = match data_segment_type {
+                DataSegmentType::Static => DataSegment::<Service>::create_static_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_responses,
+                ),
+                DataSegmentType::Dynamic => DataSegment::<Service>::create_dynamic_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_responses,
+                    server_factory.config.allocation_strategy,
+                ),
+            };
+            fail!(from origin,
+                when result,
+                with ServerCreateError::UnableToCreateDataSegment,
+                "{} since the server data segment could not be created.", msg)
+        };
 
         let response_sender = Sender {
             segment_states: {

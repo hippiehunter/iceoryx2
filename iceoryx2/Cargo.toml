@@ -50,6 +50,7 @@ iceoryx2-pal-configuration = { workspace = true }
 iceoryx2-pal-posix = { workspace = true }
 
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 tiny-fn = { workspace = true }
 

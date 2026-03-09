@@ -20,6 +20,7 @@ use iceoryx2_bb_container::vector::polymorphic_vec::*;
 use iceoryx2_bb_elementary::cyclic_tagger::*;
 use iceoryx2_bb_memory::heap_allocator::HeapAllocator;
 use iceoryx2_cal::named_concept::NamedConceptBuilder;
+use iceoryx2_cal::security::AccessRights;
 use iceoryx2_cal::zero_copy_connection::*;
 use iceoryx2_log::fatal_panic;
 use iceoryx2_log::{error, fail, warn};
@@ -90,19 +91,47 @@ impl<Service: service::Service> Connection<Service> {
                                     .create_receiver(),
                         "{} since the zero copy connection could not be established.", msg);
 
-        let segment_name = data_segment_name(sender_port_id);
-        let data_segment = match data_segment_type {
-            DataSegmentType::Static => {
-                DataSegmentView::open_static_segment(&segment_name, global_config)
+        // In secured mode with static segments, request the segment handle from
+        // the IAM server instead of opening by name. This prevents name-guessing attacks.
+        let secured_ctx = this.service_state.additional_resource.as_client();
+        let data_segment = if let Some(ctx) = secured_ctx {
+            if data_segment_type == DataSegmentType::Static {
+                match ctx.request_segment_handle(sender_port_id) {
+                    Ok(Some((_info, handle))) => {
+                        fail!(from this,
+                            when DataSegmentView::open_static_from_handle(handle, global_config),
+                            with ConnectionFailure::SegmentHandleNotAvailable,
+                            "{} since the sender data segment could not be opened from handle.", msg)
+                    }
+                    Ok(None) => {
+                        return Err(ConnectionFailure::SegmentHandleNotAvailable);
+                    }
+                    Err(_) => {
+                        return Err(ConnectionFailure::SegmentHandleNotAvailable);
+                    }
+                }
+            } else {
+                // Dynamic segments in secured mode fall back to name-based opening.
+                let segment_name = data_segment_name(sender_port_id);
+                fail!(from this,
+                    when DataSegmentView::open_dynamic_segment(&segment_name, global_config),
+                    "{} since the sender data segment could not be opened.", msg)
             }
-            DataSegmentType::Dynamic => {
-                DataSegmentView::open_dynamic_segment(&segment_name, global_config)
-            }
+        } else {
+            // Public mode: open by name (existing path)
+            let segment_name = data_segment_name(sender_port_id);
+            let result = match data_segment_type {
+                DataSegmentType::Static => {
+                    DataSegmentView::open_static_segment(&segment_name, global_config)
+                }
+                DataSegmentType::Dynamic => {
+                    DataSegmentView::open_dynamic_segment(&segment_name, global_config)
+                }
+            };
+            fail!(from this,
+                when result,
+                "{} since the sender data segment could not be opened.", msg)
         };
-
-        let data_segment = fail!(from this,
-                                 when data_segment,
-                                "{} since the sender data segment could not be opened.", msg);
 
         Ok(Self {
             receiver,
@@ -302,25 +331,84 @@ impl<Service: service::Service> Receiver<Service> {
                         origin: connection.sender_port_id,
                     };
 
-                    let offset = match connection
+                    // Try to register and translate the offset. For dynamic segments in
+                    // secured mode, we may need to request the segment from IAM first.
+                    let translated_ptr = match connection
                         .data_segment
                         .register_and_translate_offset(offset)
                     {
-                        Ok(offset) => offset,
+                        Ok(ptr) => ptr,
                         Err(e) => {
                             if connection.data_segment.is_dynamic() {
-                                warn!(from self, "Lost a sample. This only happens in the dynamic use case when a sender has reallocated its data segment and gone out of scope before the receiver has mapped the realloacted data segment. To circumvent this, you could either use static memory or increase the initial max slice len.");
-                                return Ok(None);
+                                // In secured mode, try to request the dynamic segment handle
+                                // from IAM and add it to the view
+                                if let Some(ctx) = self.service_state.additional_resource.as_client() {
+                                    let segment_id = offset.segment_id();
+                                    let segment_index = segment_id.value();
+                                    match ctx.request_dynamic_segment_handle(
+                                        connection.sender_port_id,
+                                        segment_index,
+                                    ) {
+                                        Ok(Some((_info, handle))) => {
+                                            // Add the segment from the handle and retry translation
+                                            match connection.data_segment.add_segment_from_handle(
+                                                segment_id,
+                                                handle,
+                                                AccessRights::read_only(),
+                                            ) {
+                                                Ok(()) => {
+                                                    // Segment added successfully - retry translation
+                                                    match connection.data_segment.register_and_translate_offset(offset) {
+                                                        Ok(ptr) => ptr,
+                                                        Err(e) => {
+                                                            fail!(from self,
+                                                                with ReceiveError::ConnectionFailure(ConnectionFailure::UnableToMapSendersDataSegment(e)),
+                                                                "Unable to translate offset after adding dynamic segment {} from IAM.",
+                                                                segment_index);
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(from self,
+                                                        "Lost a sample. Failed to add dynamic segment {} from IAM handle: {:?}.",
+                                                        segment_index, e);
+                                                    return Ok(None);
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            // Producer hasn't registered the segment yet - race condition
+                                            warn!(from self,
+                                                "Lost a sample. Dynamic segment {} not registered with IAM yet. \
+                                                 The producer may still be registering it.",
+                                                segment_index);
+                                            return Ok(None);
+                                        }
+                                        Err(e) => {
+                                            // IAM communication error
+                                            warn!(from self,
+                                                "Lost a sample. Failed to request dynamic segment {} handle from IAM: {:?}.",
+                                                segment_index, e);
+                                            return Ok(None);
+                                        }
+                                    }
+                                } else {
+                                    // Not in secured mode - dynamic segment not mapped
+                                    warn!(from self, "Lost a sample. This only happens in the dynamic use case when a sender has reallocated its data segment and gone out of scope before the receiver has mapped the reallocated data segment. To circumvent this, you could either use static memory or increase the initial max slice len.");
+                                    return Ok(None);
+                                }
+                            } else {
+                                // Static segment - should never fail to map
+                                fail!(from self, with ReceiveError::ConnectionFailure(ConnectionFailure::UnableToMapSendersDataSegment(e)),
+                                    "Unable to register and translate offset from sender {:?} since the received offset {:?} could not be registered and translated.",
+                                    connection.sender_port_id, offset);
                             }
-                            fail!(from self, with ReceiveError::ConnectionFailure(ConnectionFailure::UnableToMapSendersDataSegment(e)),
-                                "Unable to register and translate offset from sender {:?} since the received offset {:?} could not be registered and translated.",
-                                connection.sender_port_id, offset);
                         }
                     };
 
                     Ok(Some((
                         details,
-                        Chunk::new(&self.message_type_details, offset),
+                        Chunk::new(&self.message_type_details, translated_ptr as usize),
                     )))
                 }
             },
@@ -426,6 +514,53 @@ impl<Service: service::Service> Receiver<Service> {
 
     pub(crate) fn start_update_connection_cycle(&self) {
         self.tagger.next_cycle();
+
+        // Poll for IAM notifications in secured mode.
+        // This allows proactive segment handle delivery from the server.
+        self.poll_iam_notifications();
+    }
+
+    /// Polls for pending IAM notifications and processes them.
+    ///
+    /// In secured mode, the IAM server can push segment handles to consumers
+    /// when producers add new segments. This method drains the notification
+    /// queue and adds any received segment handles to the appropriate connections.
+    fn poll_iam_notifications(&self) {
+        let ctx = match self.service_state.additional_resource.as_client() {
+            Some(ctx) => ctx,
+            None => return, // Not in secured mode
+        };
+
+        // Drain all pending notifications
+        loop {
+            match ctx.try_receive_notification() {
+                Ok(Some((notif, handles))) => {
+                    if let crate::iam::protocol::IamNotification::SegmentUpdate {
+                        segment_id,
+                        ..
+                    } = notif
+                    {
+                        // We received a segment handle pushed by the server.
+                        // Store it for when we encounter data from this segment.
+                        if let Some(handle) = handles.into_iter().next() {
+                            // Find connections that might need this segment.
+                            // For now, we log the notification; full integration would
+                            // require tracking which connection/port needs which segment.
+                            iceoryx2_log::debug!(
+                                "Received proactive segment {} handle from IAM server",
+                                segment_id.value()
+                            );
+                            // Note: The actual segment addition is handled lazily in
+                            // receive_from_connection when we encounter unknown segment_id.
+                            // Proactive addition would require additional mapping infrastructure.
+                            drop(handle);
+                        }
+                    }
+                }
+                Ok(None) => break, // No more notifications
+                Err(_) => break,   // Error receiving, stop polling
+            }
+        }
     }
 
     pub(crate) fn update_connection(

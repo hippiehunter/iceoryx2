@@ -34,6 +34,10 @@ pub enum iox2_client_create_error_e {
     UNABLE_TO_CREATE_DATA_SEGMENT = IOX2_OK as isize + 1,
     EXCEEDS_MAX_SUPPORTED_CLIENTS,
     FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY,
+    #[CStr = "iam authorization denied"]
+    IAM_AUTHORIZATION_DENIED,
+    #[CStr = "iam connection failed"]
+    IAM_CONNECTION_FAILED,
 }
 
 impl IntoCInt for ClientCreateError {
@@ -47,6 +51,12 @@ impl IntoCInt for ClientCreateError {
             }
             ClientCreateError::FailedToDeployThreadsafetyPolicy => {
                 iox2_client_create_error_e::FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY
+            }
+            ClientCreateError::IamAuthorizationDenied => {
+                iox2_client_create_error_e::IAM_AUTHORIZATION_DENIED
+            }
+            ClientCreateError::IamConnectionFailed => {
+                iox2_client_create_error_e::IAM_CONNECTION_FAILED
             }
         }) as c_int
     }

@@ -54,6 +54,16 @@ pub enum AllocationStrategy {
     /// The memory is not increased. This may lead to an out-of-memory error when allocating.
     #[default]
     Static,
+    /// IAM-managed allocation strategy. When out of memory, returns a [`NeedSegment`] error
+    /// instead of auto-creating segments. The caller is responsible for requesting a segment
+    /// from the IAM server and adding it via [`ResizableSharedMemory::add_segment()`].
+    ///
+    /// This strategy is used in secured mode to ensure all segment creation goes through
+    /// the IAM server for proper authorization and handle-based access control.
+    ///
+    /// [`NeedSegment`]: crate::resizable_shared_memory::ResizableShmAllocationError::NeedSegment
+    /// [`ResizableSharedMemory::add_segment()`]: crate::resizable_shared_memory::ResizableSharedMemory::add_segment
+    IamManaged,
 }
 
 /// Describes error that may occur when a [`ShmAllocator`] is initialized.

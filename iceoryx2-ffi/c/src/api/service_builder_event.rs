@@ -93,6 +93,10 @@ pub enum iox2_event_open_or_create_error_e {
     O_IAM_CONNECTION_FAILED,
     #[CStr = "IAM handshake failed"]
     O_IAM_HANDSHAKE_FAILED,
+    #[CStr = "dev_permissions feature is incompatible with secured mode"]
+    O_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
+    #[CStr = "dev_permissions feature is incompatible with secured mode"]
+    C_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
     #[CStr = "same service is created and removed repeatedly"]
     SYSTEM_IN_FLUX,
 }
@@ -158,6 +162,9 @@ impl IntoCInt for EventOpenError {
             EventOpenError::IamHandshakeFailed => {
                 iox2_event_open_or_create_error_e::O_IAM_HANDSHAKE_FAILED
             }
+            EventOpenError::DevPermissionsIncompatibleWithSecuredMode => {
+                iox2_event_open_or_create_error_e::O_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE
+            }
         }) as c_int
     }
 }
@@ -184,6 +191,9 @@ impl IntoCInt for EventCreateError {
             }
             EventCreateError::IamServerCreationFailed => {
                 iox2_event_open_or_create_error_e::C_IAM_SERVER_CREATION_FAILED
+            }
+            EventCreateError::DevPermissionsIncompatibleWithSecuredMode => {
+                iox2_event_open_or_create_error_e::C_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE
             }
         }) as c_int
     }

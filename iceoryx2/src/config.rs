@@ -188,6 +188,18 @@ pub struct IamConfig {
     ///
     /// This is the maximum time a client will wait when connecting to an IAM server.
     pub connect_timeout: Duration,
+    /// Directory containing TOML policy files for per-service authorization.
+    ///
+    /// Policy files are named `{sanitized_service_name}.toml` and loaded
+    /// automatically when a secured service is created. If no policy file
+    /// exists for a service, the [`DefaultPolicy`](crate::iam::DefaultPolicy)
+    /// is used.
+    pub policy_dir: Path,
+    /// Path to the audit log file for recording IAM authorization decisions.
+    ///
+    /// The file is opened in append mode and written in JSON Lines format.
+    /// Set to an empty path to disable audit logging.
+    pub audit_log_path: Path,
 }
 
 impl Default for IamConfig {
@@ -195,6 +207,8 @@ impl Default for IamConfig {
         Self {
             endpoint_base: Path::new(b"iam").unwrap(),
             connect_timeout: Duration::from_secs(5),
+            policy_dir: Path::new(b"iam/policies").unwrap(),
+            audit_log_path: Path::new(b"iam/audit.log").unwrap(),
         }
     }
 }

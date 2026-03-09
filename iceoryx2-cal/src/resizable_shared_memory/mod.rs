@@ -95,7 +95,6 @@ use core::alloc::Layout;
 use core::fmt::Debug;
 use core::time::Duration;
 
-use iceoryx2_bb_elementary::enum_gen;
 
 use crate::named_concept::*;
 use crate::security::HandleBasedOpenError;
@@ -105,19 +104,42 @@ use crate::shared_memory::{
 use crate::shm_allocator::{PointerOffset, ShmAllocationError, ShmAllocator};
 use crate::security::{AccessRights, PlatformHandle};
 
-enum_gen! {
-/// Defines all erros that can occur when calling [`ResizableSharedMemory::allocate()`]
+/// Defines all errors that can occur when calling [`ResizableSharedMemory::allocate()`]
 ///
 /// The [`ResizableSharedMemory`] cannot be resized indefinitely. If the resize limit is hit
 /// this error will be returned. It can be mitigated by providing a better
 /// [`ResizableSharedMemoryBuilder::max_number_of_chunks_hint()`] or
 /// [`ResizableSharedMemoryBuilder::max_chunk_layout_hint()`].
-    ResizableShmAllocationError
-  entry:
-    MaxReallocationsReached
-  mapping:
-    ShmAllocationError,
-    SharedMemoryCreateError
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum ResizableShmAllocationError {
+    /// The maximum number of segment reallocations has been reached.
+    MaxReallocationsReached,
+    /// Returned when using [`AllocationStrategy::IamManaged`] and the current segment
+    /// is out of memory. The caller should request a new segment from the IAM server
+    /// and add it via [`ResizableSharedMemory::add_segment()`] before retrying allocation.
+    ///
+    /// The `requested_size` field contains the recommended minimum size for the new segment
+    /// based on the allocator's resize hint.
+    NeedSegment {
+        /// The recommended minimum size for the new segment.
+        requested_size: usize,
+    },
+    /// An error occurred during allocation from the underlying allocator.
+    ShmAllocationError(ShmAllocationError),
+    /// An error occurred while creating a new shared memory segment.
+    SharedMemoryCreateError(SharedMemoryCreateError),
+}
+
+impl From<ShmAllocationError> for ResizableShmAllocationError {
+    fn from(v: ShmAllocationError) -> Self {
+        ResizableShmAllocationError::ShmAllocationError(v)
+    }
+}
+
+impl From<SharedMemoryCreateError> for ResizableShmAllocationError {
+    fn from(v: SharedMemoryCreateError) -> Self {
+        ResizableShmAllocationError::SharedMemoryCreateError(v)
+    }
 }
 
 impl core::fmt::Display for ResizableShmAllocationError {
@@ -235,15 +257,27 @@ pub trait ResizableSharedMemoryView<Allocator: ShmAllocator, Shm: SharedMemory<A
 
     /// Adds a new [`SharedMemory`] segment from a handle received via IAM with the provided
     /// access rights.
+    ///
+    /// # Note
+    ///
+    /// This method takes `&self` despite mutating internal state because the underlying
+    /// implementation uses interior mutability (`UnsafeCell`). This allows segments to be
+    /// added from shared references, which is necessary in the receiver path where only
+    /// shared access to connections is available.
     fn add_segment_from_handle(
-        &mut self,
+        &self,
         segment_id: SegmentId,
         handle: PlatformHandle,
         access: AccessRights,
     ) -> Result<(), ResizableSharedMemoryError>;
 
     /// Retires a segment after IAM confirmed it can be released.
-    fn retire_segment(&mut self, segment_id: SegmentId) -> Result<(), ResizableSharedMemoryError>;
+    ///
+    /// # Note
+    ///
+    /// This method takes `&self` despite mutating internal state because the underlying
+    /// implementation uses interior mutability (`UnsafeCell`).
+    fn retire_segment(&self, segment_id: SegmentId) -> Result<(), ResizableSharedMemoryError>;
 }
 
 /// The [`ResizableSharedMemory`] can be only owned by exactly one process that is allowed to
@@ -288,6 +322,34 @@ pub trait ResizableSharedMemory<Allocator: ShmAllocator, Shm: SharedMemory<Alloc
     ///    [`ShmPointer`]
     ///  * the layout must be identical to the one used in [`SharedMemory::allocate()`]
     unsafe fn deallocate(&self, offset: PointerOffset, layout: core::alloc::Layout);
+
+    /// Add a segment created externally (by IAM) to this resizable shared memory.
+    ///
+    /// This is called after receiving a [`ResizableShmAllocationError::NeedSegment`] error
+    /// and obtaining a segment handle from the IAM server. The segment is opened from the
+    /// provided handle and added to the internal segment map.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment ID assigned by the IAM server
+    /// * `handle` - The platform handle to the shared memory segment
+    /// * `config` - The allocator configuration for the new segment
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - The segment was successfully added
+    /// * `Err(ResizableSharedMemoryError)` - The segment could not be added
+    ///
+    /// # Note
+    ///
+    /// This method is only relevant when using [`AllocationStrategy::IamManaged`].
+    /// For other allocation strategies, segments are created internally.
+    fn add_segment(
+        &self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        config: &Allocator::Configuration,
+    ) -> Result<(), ResizableSharedMemoryError>;
 }
 
 pub trait ResizableSharedMemoryForPoolAllocator<Shm: SharedMemory<PoolAllocator>>:

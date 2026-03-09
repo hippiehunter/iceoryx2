@@ -50,6 +50,8 @@ impl iceoryx2::service::Service for CustomServiceVariant {
     type BlackboardPayload = iceoryx2_cal::shared_memory::file::Memory<
         iceoryx2_cal::shm_allocator::bump_allocator::BumpAllocator,
     >;
+    // control channel for IAM (secured mode) communication
+    type ControlChannel = iceoryx2_cal::control_channel::recommended::Ipc;
 }
 
 impl iceoryx2::service::internal::ServiceInternal<CustomServiceVariant> for CustomServiceVariant {}

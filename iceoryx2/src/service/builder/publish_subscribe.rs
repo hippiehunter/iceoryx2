@@ -17,6 +17,7 @@
 use core::marker::PhantomData;
 
 use alloc::format;
+use alloc::sync::Arc;
 
 use iceoryx2_bb_elementary::alignment::Alignment;
 use iceoryx2_bb_elementary_traits::zero_copy_send::ZeroCopySend;
@@ -37,7 +38,11 @@ use crate::service::{self, dynamic_config::MessagingPatternSettings};
 use iceoryx2_cal::control_channel::{ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder};
 use iceoryx2_cal::named_concept::NamedConceptBuilder;
 
+use iceoryx2_bb_container::semantic_string::SemanticString;
+
+use crate::iam::audit::FileAuditLogger;
 use crate::iam::client::IamClient;
+use crate::iam::configured_policy::{PolicyDispatch, PolicyLoader};
 use crate::iam::server::{IamServer, TypeErasedIamServer};
 use crate::iam::DefaultPolicy;
 use crate::service::secured_context::{SecuredServiceContext, TypeErasedSecuredContext};
@@ -99,6 +104,10 @@ pub enum PublishSubscribeOpenError {
     /// The IAM handshake failed when opening a secured service.
     /// This can happen if the protocol version is incompatible or the server rejected the connection.
     IamHandshakeFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for PublishSubscribeOpenError {
@@ -157,6 +166,10 @@ pub enum PublishSubscribeCreateError {
     /// Failed to create the IAM server for a secured service.
     /// This can happen if the control channel listener cannot be created.
     IamServerCreationFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for PublishSubscribeCreateError {
@@ -561,6 +574,16 @@ impl<
 
         let msg = "Unable to create publish subscribe service";
 
+        // Check for dev_permissions + secured mode incompatibility
+        #[cfg(feature = "dev_permissions")]
+        {
+            if self.base.shared_node.config().global.node.security.mode == SecurityMode::Secured {
+                fail!(from self, with PublishSubscribeCreateError::DevPermissionsIncompatibleWithSecuredMode,
+                    "{} since the 'dev_permissions' feature is incompatible with SecurityMode::Secured. \
+                     The 'dev_permissions' feature sets world-readable permissions which defeats secured mode isolation.", msg);
+            }
+        }
+
         if !self.config_details().enable_safe_overflow
             && (self.config_details().subscriber_max_buffer_size
                 < self.config_details().history_size)
@@ -654,9 +677,34 @@ impl<
                             PublishSubscribeCreateError::IamServerCreationFailed
                         })?;
 
-                    // Create IAM server with default policy
-                    let policy = DefaultPolicy::new();
-                    let server = IamServer::new(listener, policy);
+                    // Load policy for this service (falls back to DefaultPolicy)
+                    let iam_config = &self.base.shared_node.config().global.node.security.iam;
+                    let service_name_str = self.base.service_config.name().to_string();
+                    let policy_dir_str = core::str::from_utf8(iam_config.policy_dir.as_bytes()).unwrap_or("iam/policies");
+                    let policy = match PolicyLoader::load_for_service(std::path::Path::new(policy_dir_str), self.base.service_config.name()) {
+                        Some(configured) => PolicyDispatch::Configured(configured),
+                        None => PolicyDispatch::Default(DefaultPolicy::new()),
+                    };
+
+                    // Create audit logger (best-effort - continues without if file cannot be opened)
+                    let audit_path_str = core::str::from_utf8(iam_config.audit_log_path.as_bytes()).unwrap_or("iam/audit.log");
+                    let audit_logger: Option<Box<dyn crate::iam::audit::AuditLogger>> =
+                        FileAuditLogger::new(std::path::Path::new(audit_path_str))
+                            .ok()
+                            .map(|l| Box::new(l) as _);
+
+                    // Create segment factory for IAM-managed dynamic segments
+                    let segment_factory = Arc::new(crate::iam::segment_factory::ServiceSegmentFactory::<ServiceType>::new(
+                        self.base.shared_node.config().clone(),
+                    ));
+
+                    let server = IamServer::new_with_all(
+                        listener,
+                        policy,
+                        service_name_str,
+                        audit_logger,
+                        segment_factory,
+                    );
 
                     // Wrap in type-erased container
                     SecurityResource::SecuredServer(TypeErasedIamServer::new(server))
@@ -689,6 +737,16 @@ impl<
         PublishSubscribeOpenError,
     > {
         let msg = "Unable to open publish subscribe service";
+
+        // Check for dev_permissions + secured mode incompatibility
+        #[cfg(feature = "dev_permissions")]
+        {
+            if self.base.shared_node.config().global.node.security.mode == SecurityMode::Secured {
+                fail!(from self, with PublishSubscribeOpenError::DevPermissionsIncompatibleWithSecuredMode,
+                    "{} since the 'dev_permissions' feature is incompatible with SecurityMode::Secured. \
+                     The 'dev_permissions' feature sets world-readable permissions which defeats secured mode isolation.", msg);
+            }
+        }
 
         let mut service_open_retry_count = 0;
         loop {

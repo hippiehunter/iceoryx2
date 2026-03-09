@@ -125,6 +125,7 @@ use iceoryx2_cal::zero_copy_connection::{
 };
 use iceoryx2_log::{fail, warn};
 
+use crate::iam::error::IamClientError;
 use crate::port::details::sender::*;
 use crate::port::update_connections::{ConnectionFailure, UpdateConnections};
 use crate::prelude::UnableToDeliverStrategy;
@@ -376,6 +377,26 @@ impl<
     ) -> Result<Self, PublisherCreateError> {
         let msg = "Unable to create Publisher port";
         let origin = "Publisher::new()";
+
+        // For secured services, request authorization from the IAM server before creating the port.
+        // The IAM server verifies the process credentials and policy before allowing attachment.
+        let secured_ctx = service.additional_resource.as_client();
+        if let Some(ctx) = secured_ctx {
+            match ctx.attach_publisher(static_config.history_size, config.initial_max_slice_len) {
+                Ok((_port_id, _segments, _handles)) => {
+                    // IAM authorization successful.
+                }
+                Err(IamClientError::RequestDenied) => {
+                    fail!(from origin, with PublisherCreateError::IamAuthorizationDenied,
+                        "{} since the IAM server denied the attach request.", msg);
+                }
+                Err(e) => {
+                    fail!(from origin, with PublisherCreateError::IamConnectionFailed,
+                        "{} since communication with the IAM server failed: {:?}.", msg, e);
+                }
+            }
+        }
+
         let port_id = UniquePublisherId::new();
         let subscriber_list = &service
             .dynamic_storage
@@ -408,26 +429,69 @@ impl<
         let global_config = service.shared_node.config();
 
         let segment_name = data_segment_name(publisher_details.publisher_id.value());
-        let data_segment = match data_segment_type {
-            DataSegmentType::Static => DataSegment::create_static_segment(
-                &segment_name,
-                sample_layout,
-                global_config,
-                number_of_samples,
-            ),
-            DataSegmentType::Dynamic => DataSegment::create_dynamic_segment(
-                &segment_name,
-                sample_layout,
-                global_config,
-                number_of_samples,
-                config.allocation_strategy,
-            ),
-        };
 
-        let data_segment = fail!(from origin,
-                when data_segment,
+        // In secured mode with static segments, create anonymous segments and register
+        // the handle with IAM for brokering to subscribers.
+        let is_secured = service.additional_resource.as_client().is_some();
+        let data_segment = if is_secured && data_segment_type == DataSegmentType::Static {
+            let (segment, handle) = fail!(from origin,
+                when DataSegment::create_anonymous_static_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_samples,
+                ),
                 with PublisherCreateError::UnableToCreateDataSegment,
-                "{} since the data segment could not be acquired.", msg);
+                "{} since the anonymous data segment could not be created.", msg);
+
+            // Register the handle with the IAM server
+            if let Some(ctx) = service.additional_resource.as_client() {
+                let segment_size = sample_layout.size() * number_of_samples + sample_layout.align() - 1;
+                if let Err(e) = ctx.register_segment(
+                    publisher_details.publisher_id.value(),
+                    segment_size,
+                    &handle,
+                ) {
+                    warn!(from origin,
+                        "Failed to register segment handle with IAM server: {:?}. \
+                         Subscribers will not be able to open this segment via IAM.", e);
+                }
+            }
+            segment
+        } else if is_secured && data_segment_type == DataSegmentType::Dynamic {
+            // IAM-managed dynamic segments: use IamManaged allocation strategy
+            // which returns NeedSegment errors on OOM, allowing the sender to
+            // request segments from IAM and add them via add_segment().
+            fail!(from origin,
+                when DataSegment::create_dynamic_segment_iam_managed(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_samples,
+                ),
+                with PublisherCreateError::UnableToCreateDataSegment,
+                "{} since the IAM-managed dynamic data segment could not be created.", msg)
+        } else {
+            let result = match data_segment_type {
+                DataSegmentType::Static => DataSegment::create_static_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_samples,
+                ),
+                DataSegmentType::Dynamic => DataSegment::create_dynamic_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_samples,
+                    config.allocation_strategy,
+                ),
+            };
+            fail!(from origin,
+                when result,
+                with PublisherCreateError::UnableToCreateDataSegment,
+                "{} since the data segment could not be acquired.", msg)
+        };
 
         let publisher_shared_state =
             <Service as service::Service>::ArcThreadSafetyPolicy::new(PublisherSharedState {

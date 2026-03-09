@@ -155,64 +155,6 @@ pub(crate) fn try_receive_message<C: ControlChannelConnection, T: DeserializeOwn
     Postcard::deserialize(buffer).map_err(|_| IamServerError::SerializationError).map(Some)
 }
 
-/// Receives and deserializes a message from a CAL connection (blocking).
-///
-/// This function blocks until a complete framed message is received.
-///
-/// # Arguments
-/// * `conn` - The CAL connection to receive from
-/// * `buffer` - A reusable buffer for receiving data
-///
-/// # Errors
-/// Returns `IamServerError::SerializationError` if deserialization fails.
-/// Returns `IamServerError::ReceiveFailed` if the receive operation fails.
-pub(crate) fn receive_message<C: ControlChannelConnection, T: DeserializeOwned>(
-    conn: &C,
-    buffer: &mut Vec<u8>,
-) -> Result<T, IamServerError> {
-    // Ensure buffer has capacity for length prefix
-    buffer.clear();
-    buffer.resize(4, 0);
-
-    // Receive the length prefix (blocking)
-    let mut total_read = 0;
-    while total_read < 4 {
-        let bytes_read = conn
-            .receive(&mut buffer[total_read..4])
-            .map_err(map_receive_error_server)?;
-        if bytes_read == 0 {
-            return Err(IamServerError::ReceiveFailed);
-        }
-        total_read += bytes_read as usize;
-    }
-
-    // Parse the length prefix
-    let len = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
-
-    // Validate message size (must be > 0 and <= MAX_MESSAGE_SIZE)
-    if len == 0 || len > MAX_MESSAGE_SIZE {
-        return Err(IamServerError::SerializationError);
-    }
-
-    // Resize buffer to hold the payload
-    buffer.resize(len, 0);
-
-    // Read the complete payload
-    let mut total_read = 0;
-    while total_read < len {
-        let bytes_read = conn
-            .receive(&mut buffer[total_read..])
-            .map_err(map_receive_error_server)?;
-        if bytes_read == 0 {
-            return Err(IamServerError::ReceiveFailed);
-        }
-        total_read += bytes_read as usize;
-    }
-
-    // Deserialize the message
-    Postcard::deserialize(buffer).map_err(|_| IamServerError::SerializationError)
-}
-
 /// Sends platform handles over a CAL connection.
 ///
 /// Converts from `&[PlatformHandle]` to `&[&PlatformHandle]` as required by
@@ -232,22 +174,6 @@ pub(crate) fn send_handles<C: ControlChannelConnection>(
     let handle_refs: Vec<&PlatformHandle> = handles.iter().collect();
     conn.send_handles(&handle_refs)
         .map_err(|_| IamServerError::HandlePassingFailed)
-}
-
-/// Receives platform handles from a CAL connection (blocking).
-///
-/// # Arguments
-/// * `conn` - The CAL connection to receive from
-///
-/// # Errors
-/// Returns `IamServerError::HandlePassingFailed` if the receive operation fails
-/// or no handles were received.
-pub(crate) fn receive_handles<C: ControlChannelConnection>(
-    conn: &C,
-) -> Result<Vec<PlatformHandle>, IamServerError> {
-    conn.receive_handles()
-        .map_err(|_| IamServerError::HandlePassingFailed)?
-        .ok_or(IamServerError::HandlePassingFailed)
 }
 
 /// Gets peer credentials from a CAL connection.
@@ -357,6 +283,97 @@ pub(crate) fn client_receive_message<C: ControlChannelClient, T: DeserializeOwne
     Postcard::deserialize(buffer).map_err(|_| IamClientError::SerializationError)
 }
 
+/// Tries to receive and deserialize a message from a CAL client connection (non-blocking).
+///
+/// This function attempts to read a complete framed message. If no data is
+/// available, it returns `Ok(None)`.
+///
+/// # Arguments
+/// * `client` - The CAL client connection to receive from
+/// * `buffer` - A reusable buffer for receiving data
+///
+/// # Returns
+/// * `Ok(Some(message))` - A complete message was received
+/// * `Ok(None)` - No data is available (would block)
+///
+/// # Errors
+/// Returns `IamClientError::SerializationError` if deserialization fails.
+/// Returns `IamClientError::ReceiveFailed` if the receive operation fails.
+pub(crate) fn client_try_receive_message<C: ControlChannelClient, T: DeserializeOwned>(
+    client: &C,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<T>, IamClientError> {
+    // Ensure buffer has capacity for length prefix
+    buffer.clear();
+    buffer.resize(4, 0);
+
+    // Try to receive the length prefix (non-blocking)
+    let bytes_read = client.try_receive(buffer).map_err(map_receive_error_client)?;
+
+    if bytes_read == 0 {
+        return Ok(None); // No data available
+    }
+
+    // If we got partial data, complete the read (blocking for remainder)
+    let mut total_header_read = bytes_read as usize;
+    while total_header_read < 4 {
+        let additional = client
+            .receive(&mut buffer[total_header_read..4])
+            .map_err(map_receive_error_client)?;
+        if additional == 0 {
+            return Err(IamClientError::ReceiveFailed);
+        }
+        total_header_read += additional as usize;
+    }
+
+    // Parse the length prefix
+    let len = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+
+    // Validate message size (must be > 0 and <= MAX_MESSAGE_SIZE)
+    if len == 0 || len > MAX_MESSAGE_SIZE {
+        return Err(IamClientError::SerializationError);
+    }
+
+    // Resize buffer to hold the payload
+    buffer.resize(len, 0);
+
+    // Read the complete payload
+    let mut total_read = 0;
+    while total_read < len {
+        let bytes_read = client
+            .receive(&mut buffer[total_read..])
+            .map_err(map_receive_error_client)?;
+        if bytes_read == 0 {
+            return Err(IamClientError::ReceiveFailed);
+        }
+        total_read += bytes_read as usize;
+    }
+
+    // Deserialize the message
+    Postcard::deserialize(buffer)
+        .map_err(|_| IamClientError::SerializationError)
+        .map(Some)
+}
+
+/// Tries to receive platform handles from a CAL client connection (non-blocking).
+///
+/// # Arguments
+/// * `client` - The CAL client connection to receive from
+///
+/// # Returns
+/// * `Ok(Some(handles))` - Handles were received
+/// * `Ok(None)` - No handles available
+///
+/// # Errors
+/// Returns `IamClientError::HandleReceiveFailed` if the receive operation fails.
+pub(crate) fn client_try_receive_handles<C: ControlChannelClient>(
+    client: &C,
+) -> Result<Option<Vec<PlatformHandle>>, IamClientError> {
+    client
+        .try_receive_handles()
+        .map_err(|_| IamClientError::HandleReceiveFailed)
+}
+
 /// Receives platform handles from a CAL client connection (blocking).
 ///
 /// # Arguments
@@ -372,6 +389,46 @@ pub(crate) fn client_receive_handles<C: ControlChannelClient>(
         .receive_handles()
         .map_err(|_| IamClientError::HandleReceiveFailed)?
         .ok_or(IamClientError::HandleReceiveFailed)
+}
+
+/// Sends platform handles from a CAL client connection to the server.
+///
+/// This is used by producers (publisher/server) to send segment handles
+/// to the IAM server for brokering to consumers.
+///
+/// # Arguments
+/// * `client` - The CAL client connection to send on
+/// * `handles` - The handles to send
+///
+/// # Errors
+/// Returns `IamClientError::HandleSendFailed` if the send operation fails.
+pub(crate) fn client_send_handles<C: ControlChannelClient>(
+    client: &C,
+    handles: &[PlatformHandle],
+) -> Result<(), IamClientError> {
+    let handle_refs: Vec<&PlatformHandle> = handles.iter().collect();
+    client
+        .send_handles(&handle_refs)
+        .map_err(|_| IamClientError::HandleSendFailed)
+}
+
+/// Receives platform handles from a client connection (server-side).
+///
+/// This is used by the IAM server to receive segment handles sent by
+/// producers during segment registration.
+///
+/// # Arguments
+/// * `conn` - The CAL connection to receive from
+///
+/// # Errors
+/// Returns `IamServerError::HandlePassingFailed` if the receive operation fails
+/// or no handles were received.
+pub(crate) fn receive_handles_from_client<C: ControlChannelConnection>(
+    conn: &C,
+) -> Result<Vec<PlatformHandle>, IamServerError> {
+    conn.receive_handles()
+        .map_err(|_| IamServerError::HandlePassingFailed)?
+        .ok_or(IamServerError::HandlePassingFailed)
 }
 
 /// Creates a new buffer with the initial capacity for receiving messages.

@@ -166,6 +166,8 @@ pub struct SegmentManager {
     /// All managed segments indexed by their ID value.
     /// We use BTreeMap with the underlying u8 value since SegmentId doesn't implement Hash.
     segments: BTreeMap<SegmentIdKey, ManagedSegment>,
+    /// Mapping from producer port ID to the segment IDs it has registered.
+    port_segments: BTreeMap<u128, Vec<SegmentId>>,
     /// Counter for generating unique segment IDs.
     ///
     /// Uses u8 since SegmentId is based on u8.
@@ -183,6 +185,7 @@ impl SegmentManager {
     pub const fn new() -> Self {
         Self {
             segments: BTreeMap::new(),
+            port_segments: BTreeMap::new(),
             next_id: 0,
         }
     }
@@ -251,10 +254,75 @@ impl SegmentManager {
         Ok(segment_id)
     }
 
+    /// Registers a segment with a pre-allocated ID and existing handle.
+    ///
+    /// This is used when the segment ID has already been allocated (e.g., by
+    /// the IAM server during AddSegment processing) and the shared memory
+    /// has been created externally.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The pre-allocated segment ID
+    /// * `handle` - The platform handle for the segment
+    /// * `size` - The size of the segment in bytes
+    /// * `access` - The access rights for the segment
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IamServerError::InvalidSegmentSize`] if size is zero.
+    pub fn register_segment_with_id(
+        &mut self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        size: usize,
+        access: AccessRights,
+    ) -> Result<(), IamServerError> {
+        // Validate segment size to prevent resource accounting corruption
+        if size == 0 {
+            return Err(IamServerError::InvalidSegmentSize);
+        }
+
+        let segment = ManagedSegment::new(segment_id, handle, size, access);
+        self.segments.insert(segment_id.value(), segment);
+
+        Ok(())
+    }
+
+    /// Associates a segment with a producer port.
+    ///
+    /// This adds the segment to the port's segment list, allowing consumers
+    /// to retrieve handles via [`get_segment_handle_for_consumer`].
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment to associate
+    /// * `port_id` - The producer port to associate with
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IamServerError::SegmentNotFound`] if the segment doesn't exist.
+    pub fn associate_segment_with_port(
+        &mut self,
+        segment_id: SegmentId,
+        port_id: u128,
+    ) -> Result<(), IamServerError> {
+        // Verify the segment exists
+        if !self.segments.contains_key(&segment_id.value()) {
+            return Err(IamServerError::SegmentNotFound);
+        }
+
+        self.port_segments
+            .entry(port_id)
+            .or_default()
+            .push(segment_id);
+
+        Ok(())
+    }
+
     /// Allocates the next available segment ID.
     ///
     /// This handles wrapping and checking for ID collisions.
-    fn allocate_segment_id(&mut self) -> Result<SegmentId, IamServerError> {
+    pub fn allocate_segment_id(&mut self) -> Result<SegmentId, IamServerError> {
         let start_id = self.next_id;
 
         loop {
@@ -286,7 +354,184 @@ impl SegmentManager {
     ///
     /// The removed segment if it existed, or `None` if not found.
     pub fn remove_segment(&mut self, segment_id: SegmentId) -> Option<ManagedSegment> {
+        // Clean up port_segments mapping
+        for seg_ids in self.port_segments.values_mut() {
+            seg_ids.retain(|id| id.value() != segment_id.value());
+        }
         self.segments.remove(&segment_id.value())
+    }
+
+    // ========================================================================
+    // Port-to-Segment Mapping
+    // ========================================================================
+
+    /// Registers a segment and associates it with a producer port.
+    ///
+    /// The handle is stored in the segment manager for later brokering
+    /// to authorized consumers via [`get_segment_handle_for_consumer`].
+    ///
+    /// # Arguments
+    ///
+    /// * `port_id` - The producer port that owns the segment
+    /// * `handle` - The platform handle for the anonymous segment
+    /// * `size` - The size of the segment in bytes
+    /// * `access` - The access rights for the segment
+    ///
+    /// # Returns
+    ///
+    /// The segment ID assigned to the registered segment.
+    pub fn register_segment_for_port(
+        &mut self,
+        port_id: u128,
+        handle: PlatformHandle,
+        size: usize,
+        access: AccessRights,
+    ) -> Result<SegmentId, IamServerError> {
+        let segment_id = self.register_segment(handle, size, access)?;
+        self.port_segments
+            .entry(port_id)
+            .or_default()
+            .push(segment_id);
+        Ok(segment_id)
+    }
+
+    /// Returns the segment IDs registered for a given port.
+    pub fn get_segments_for_port(&self, port_id: u128) -> &[SegmentId] {
+        self.port_segments
+            .get(&port_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Retrieves a cloned segment handle for a consumer to use.
+    ///
+    /// Looks up the first segment registered for `port_id`, authorizes the
+    /// given session, and returns the segment info plus a cloned handle.
+    ///
+    /// # Arguments
+    ///
+    /// * `port_id` - The producer port whose segment is requested
+    /// * `consumer_session_id` - The session ID of the requesting consumer
+    ///
+    /// # Returns
+    ///
+    /// `Some((SegmentInfo, PlatformHandle))` if the port has a registered segment
+    /// and the handle can be cloned, or `None` otherwise.
+    pub fn get_segment_handle_for_consumer(
+        &mut self,
+        port_id: u128,
+        consumer_session_id: SessionId,
+    ) -> Option<(SegmentInfo, PlatformHandle)> {
+        let segment_ids = self.port_segments.get(&port_id)?;
+        let segment_id = segment_ids.first()?;
+        let segment_id_key = segment_id.value();
+
+        // Authorize the session and get a cloned handle
+        let handle = self
+            .authorize_session(SegmentId::new(segment_id_key), consumer_session_id)
+            .ok()?;
+        let segment = self.segments.get(&segment_id_key)?;
+        let info = SegmentInfo::new(
+            SegmentId::new(segment_id_key),
+            segment.size,
+            segment.access,
+        );
+        Some((info, handle))
+    }
+
+    /// Registers a dynamic segment at a specific index for a port.
+    ///
+    /// Dynamic segments are indexed (0 for initial, 1+ for reallocations).
+    /// This method ensures the segment is stored at the correct position
+    /// in the port's segment list.
+    ///
+    /// # Arguments
+    ///
+    /// * `port_id` - The producer port that owns the segment
+    /// * `segment_index` - The index within the dynamic segment set (0-based)
+    /// * `handle` - The platform handle for the anonymous segment
+    /// * `size` - The size of the segment in bytes
+    /// * `access` - The access rights for the segment
+    ///
+    /// # Returns
+    ///
+    /// The segment ID assigned to the registered segment.
+    pub fn register_dynamic_segment_for_port(
+        &mut self,
+        port_id: u128,
+        segment_index: u8,
+        handle: PlatformHandle,
+        size: usize,
+        access: AccessRights,
+    ) -> Result<SegmentId, IamServerError> {
+        let segment_id = self.register_segment(handle, size, access)?;
+
+        let segments = self.port_segments.entry(port_id).or_default();
+
+        // Ensure the vector is large enough to hold this index
+        while segments.len() <= segment_index as usize {
+            // Use a placeholder ID that will be replaced or ignored
+            // We push the actual segment_id at the target index
+            if segments.len() == segment_index as usize {
+                segments.push(segment_id);
+            } else {
+                // Push a placeholder (SegmentId::new(255) as invalid marker)
+                // This handles gaps if segments are registered out of order
+                segments.push(SegmentId::new(255));
+            }
+        }
+
+        // If the slot already exists (not a placeholder), update it
+        if segments.len() > segment_index as usize {
+            segments[segment_index as usize] = segment_id;
+        }
+
+        Ok(segment_id)
+    }
+
+    /// Retrieves a cloned dynamic segment handle for a consumer by index.
+    ///
+    /// Looks up the segment at the specified index within a port's dynamic
+    /// segment set, authorizes the given session, and returns the segment
+    /// info plus a cloned handle.
+    ///
+    /// # Arguments
+    ///
+    /// * `port_id` - The producer port whose segment is requested
+    /// * `segment_index` - The index of the dynamic segment (0-based)
+    /// * `consumer_session_id` - The session ID of the requesting consumer
+    ///
+    /// # Returns
+    ///
+    /// `Some((SegmentInfo, PlatformHandle))` if the port has a segment at the
+    /// given index and the handle can be cloned, or `None` otherwise.
+    pub fn get_dynamic_segment_handle(
+        &mut self,
+        port_id: u128,
+        segment_index: u8,
+        consumer_session_id: SessionId,
+    ) -> Option<(SegmentInfo, PlatformHandle)> {
+        let segment_ids = self.port_segments.get(&port_id)?;
+        let segment_id = segment_ids.get(segment_index as usize)?;
+
+        // Check for placeholder (invalid segment ID 255)
+        if segment_id.value() == 255 {
+            return None;
+        }
+
+        let segment_id_key = segment_id.value();
+
+        // Authorize the session and get a cloned handle
+        let handle = self
+            .authorize_session(SegmentId::new(segment_id_key), consumer_session_id)
+            .ok()?;
+        let segment = self.segments.get(&segment_id_key)?;
+        let info = SegmentInfo::new(
+            SegmentId::new(segment_id_key),
+            segment.size,
+            segment.access,
+        );
+        Some((info, handle))
     }
 
     // ========================================================================
@@ -934,6 +1179,98 @@ mod tests {
             .register_segment(handle3, 4096, AccessRights::read_write())
             .unwrap();
         assert_eq!(segment2.value(), 2);
+    }
+
+    // ========================================================================
+    // Port-to-Segment Mapping Tests
+    // ========================================================================
+
+    #[test]
+    fn test_manager_register_segment_for_port() {
+        let mut manager = SegmentManager::new();
+        let handle = create_test_handle();
+        let port_id: u128 = 0xABCD;
+
+        let segment_id = manager
+            .register_segment_for_port(port_id, handle, 4096, AccessRights::read_write())
+            .unwrap();
+
+        assert!(manager.has_segment(segment_id));
+        let segments = manager.get_segments_for_port(port_id);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].value(), segment_id.value());
+    }
+
+    #[test]
+    fn test_manager_register_multiple_segments_for_port() {
+        let mut manager = SegmentManager::new();
+        let port_id: u128 = 0x1234;
+
+        let handle1 = create_test_handle();
+        let seg1 = manager
+            .register_segment_for_port(port_id, handle1, 4096, AccessRights::read_write())
+            .unwrap();
+
+        let handle2 = create_test_handle();
+        let seg2 = manager
+            .register_segment_for_port(port_id, handle2, 8192, AccessRights::read_write())
+            .unwrap();
+
+        let segments = manager.get_segments_for_port(port_id);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].value(), seg1.value());
+        assert_eq!(segments[1].value(), seg2.value());
+    }
+
+    #[test]
+    fn test_manager_get_segments_for_unknown_port() {
+        let manager = SegmentManager::new();
+        let segments = manager.get_segments_for_port(0xFFFF);
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_manager_remove_segment_cleans_port_mapping() {
+        let mut manager = SegmentManager::new();
+        let port_id: u128 = 0x5678;
+        let handle = create_test_handle();
+
+        let segment_id = manager
+            .register_segment_for_port(port_id, handle, 4096, AccessRights::read_write())
+            .unwrap();
+
+        manager.remove_segment(segment_id);
+
+        let segments = manager.get_segments_for_port(port_id);
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_manager_get_segment_handle_for_consumer() {
+        let mut manager = SegmentManager::new();
+        let port_id: u128 = 0xAAAA;
+        let consumer_session = SessionId::from_value(42);
+        let handle = create_test_handle();
+
+        manager
+            .register_segment_for_port(port_id, handle, 4096, AccessRights::read_only())
+            .unwrap();
+
+        let result = manager.get_segment_handle_for_consumer(port_id, consumer_session);
+        assert!(result.is_some());
+
+        let (info, _handle) = result.unwrap();
+        assert_eq!(info.size(), 4096);
+        assert!(info.access().can_read());
+    }
+
+    #[test]
+    fn test_manager_get_segment_handle_for_consumer_unknown_port() {
+        let mut manager = SegmentManager::new();
+        let consumer_session = SessionId::from_value(99);
+
+        let result = manager.get_segment_handle_for_consumer(0xBBBB, consumer_session);
+        assert!(result.is_none());
     }
 
     // ========================================================================

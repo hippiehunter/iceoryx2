@@ -291,6 +291,8 @@ pub enum DenialReason {
     VersionMismatch,
     /// The session was not found or has expired.
     SessionNotFound,
+    /// The request contains invalid parameters.
+    InvalidRequest,
 }
 
 // ============================================================================
@@ -351,13 +353,19 @@ pub enum IamRequest {
     },
 
     /// Request to add a new segment for a port.
+    ///
+    /// IAM creates the segment and returns a handle to the producer.
     AddSegment {
         /// The service the port belongs to.
         service_id: ServiceId,
         /// The port identifier.
         port_id: u128,
-        /// The requested size for the new segment.
+        /// The requested size for the new segment (payload size).
         requested_size: usize,
+        /// The bucket size for the pool allocator.
+        bucket_size: usize,
+        /// The bucket alignment for the pool allocator.
+        bucket_align: usize,
     },
 
     /// Request to detach a port from a service.
@@ -374,6 +382,64 @@ pub enum IamRequest {
         service_id: ServiceId,
         /// The segment identifier.
         segment_id: SegmentId,
+    },
+
+    /// Register a segment handle created by a producer port.
+    ///
+    /// The producer (publisher/server) creates an anonymous shared memory
+    /// segment locally and sends the handle to the IAM server for brokering
+    /// to authorized consumers.
+    RegisterSegment {
+        /// The service the port belongs to.
+        service_id: ServiceId,
+        /// The producer port identifier.
+        port_id: u128,
+        /// The size of the segment in bytes.
+        segment_size: usize,
+        /// The number of handles that will follow this message.
+        handle_count: usize,
+    },
+
+    /// Request a segment handle for a sender port's data segment.
+    ///
+    /// Consumers (subscriber/client) use this to obtain handles to producer
+    /// data segments brokered through the IAM server.
+    RequestSegmentHandle {
+        /// The service the port belongs to.
+        service_id: ServiceId,
+        /// The producer port whose segment handle is requested.
+        sender_port_id: u128,
+    },
+
+    /// Register a dynamic segment handle created by a producer port.
+    ///
+    /// Used for resizable shared memory segments. The producer creates an
+    /// anonymous segment and registers it with an index (segment_id) within
+    /// its dynamic segment set.
+    RegisterDynamicSegment {
+        /// The service the port belongs to.
+        service_id: ServiceId,
+        /// The producer port identifier.
+        port_id: u128,
+        /// Index within the dynamic segment set (0 for initial, 1+ for reallocations).
+        segment_id: u8,
+        /// The size of the segment in bytes.
+        segment_size: usize,
+        /// The number of handles that will follow this message.
+        handle_count: usize,
+    },
+
+    /// Request a specific dynamic segment handle from a producer port.
+    ///
+    /// Consumers use this to obtain handles to specific segments within a
+    /// producer's dynamic segment set, identified by segment_id index.
+    RequestDynamicSegmentHandle {
+        /// The service the port belongs to.
+        service_id: ServiceId,
+        /// The producer port whose segment handle is requested.
+        sender_port_id: u128,
+        /// The index of the dynamic segment to retrieve.
+        segment_id: u8,
     },
 }
 
@@ -437,6 +503,48 @@ pub enum IamResponse {
         /// A human-readable message explaining the error.
         message: String,
     },
+
+    /// Successful response to a RegisterSegment request.
+    RegisterSegmentOk {
+        /// The segment ID assigned to the registered segment.
+        segment_id: SegmentId,
+    },
+
+    /// Successful response to a RequestSegmentHandle request — handle available.
+    SegmentHandleOk {
+        /// Metadata about the segment being provided.
+        segment_info: SegmentInfo,
+        /// The number of handles that will follow this message.
+        handle_count: usize,
+    },
+
+    /// Response to a RequestSegmentHandle request — no handle available yet.
+    ///
+    /// This typically means the producer has not yet registered its segment.
+    /// The consumer should retry later.
+    SegmentHandleNotFound,
+
+    /// Successful response to a RegisterDynamicSegment request.
+    RegisterDynamicSegmentOk {
+        /// The segment ID index that was registered.
+        segment_id: u8,
+    },
+
+    /// Successful response to a RequestDynamicSegmentHandle request — handle available.
+    DynamicSegmentHandleOk {
+        /// Metadata about the segment being provided.
+        segment_info: SegmentInfo,
+        /// The number of handles that will follow this message.
+        handle_count: usize,
+    },
+
+    /// Response to a RequestDynamicSegmentHandle request — segment not registered yet.
+    ///
+    /// The producer may not have registered this segment index yet. This can occur
+    /// during a race condition when a consumer receives an offset referencing a
+    /// newly allocated segment before the producer has registered it with IAM.
+    /// The consumer should retry later.
+    DynamicSegmentPending,
 }
 
 // ============================================================================
@@ -796,6 +904,108 @@ mod tests {
             }
             _ => panic!("Expected CreateServiceOk response"),
         }
+    }
+
+    #[test]
+    fn test_iam_request_register_segment_serialization_roundtrip() {
+        use crate::service::messaging_pattern::MessagingPattern;
+        use iceoryx2_cal::hash::sha1::Sha1;
+
+        let service_name = ServiceName::new("test/register_segment").unwrap();
+        let service_id = ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe);
+
+        let request = IamRequest::RegisterSegment {
+            service_id,
+            port_id: 0xDEAD_BEEF,
+            segment_size: 65536,
+            handle_count: 1,
+        };
+        let serialized = postcard::to_allocvec(&request).unwrap();
+        let deserialized: IamRequest = postcard::from_bytes(&serialized).unwrap();
+        match deserialized {
+            IamRequest::RegisterSegment {
+                service_id: deser_id,
+                port_id,
+                segment_size,
+                handle_count,
+            } => {
+                assert_eq!(deser_id, service_id);
+                assert_eq!(port_id, 0xDEAD_BEEF);
+                assert_eq!(segment_size, 65536);
+                assert_eq!(handle_count, 1);
+            }
+            _ => panic!("Expected RegisterSegment request"),
+        }
+    }
+
+    #[test]
+    fn test_iam_request_request_segment_handle_serialization_roundtrip() {
+        use crate::service::messaging_pattern::MessagingPattern;
+        use iceoryx2_cal::hash::sha1::Sha1;
+
+        let service_name = ServiceName::new("test/request_handle").unwrap();
+        let service_id = ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe);
+
+        let request = IamRequest::RequestSegmentHandle {
+            service_id,
+            sender_port_id: 42,
+        };
+        let serialized = postcard::to_allocvec(&request).unwrap();
+        let deserialized: IamRequest = postcard::from_bytes(&serialized).unwrap();
+        match deserialized {
+            IamRequest::RequestSegmentHandle {
+                service_id: deser_id,
+                sender_port_id,
+            } => {
+                assert_eq!(deser_id, service_id);
+                assert_eq!(sender_port_id, 42);
+            }
+            _ => panic!("Expected RequestSegmentHandle request"),
+        }
+    }
+
+    #[test]
+    fn test_iam_response_register_segment_ok_serialization_roundtrip() {
+        let response = IamResponse::RegisterSegmentOk {
+            segment_id: SegmentId::new(7),
+        };
+        let serialized = postcard::to_allocvec(&response).unwrap();
+        let deserialized: IamResponse = postcard::from_bytes(&serialized).unwrap();
+        match deserialized {
+            IamResponse::RegisterSegmentOk { segment_id } => {
+                assert_eq!(segment_id.value(), 7);
+            }
+            _ => panic!("Expected RegisterSegmentOk response"),
+        }
+    }
+
+    #[test]
+    fn test_iam_response_segment_handle_ok_serialization_roundtrip() {
+        let info = SegmentInfo::new(SegmentId::new(3), 8192, AccessRights::read_only());
+        let response = IamResponse::SegmentHandleOk {
+            segment_info: info,
+            handle_count: 1,
+        };
+        let serialized = postcard::to_allocvec(&response).unwrap();
+        let deserialized: IamResponse = postcard::from_bytes(&serialized).unwrap();
+        match deserialized {
+            IamResponse::SegmentHandleOk {
+                segment_info,
+                handle_count,
+            } => {
+                assert_eq!(segment_info, info);
+                assert_eq!(handle_count, 1);
+            }
+            _ => panic!("Expected SegmentHandleOk response"),
+        }
+    }
+
+    #[test]
+    fn test_iam_response_segment_handle_not_found_serialization_roundtrip() {
+        let response = IamResponse::SegmentHandleNotFound;
+        let serialized = postcard::to_allocvec(&response).unwrap();
+        let deserialized: IamResponse = postcard::from_bytes(&serialized).unwrap();
+        assert!(matches!(deserialized, IamResponse::SegmentHandleNotFound));
     }
 
     #[test]

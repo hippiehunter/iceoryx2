@@ -1302,6 +1302,7 @@ dependencies = [
  "iceoryx2-pal-testing",
  "postcard",
  "serde",
+ "serde_json",
  "tiny-fn",
  "toml 0.9.8",
 ]

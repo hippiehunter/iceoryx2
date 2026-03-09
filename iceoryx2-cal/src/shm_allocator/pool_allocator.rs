@@ -89,7 +89,9 @@ impl ShmAllocator for PoolAllocator {
             == self.number_of_buckets() as usize
         {
             match strategy {
-                AllocationStrategy::BestFit => self.allocator.number_of_buckets() + 1,
+                AllocationStrategy::BestFit | AllocationStrategy::IamManaged => {
+                    self.allocator.number_of_buckets() + 1
+                }
                 AllocationStrategy::PowerOfTwo => {
                     (self.allocator.number_of_buckets() + 1).next_power_of_two()
                 }
@@ -103,7 +105,7 @@ impl ShmAllocator for PoolAllocator {
             if current_layout.size() < layout.size() || current_layout.align() < layout.align() {
                 match strategy {
                     AllocationStrategy::Static => current_layout,
-                    AllocationStrategy::BestFit => unsafe {
+                    AllocationStrategy::BestFit | AllocationStrategy::IamManaged => unsafe {
                         let align = layout.align().max(current_layout.align());
                         let size = layout
                             .size()

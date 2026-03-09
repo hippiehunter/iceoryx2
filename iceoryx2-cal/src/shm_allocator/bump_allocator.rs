@@ -48,7 +48,9 @@ impl ShmAllocator for BumpAllocator {
         }
 
         let payload_size = match strategy {
-            AllocationStrategy::BestFit => current_payload_size + layout.size(),
+            AllocationStrategy::BestFit | AllocationStrategy::IamManaged => {
+                current_payload_size + layout.size()
+            }
             AllocationStrategy::PowerOfTwo => {
                 (current_payload_size + layout.size()).next_power_of_two()
             }

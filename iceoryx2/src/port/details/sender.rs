@@ -21,7 +21,7 @@ use iceoryx2_bb_concurrency::atomic::AtomicUsize;
 use iceoryx2_bb_concurrency::cell::UnsafeCell;
 use iceoryx2_bb_elementary::cyclic_tagger::*;
 use iceoryx2_cal::named_concept::NamedConceptBuilder;
-use iceoryx2_cal::shm_allocator::{AllocationError, PointerOffset, ShmAllocationError};
+use iceoryx2_cal::shm_allocator::{AllocationError, PointerOffset};
 use iceoryx2_cal::zero_copy_connection::{
     ChannelId, ZeroCopyConnection, ZeroCopyConnectionBuilder, ZeroCopyCreationError,
     ZeroCopySendError, ZeroCopySender,
@@ -39,7 +39,7 @@ use crate::{service, service::naming_scheme::connection_name};
 use super::channel_management::ChannelManagement;
 use super::channel_management::INVALID_CHANNEL_STATE;
 use super::chunk::ChunkMut;
-use super::data_segment::DataSegment;
+use super::data_segment::{DataSegment, DataSegmentAllocationError};
 use super::segment_state::SegmentState;
 
 #[derive(Clone, Copy)]
@@ -313,19 +313,58 @@ impl<Service: service::Service> Sender<Service> {
                 msg, layout, self.loan_counter.load(Ordering::Relaxed), self.sender_max_borrowed_samples);
         }
 
-        let shm_pointer = match self.data_segment.allocate(layout) {
-            Ok(chunk) => chunk,
-            Err(ShmAllocationError::AllocationError(AllocationError::OutOfMemory)) => {
-                fail!(from self, with LoanError::OutOfMemory,
-                    "{} {:?} since the underlying shared memory is out of memory.", msg, layout);
-            }
-            Err(ShmAllocationError::AllocationError(AllocationError::SizeTooLarge))
-            | Err(ShmAllocationError::AllocationError(AllocationError::AlignmentFailure)) => {
-                fatal_panic!(from self, "{} {:?} since the system seems to be corrupted.", msg, layout);
-            }
-            Err(v) => {
-                fail!(from self, with LoanError::InternalFailure,
-                    "{} {:?} since an internal failure occurred ({:?}).", msg, layout, v);
+        // Allocation loop - handles IAM-managed segment creation
+        let shm_pointer = loop {
+            match self.data_segment.allocate(layout) {
+                Ok(chunk) => break chunk,
+                Err(DataSegmentAllocationError::AllocationError(AllocationError::OutOfMemory)) => {
+                    fail!(from self, with LoanError::OutOfMemory,
+                        "{} {:?} since the underlying shared memory is out of memory.", msg, layout);
+                }
+                Err(DataSegmentAllocationError::AllocationError(AllocationError::SizeTooLarge))
+                | Err(DataSegmentAllocationError::AllocationError(AllocationError::AlignmentFailure)) => {
+                    fatal_panic!(from self, "{} {:?} since the system seems to be corrupted.", msg, layout);
+                }
+                Err(DataSegmentAllocationError::NeedSegment { requested_size }) => {
+                    // IAM-managed allocation: request a segment from the IAM server
+                    if let Some(ctx) = self.service_state.additional_resource.as_client() {
+                        match ctx.add_segment(self.sender_port_id, requested_size, layout.size(), layout.align()) {
+                            Ok((segment_id, _actual_size, handles)) => {
+                                // Use the first handle (IAM sends one handle per segment)
+                                if let Some(handle) = handles.into_iter().next() {
+                                    // Add the segment and retry allocation
+                                    let config = iceoryx2_cal::shm_allocator::pool_allocator::Config {
+                                        bucket_layout: layout,
+                                    };
+                                    if let Err(e) = self.data_segment.add_segment(segment_id, handle, &config) {
+                                        fail!(from self, with LoanError::InternalFailure,
+                                            "{} {:?} since adding IAM-provided segment failed: {:?}.",
+                                            msg, layout, e);
+                                    }
+                                    // Loop continues to retry allocation
+                                } else {
+                                    fail!(from self, with LoanError::InternalFailure,
+                                        "{} {:?} since IAM returned no handles for the new segment.",
+                                        msg, layout);
+                                }
+                            }
+                            Err(e) => {
+                                fail!(from self, with LoanError::InternalFailure,
+                                    "{} {:?} since IAM segment request failed: {:?}.",
+                                    msg, layout, e);
+                            }
+                        }
+                    } else {
+                        // No IAM context available - this shouldn't happen with IamManaged strategy
+                        fail!(from self, with LoanError::InternalFailure,
+                            "{} {:?} since IAM-managed segment creation is required \
+                             but no IAM context is available.", msg, layout);
+                    }
+                }
+                Err(v) => {
+                    fail!(from self, with LoanError::InternalFailure,
+                        "{} {:?} since an internal failure occurred ({:?}).", msg, layout, v);
+                }
             }
         };
 

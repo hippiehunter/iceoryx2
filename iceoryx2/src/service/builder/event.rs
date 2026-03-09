@@ -34,7 +34,11 @@ use crate::service::{self, dynamic_config::event::DynamicConfigSettings};
 use iceoryx2_cal::control_channel::{ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder};
 use iceoryx2_cal::named_concept::NamedConceptBuilder;
 
+use iceoryx2_bb_container::semantic_string::SemanticString;
+
+use crate::iam::audit::FileAuditLogger;
 use crate::iam::client::IamClient;
+use crate::iam::configured_policy::{PolicyDispatch, PolicyLoader};
 use crate::iam::server::{IamServer, TypeErasedIamServer};
 use crate::iam::DefaultPolicy;
 use crate::service::secured_context::{SecuredServiceContext, TypeErasedSecuredContext};
@@ -98,6 +102,10 @@ pub enum EventOpenError {
     /// The IAM handshake failed when opening a secured service.
     /// This can happen if the protocol version is incompatible or the server rejected the connection.
     IamHandshakeFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for EventOpenError {
@@ -141,6 +149,10 @@ pub enum EventCreateError {
     /// Failed to create the IAM server for a secured service.
     /// This can happen if the control channel listener cannot be created.
     IamServerCreationFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for EventCreateError {
@@ -410,6 +422,16 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
     ) -> Result<event::PortFactory<ServiceType>, EventOpenError> {
         let msg = "Unable to open event service";
 
+        // Check for dev_permissions + secured mode incompatibility
+        #[cfg(feature = "dev_permissions")]
+        {
+            if self.base.shared_node.config().global.node.security.mode == SecurityMode::Secured {
+                fail!(from self, with EventOpenError::DevPermissionsIncompatibleWithSecuredMode,
+                    "{} since the 'dev_permissions' feature is incompatible with SecurityMode::Secured. \
+                     The 'dev_permissions' feature sets world-readable permissions which defeats secured mode isolation.", msg);
+            }
+        }
+
         let mut service_open_retry_count = 0;
         loop {
             match self.base.is_service_available(msg)? {
@@ -531,6 +553,16 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
 
         let msg = "Unable to create event service";
 
+        // Check for dev_permissions + secured mode incompatibility
+        #[cfg(feature = "dev_permissions")]
+        {
+            if self.base.shared_node.config().global.node.security.mode == SecurityMode::Secured {
+                fail!(from self, with EventCreateError::DevPermissionsIncompatibleWithSecuredMode,
+                    "{} since the 'dev_permissions' feature is incompatible with SecurityMode::Secured. \
+                     The 'dev_permissions' feature sets world-readable permissions which defeats secured mode isolation.", msg);
+            }
+        }
+
         match self.base.is_service_available(msg)? {
             None => {
                 let service_tag = self
@@ -620,9 +652,23 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
                             EventCreateError::IamServerCreationFailed
                         })?;
 
-                    // Create IAM server with default policy
-                    let policy = DefaultPolicy::new();
-                    let server = IamServer::new(listener, policy);
+                    // Load policy for this service (falls back to DefaultPolicy)
+                    let iam_config = &self.base.shared_node.config().global.node.security.iam;
+                    let service_name_str = self.base.service_config.name().to_string();
+                    let policy_dir_str = core::str::from_utf8(iam_config.policy_dir.as_bytes()).unwrap_or("iam/policies");
+                    let policy = match PolicyLoader::load_for_service(std::path::Path::new(policy_dir_str), self.base.service_config.name()) {
+                        Some(configured) => PolicyDispatch::Configured(configured),
+                        None => PolicyDispatch::Default(DefaultPolicy::new()),
+                    };
+
+                    // Create audit logger (best-effort - continues without if file cannot be opened)
+                    let audit_path_str = core::str::from_utf8(iam_config.audit_log_path.as_bytes()).unwrap_or("iam/audit.log");
+                    let audit_logger: Option<Box<dyn crate::iam::audit::AuditLogger>> =
+                        FileAuditLogger::new(std::path::Path::new(audit_path_str))
+                            .ok()
+                            .map(|l| Box::new(l) as _);
+
+                    let server = IamServer::new_with_audit(listener, policy, service_name_str, audit_logger);
 
                     // Wrap in type-erased container
                     SecurityResource::SecuredServer(TypeErasedIamServer::new(server))
