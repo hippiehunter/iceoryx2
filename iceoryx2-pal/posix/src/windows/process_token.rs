@@ -57,7 +57,7 @@ use super::security_descriptor::Sid;
 // Windows API imports
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_NO_TOKEN, FALSE,
-    HANDLE,
+    HANDLE, TRUE,
 };
 
 use windows_sys::Win32::Security::{
@@ -67,7 +67,9 @@ use windows_sys::Win32::Security::{
 
 use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
 
-use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken, PROCESS_QUERY_INFORMATION,
+};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -297,11 +299,16 @@ fn open_thread_token() -> Result<HANDLE, TokenError> {
 
     // SAFETY: GetCurrentThread returns a pseudo-handle that is always valid.
     // OpenThreadToken opens the token of the current thread.
+    //
+    // bOpenAsSelf = TRUE means "open the token using the process's security context"
+    // rather than the impersonated client's context. This is required because the
+    // impersonated client typically doesn't have TOKEN_QUERY access to its own
+    // impersonation token. The server process (which has higher privileges) does.
     let result = unsafe {
         OpenThreadToken(
             GetCurrentThread(),
             TOKEN_QUERY,
-            FALSE, // Use impersonation context, not process context
+            TRUE, // Use process security context to open the impersonation token
             &mut token_handle,
         )
     };
@@ -540,6 +547,76 @@ pub fn get_client_token_sids(pipe_handle: HANDLE) -> Result<TokenSids, TokenErro
 
     // Explicitly revert impersonation (guard will also do this in drop)
     guard.revert()?;
+
+    Ok(TokenSids {
+        user_sid,
+        group_sids,
+    })
+}
+
+/// Extracts user and group SIDs from a process by its PID.
+///
+/// This function opens the target process, gets its primary token, and extracts
+/// the user and group SIDs. Unlike [`get_client_token_sids`], this does NOT use
+/// pipe impersonation, so it works regardless of whether data has been read from
+/// the pipe.
+///
+/// # Arguments
+/// * `process_id` - The target process ID
+///
+/// # Returns
+/// * `Ok(TokenSids)` - The extracted user and group SIDs
+/// * `Err(TokenError)` - If any step fails
+///
+/// # Security Note
+///
+/// Requires `PROCESS_QUERY_INFORMATION` access to the target process. This
+/// typically succeeds when both processes run under the same user account.
+pub fn get_process_token_sids(process_id: u32) -> Result<TokenSids, TokenError> {
+    // Open the target process with PROCESS_QUERY_INFORMATION access
+    let process_handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, process_id) };
+
+    if process_handle == 0 {
+        let error = unsafe { GetLastError() };
+        return Err(TokenError::from_win32(error));
+    }
+
+    // Ensure the process handle is closed when we're done
+    struct ProcessGuard(HANDLE);
+    impl Drop for ProcessGuard {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+    let _process_guard = ProcessGuard(process_handle);
+
+    // Open the process token
+    let mut token_handle: HANDLE = 0;
+    let result = unsafe { OpenProcessToken(process_handle, TOKEN_QUERY, &mut token_handle) };
+
+    if result == FALSE {
+        let error = unsafe { GetLastError() };
+        return Err(TokenError::from_win32(error));
+    }
+
+    // Ensure the token handle is closed when we're done
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            if self.0 != 0 {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+    let _token_guard = TokenGuard(token_handle);
+
+    // Extract user SID
+    let user_sid = get_token_user(token_handle)?;
+
+    // Extract group SIDs
+    let group_sids = get_token_groups(token_handle)?;
 
     Ok(TokenSids {
         user_sid,

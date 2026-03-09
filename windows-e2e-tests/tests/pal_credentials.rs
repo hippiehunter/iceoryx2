@@ -72,12 +72,7 @@ fn peer_pid_matches_client_pid() {
 }
 
 #[test]
-fn user_sid_extraction_completes() {
-    // NOTE: On the server-side connection (overlapped I/O), token impersonation
-    // may fail silently, causing peer_credentials() to return PID-only creds.
-    // This test verifies the extraction completes without crashing and documents
-    // the current behavior. If SID extraction works, the SID will start with "S-1-".
-    // If it falls back to PID-only, the SID will be "None".
+fn user_sid_is_valid() {
     let name = unique_name("creds_sid");
 
     let server = spawn_server(&["pipe-creds", "--pipe-name", &name]);
@@ -89,20 +84,13 @@ fn user_sid_extraction_completes() {
     let sid_line = server.expect("SERVER: user_sid=").unwrap();
     let sid = sid_line.split("user_sid=").nth(1).unwrap().trim();
 
-    // Verify the field is present (either a valid SID or "None" for PID-only fallback)
+    // SID extraction should succeed — the user SID must be a valid Windows SID
     assert!(
-        sid.starts_with("S-1-") || sid == "None",
-        "Expected SID starting with 'S-1-' or 'None', got: '{}'",
+        sid.starts_with("S-1-"),
+        "Expected valid SID starting with 'S-1-', got: '{}'. \
+         Token impersonation via ImpersonateNamedPipeClient may be failing.",
         sid
     );
-
-    if sid == "None" {
-        eprintln!(
-            "WARNING: SID extraction fell back to PID-only. \
-             This indicates get_client_token_sids() failed on the server-side connection. \
-             See named_pipe.rs peer_credentials() for details."
-        );
-    }
 
     server.expect("SERVER: done").unwrap();
     let code = client.wait_exit(DEFAULT_TIMEOUT).unwrap();
@@ -110,9 +98,7 @@ fn user_sid_extraction_completes() {
 }
 
 #[test]
-fn group_sid_extraction_completes() {
-    // Same caveat as user_sid_extraction_completes — group SIDs may be 0
-    // when token impersonation fails on the server-side connection.
+fn group_sids_present() {
     let name = unique_name("creds_grp");
 
     let server = spawn_server(&["pipe-creds", "--pipe-name", &name]);
@@ -130,14 +116,12 @@ fn group_sid_extraction_completes() {
         .parse()
         .unwrap();
 
-    if count == 0 {
-        eprintln!(
-            "WARNING: group_count=0 — SID extraction fell back to PID-only. \
-             Token impersonation may be failing on the overlapped server connection."
-        );
-    }
-    // We accept both outcomes — the test validates the extraction completes
-    // without panicking, regardless of whether SIDs are available.
+    // Every Windows user belongs to at least one group
+    assert!(
+        count > 0,
+        "Expected at least one group SID, got 0. \
+         Token impersonation via ImpersonateNamedPipeClient may be failing."
+    );
 
     server.expect("SERVER: done").unwrap();
     let code = client.wait_exit(DEFAULT_TIMEOUT).unwrap();

@@ -1102,9 +1102,10 @@ impl NamedPipeConnection {
 
     /// Returns the credentials of the connected peer.
     ///
-    /// On Windows, this retrieves the process ID and attempts to extract the client's
-    /// Security Identifiers (SIDs) via token impersonation. If SID extraction fails,
-    /// credentials are returned with PID only (graceful fallback).
+    /// On Windows, this retrieves the process ID via `GetNamedPipeClientProcessId` and
+    /// extracts the client's Security Identifiers (SIDs) by opening the client's process
+    /// token directly. If SID extraction fails (e.g., due to insufficient privileges),
+    /// credentials are returned with PID only.
     ///
     /// # Returns
     /// * `Ok(credentials)` - The peer's credentials (with or without SIDs)
@@ -1112,22 +1113,24 @@ impl NamedPipeConnection {
     pub fn peer_credentials(&mut self) -> Result<PipeProcessCredentials, NamedPipeError> {
         let pid = self.client_process_id()?;
 
-        // Attempt to get SIDs via token impersonation.
-        // If this fails, we gracefully fall back to PID-only credentials.
-        match super::process_token::get_client_token_sids(self.handle) {
+        // Extract SIDs by opening the client's process token directly.
+        // This avoids ImpersonateNamedPipeClient which requires a read from the
+        // pipe before it can be called (Windows error 1368).
+        match super::process_token::get_process_token_sids(pid) {
             Ok(token_sids) => Ok(PipeProcessCredentials::with_sids(
                 pid,
                 token_sids.user_sid,
                 token_sids.group_sids,
             )),
-            Err(_e) => {
-                // SID extraction failed, return PID-only credentials.
-                // TODO: Add logging once iceoryx2_bb_log is available in PAL crate.
-                // This would help diagnose issues like:
-                // - Insufficient privileges for impersonation
-                // - Token access failures
-                // - Invalid SID structures
-                // For now, the failure is silent and we fall back to PID-only credentials.
+            Err(e) => {
+                // SID extraction failed — log the specific error for diagnostics.
+                // Common cause: insufficient privileges to open client's process token.
+                std::eprintln!(
+                    "iceoryx2: peer_credentials SID extraction failed (pid={}): {}. \
+                     Falling back to PID-only credentials.",
+                    pid,
+                    e
+                );
                 Ok(PipeProcessCredentials::new(pid))
             }
         }
