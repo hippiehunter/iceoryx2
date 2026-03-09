@@ -339,13 +339,13 @@ impl core::error::Error for IamClientError {}
 
 ### Phase 1 Review Criteria
 
-- [ ] All types derive appropriate traits (Debug, Clone, Serialize, Deserialize)
-- [ ] Error types follow codebase pattern (Copy, Display, Error)
-- [ ] Protocol version compatibility logic is correct
-- [ ] Serialization round-trips work correctly
-- [ ] No Copy types contain heap-allocated data
-- [ ] Types are repr(C) where needed for cross-process use
-- [ ] Naming follows codebase conventions
+* [ ] All types derive appropriate traits (Debug, Clone, Serialize, Deserialize)
+* [ ] Error types follow codebase pattern (Copy, Display, Error)
+* [ ] Protocol version compatibility logic is correct
+* [ ] Serialization round-trips work correctly
+* [ ] No Copy types contain heap-allocated data
+* [ ] Types are repr(C) where needed for cross-process use
+* [ ] Naming follows codebase conventions
 
 ---
 
@@ -590,12 +590,12 @@ impl core::error::Error for PolicyError {}
 
 ### Phase 2 Review Criteria
 
-- [ ] IamPolicy trait is Send + Sync for thread-safety
-- [ ] DefaultPolicy correctly enforces same-UID restriction
-- [ ] Resource limits are correctly enforced
-- [ ] PolicyDecision has appropriate helper methods
-- [ ] Default limits are reasonable for production use
-- [ ] Error messages are descriptive and useful for debugging
+* [ ] IamPolicy trait is Send + Sync for thread-safety
+* [ ] DefaultPolicy correctly enforces same-UID restriction
+* [ ] Resource limits are correctly enforced
+* [ ] PolicyDecision has appropriate helper methods
+* [ ] Default limits are reasonable for production use
+* [ ] Error messages are descriptive and useful for debugging
 
 ---
 
@@ -1118,14 +1118,14 @@ impl<C: ControlChannel, P: IamPolicy> IamServer<C, P> {
 
 ### Phase 3 Review Criteria
 
-- [ ] Server handles concurrent sessions correctly
-- [ ] Session cleanup is complete on disconnect
-- [ ] Segment authorization is properly tracked
-- [ ] Handle cloning for multiple clients works
-- [ ] Retirement protocol is correctly implemented
-- [ ] Error handling is comprehensive
-- [ ] No resource leaks (handles, memory)
-- [ ] Policy is correctly enforced at all decision points
+* [ ] Server handles concurrent sessions correctly
+* [ ] Session cleanup is complete on disconnect
+* [ ] Segment authorization is properly tracked
+* [ ] Handle cloning for multiple clients works
+* [ ] Retirement protocol is correctly implemented
+* [ ] Error handling is comprehensive
+* [ ] No resource leaks (handles, memory)
+* [ ] Policy is correctly enforced at all decision points
 
 ---
 
@@ -1422,13 +1422,13 @@ pub struct AttachResult {
 
 ### Phase 4 Review Criteria
 
-- [ ] Client handles connection failures gracefully
-- [ ] Handshake properly validates versions
-- [ ] Handles are correctly received and stored
-- [ ] Segment retirement acknowledgment works
-- [ ] Notification polling is non-blocking
-- [ ] Error mapping is complete
-- [ ] No handle leaks on error paths
+* [ ] Client handles connection failures gracefully
+* [ ] Handshake properly validates versions
+* [ ] Handles are correctly received and stored
+* [ ] Segment retirement acknowledgment works
+* [ ] Notification polling is non-blocking
+* [ ] Error mapping is complete
+* [ ] No handle leaks on error paths
 
 ---
 
@@ -1557,13 +1557,13 @@ mod tests {
 
 ### Phase 5 Review Criteria
 
-- [ ] Tests cover happy path for all operations
-- [ ] Tests cover error scenarios
-- [ ] Tests verify credential enforcement
-- [ ] Tests verify handle passing works
-- [ ] Tests don't have race conditions
-- [ ] Tests clean up resources properly
-- [ ] Tests run on both Linux and Windows (where applicable)
+* [ ] Tests cover happy path for all operations
+* [ ] Tests cover error scenarios
+* [ ] Tests verify credential enforcement
+* [ ] Tests verify handle passing works
+* [ ] Tests don't have race conditions
+* [ ] Tests clean up resources properly
+* [ ] Tests run on both Linux and Windows (where applicable)
 
 ---
 
@@ -1573,15 +1573,15 @@ For each phase:
 
 1. **Implementation Agent** creates the code following this plan
 2. **3 Sonnet Reviewers** independently review for:
-   - Correctness (does it match spec?)
-   - Idiomatic Rust (follows codebase patterns?)
-   - Performance (no unnecessary allocations/copies?)
-   - Safety (no UB, proper error handling?)
-   - Security (authorization checks complete?)
+   * Correctness (does it match spec?)
+   * Idiomatic Rust (follows codebase patterns?)
+   * Performance (no unnecessary allocations/copies?)
+   * Safety (no UB, proper error handling?)
+   * Security (authorization checks complete?)
 3. **Decision**:
-   - If all 3 approve: proceed to next phase
-   - If any reject: loop back with specific changes
-   - Rejection must include concrete fix suggestions
+   * If all 3 approve: proceed to next phase
+   * If any reject: loop back with specific changes
+   * Rejection must include concrete fix suggestions
 
 ### Reviewer Guidelines
 

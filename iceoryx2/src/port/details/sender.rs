@@ -322,21 +322,31 @@ impl<Service: service::Service> Sender<Service> {
                         "{} {:?} since the underlying shared memory is out of memory.", msg, layout);
                 }
                 Err(DataSegmentAllocationError::AllocationError(AllocationError::SizeTooLarge))
-                | Err(DataSegmentAllocationError::AllocationError(AllocationError::AlignmentFailure)) => {
+                | Err(DataSegmentAllocationError::AllocationError(
+                    AllocationError::AlignmentFailure,
+                )) => {
                     fatal_panic!(from self, "{} {:?} since the system seems to be corrupted.", msg, layout);
                 }
                 Err(DataSegmentAllocationError::NeedSegment { requested_size }) => {
                     // IAM-managed allocation: request a segment from the IAM server
                     if let Some(ctx) = self.service_state.additional_resource.as_client() {
-                        match ctx.add_segment(self.sender_port_id, requested_size, layout.size(), layout.align()) {
+                        match ctx.add_segment(
+                            self.sender_port_id,
+                            requested_size,
+                            layout.size(),
+                            layout.align(),
+                        ) {
                             Ok((segment_id, _actual_size, handles)) => {
                                 // Use the first handle (IAM sends one handle per segment)
                                 if let Some(handle) = handles.into_iter().next() {
                                     // Add the segment and retry allocation
-                                    let config = iceoryx2_cal::shm_allocator::pool_allocator::Config {
-                                        bucket_layout: layout,
-                                    };
-                                    if let Err(e) = self.data_segment.add_segment(segment_id, handle, &config) {
+                                    let config =
+                                        iceoryx2_cal::shm_allocator::pool_allocator::Config {
+                                            bucket_layout: layout,
+                                        };
+                                    if let Err(e) =
+                                        self.data_segment.add_segment(segment_id, handle, &config)
+                                    {
                                         fail!(from self, with LoanError::InternalFailure,
                                             "{} {:?} since adding IAM-provided segment failed: {:?}.",
                                             msg, layout, e);

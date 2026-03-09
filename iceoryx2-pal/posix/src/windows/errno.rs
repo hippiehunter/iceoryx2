@@ -13,10 +13,16 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(unused_variables)]
 
+#[cfg(feature = "std")]
+extern crate std;
+
 use crate::posix::types::*;
 use crate::ErrnoEnumGenerator;
 use core::{ffi::CStr, fmt::Display};
 
+use alloc::string::ToString;
+
+#[cfg(feature = "std")]
 use iceoryx2_pal_concurrency_sync::cell::Cell;
 
 ErrnoEnumGenerator!(
@@ -140,13 +146,32 @@ ErrnoEnumGenerator!(
     // EHWPOISON,
 );
 
-thread_local! {
+#[cfg(feature = "std")]
+std::thread_local! {
     pub static GLOBAL_ERRNO_VALUE: Cell<u32> = const { Cell::new(Errno::ESUCCES as _) };
+}
+
+#[cfg(not(feature = "std"))]
+mod errno_storage {
+    use iceoryx2_pal_concurrency_sync::atomic::AtomicU32;
+
+    use super::Errno;
+    pub static GLOBAL_ERRNO_VALUE: AtomicU32 = AtomicU32::new(Errno::ESUCCES as u32);
 }
 
 impl Errno {
     pub fn get() -> Errno {
-        GLOBAL_ERRNO_VALUE.get().into()
+        #[cfg(feature = "std")]
+        {
+            GLOBAL_ERRNO_VALUE.get().into()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            use iceoryx2_pal_concurrency_sync::atomic::Ordering;
+            errno_storage::GLOBAL_ERRNO_VALUE
+                .load(Ordering::Relaxed)
+                .into()
+        }
     }
 
     pub fn reset() {
@@ -154,7 +179,15 @@ impl Errno {
     }
 
     pub(crate) fn set(value: Errno) {
-        GLOBAL_ERRNO_VALUE.set(value as _);
+        #[cfg(feature = "std")]
+        {
+            GLOBAL_ERRNO_VALUE.set(value as _);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            use iceoryx2_pal_concurrency_sync::atomic::Ordering;
+            errno_storage::GLOBAL_ERRNO_VALUE.store(value as _, Ordering::Relaxed);
+        }
     }
 }
 

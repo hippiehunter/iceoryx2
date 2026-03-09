@@ -15,14 +15,18 @@
 // Only compile tests when std feature is enabled
 #![cfg(feature = "std")]
 
-extern crate iceoryx2_loggers;
+extern crate iceoryx2_bb_loggers;
 
 use iceoryx2_bb_testing::assert_that;
 use iceoryx2_cal::security::*;
 use iceoryx2_cal::shm_allocator::SegmentId;
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle};
 
+#[cfg(unix)]
 mod platform_handle_tests {
     use super::*;
 
@@ -61,6 +65,48 @@ mod platform_handle_tests {
 
         // Clean up manually since we took ownership - reconstruct File and drop it
         unsafe { drop(File::from_raw_fd(fd)) };
+    }
+}
+
+#[cfg(windows)]
+mod platform_handle_tests {
+    use super::*;
+
+    fn create_test_handle() -> PlatformHandle {
+        // Create a temporary file and use its handle as our test handle
+        let file = File::open("NUL").expect("Failed to open NUL");
+        let handle = file.into_raw_handle();
+        unsafe { PlatformHandle::from_raw_handle(handle) }
+    }
+
+    #[test]
+    fn try_clone_creates_independent_handle() {
+        let handle = create_test_handle();
+        let original_handle = handle.as_raw_handle();
+
+        let cloned = handle.try_clone().expect("clone should succeed");
+
+        assert_that!(cloned.as_raw_handle(), ne original_handle);
+        assert_that!(cloned.as_raw_handle().is_null(), eq false);
+    }
+
+    #[test]
+    fn as_raw_handle_returns_valid_handle() {
+        let handle = create_test_handle();
+        let raw = handle.as_raw_handle();
+
+        assert_that!(raw.is_null(), eq false);
+    }
+
+    #[test]
+    fn into_raw_handle_transfers_ownership() {
+        let handle = create_test_handle();
+        let raw = handle.into_raw_handle();
+
+        assert_that!(raw.is_null(), eq false);
+
+        // Clean up manually since we took ownership - reconstruct File and drop it
+        unsafe { drop(File::from_raw_handle(raw)) };
     }
 }
 
@@ -105,6 +151,7 @@ mod access_rights_tests {
     }
 }
 
+#[cfg(unix)]
 mod handle_bundle_tests {
     use super::*;
 
@@ -137,6 +184,42 @@ mod handle_bundle_tests {
         let recovered_handle = bundle.into_handle();
 
         assert_that!(recovered_handle.as_raw_fd(), eq original_fd);
+    }
+}
+
+#[cfg(windows)]
+mod handle_bundle_tests {
+    use super::*;
+
+    fn create_test_handle() -> PlatformHandle {
+        let file = File::open("NUL").expect("Failed to open NUL");
+        let handle = file.into_raw_handle();
+        unsafe { PlatformHandle::from_raw_handle(handle) }
+    }
+
+    #[test]
+    fn new_creates_bundle_with_correct_fields() {
+        let handle = create_test_handle();
+        let segment_id = SegmentId::new(42);
+        let access = AccessRights::read_only();
+        let size = 4096usize;
+
+        let bundle = HandleBundle::new(handle, segment_id, access, size);
+
+        assert_that!(bundle.segment_id().value(), eq 42);
+        assert_that!(bundle.access(), eq AccessRights::read_only());
+        assert_that!(bundle.size(), eq 4096);
+    }
+
+    #[test]
+    fn into_handle_returns_platform_handle() {
+        let handle = create_test_handle();
+        let original_handle = handle.as_raw_handle();
+        let bundle = HandleBundle::new(handle, SegmentId::new(0), AccessRights::none(), 0);
+
+        let recovered_handle = bundle.into_handle();
+
+        assert_that!(recovered_handle.as_raw_handle(), eq original_handle);
     }
 }
 

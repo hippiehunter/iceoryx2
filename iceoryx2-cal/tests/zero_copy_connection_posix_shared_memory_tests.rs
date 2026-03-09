@@ -16,9 +16,9 @@ mod zero_copy_connection_posix_shared_memory_tests {
     use core::time::Duration;
     use iceoryx2_bb_elementary::math::ToB64;
     use iceoryx2_bb_posix::creation_mode::CreationMode;
-    use iceoryx2_bb_posix::permission::Permission;
     #[cfg(unix)]
     use iceoryx2_bb_posix::file_descriptor::FileDescriptorBased;
+    use iceoryx2_bb_posix::permission::Permission;
     #[cfg(unix)]
     use iceoryx2_bb_posix::shared_memory::AccessMode;
     use iceoryx2_bb_posix::unique_system_id::UniqueSystemId;

@@ -14,6 +14,8 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(unused_variables)]
 
+extern crate std;
+
 use core::panic;
 use iceoryx2_pal_concurrency_sync::atomic::Ordering;
 use std::{
@@ -41,6 +43,8 @@ use windows_sys::Win32::{
         },
     },
 };
+
+use alloc::vec::Vec;
 
 pub use crate::posix::MemZeroedStruct;
 use crate::posix::*;

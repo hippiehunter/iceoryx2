@@ -31,6 +31,7 @@ use iceoryx2_bb_system_types::path::Path;
 use iceoryx2_log::fatal_panic;
 use iceoryx2_log::{fail, warn};
 
+use crate::security::{AccessRights, PlatformHandle};
 use crate::shared_memory::{
     AllocationStrategy, SegmentId, SharedMemoryForPoolAllocator, ShmPointer,
 };
@@ -40,7 +41,6 @@ use crate::shared_memory::{
 };
 use crate::shm_allocator::pool_allocator::PoolAllocator;
 use crate::shm_allocator::ShmAllocationError;
-use crate::security::{AccessRights, PlatformHandle};
 
 use super::{
     NamedConcept, NamedConceptBuilder, NamedConceptDoesExistError, NamedConceptListError,
@@ -756,10 +756,9 @@ where
                 }
                 AllocationStrategy::IamManaged => {
                     // Calculate the recommended segment size based on allocator hints
-                    let adjusted_segment_setup = shm.allocator().resize_hint(
-                        layout,
-                        state.shared_state.allocation_strategy,
-                    );
+                    let adjusted_segment_setup = shm
+                        .allocator()
+                        .resize_hint(layout, state.shared_state.allocation_strategy);
                     fail!(from self, with ResizableShmAllocationError::NeedSegment {
                         requested_size: adjusted_segment_setup.payload_size,
                     },
@@ -883,9 +882,13 @@ where
             &state.builder_config.shm,
             segment_id,
         )
-        .has_ownership(true)  // Owner takes ownership for cleanup
+        .has_ownership(true) // Owner takes ownership for cleanup
         .timeout(Duration::ZERO)
-        .open_from_handle(handle, AccessRights::read_write(), &state.builder_config.shm)
+        .open_from_handle(
+            handle,
+            AccessRights::read_write(),
+            &state.builder_config.shm,
+        )
         .map_err(ResizableSharedMemoryError::from)?;
 
         // Clean up old segment if it's empty

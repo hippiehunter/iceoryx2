@@ -342,7 +342,9 @@ impl<Service: service::Service> Receiver<Service> {
                             if connection.data_segment.is_dynamic() {
                                 // In secured mode, try to request the dynamic segment handle
                                 // from IAM and add it to the view
-                                if let Some(ctx) = self.service_state.additional_resource.as_client() {
+                                if let Some(ctx) =
+                                    self.service_state.additional_resource.as_client()
+                                {
                                     let segment_id = offset.segment_id();
                                     let segment_index = segment_id.value();
                                     match ctx.request_dynamic_segment_handle(
@@ -358,7 +360,10 @@ impl<Service: service::Service> Receiver<Service> {
                                             ) {
                                                 Ok(()) => {
                                                     // Segment added successfully - retry translation
-                                                    match connection.data_segment.register_and_translate_offset(offset) {
+                                                    match connection
+                                                        .data_segment
+                                                        .register_and_translate_offset(offset)
+                                                    {
                                                         Ok(ptr) => ptr,
                                                         Err(e) => {
                                                             fail!(from self,
@@ -536,8 +541,7 @@ impl<Service: service::Service> Receiver<Service> {
             match ctx.try_receive_notification() {
                 Ok(Some((notif, handles))) => {
                     if let crate::iam::protocol::IamNotification::SegmentUpdate {
-                        segment_id,
-                        ..
+                        segment_id, ..
                     } = notif
                     {
                         // We received a segment handle pushed by the server.

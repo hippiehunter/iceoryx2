@@ -37,11 +37,11 @@ pub mod details {
 
     pub use crate::zero_copy_connection::*;
 
+    use crate::dynamic_storage::posix_shared_memory::{header_data_from_mapping, header_size};
     use crate::dynamic_storage::{
         DynamicStorage, DynamicStorageBuilder, DynamicStorageCreateError, DynamicStorageOpenError,
         DynamicStorageOpenOrCreateError,
     };
-    use crate::dynamic_storage::posix_shared_memory::{header_data_from_mapping, header_size};
     use crate::named_concept::*;
     use crate::security::{
         platform_handle_into_fd, AccessRights, HandleBasedOpenError, PlatformHandle,
@@ -453,15 +453,14 @@ pub mod details {
 
             drop(header_mapping);
 
-            let channel_mapping_size = match channels_offset
-                .checked_add(core::mem::size_of::<Channel>())
-            {
-                Some(size) => size,
-                None => {
-                    fail!(from self, with HandleBasedOpenError::InternalError,
+            let channel_mapping_size =
+                match channels_offset.checked_add(core::mem::size_of::<Channel>()) {
+                    Some(size) => size,
+                    None => {
+                        fail!(from self, with HandleBasedOpenError::InternalError,
                         "{} since the channel mapping size overflowed.", msg);
-                }
-            };
+                    }
+                };
 
             let channel_mapping = MemoryMappingBuilder::from_file_descriptor(header_fd.clone())
                 .mapping_behavior(MappingBehavior::Shared)
@@ -471,7 +470,8 @@ pub mod details {
                 .map_err(|e| map_mapping_error(e, msg))?;
 
             let mapping_base = channel_mapping.base_address() as usize;
-            let data = unsafe { header_data_from_mapping::<SharedManagementData>(&channel_mapping) };
+            let data =
+                unsafe { header_data_from_mapping::<SharedManagementData>(&channel_mapping) };
 
             let number_of_channels = data.channels.capacity();
             if number_of_channels == 0 {

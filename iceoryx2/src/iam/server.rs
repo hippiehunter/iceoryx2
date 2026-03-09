@@ -71,8 +71,8 @@
 //! server.process()?;
 //! ```
 
-use alloc::sync::Arc;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::collections::HashMap;
 
@@ -121,6 +121,84 @@ impl<C: CalConnection> SessionEntry<C> {
             session,
             connection,
             handshake_complete: false,
+        }
+    }
+}
+
+// ============================================================================
+// IamServerBuilder
+// ============================================================================
+
+/// Builder for constructing an [`IamServer`] with optional configuration.
+///
+/// # Required
+/// - `listener` and `policy` (passed to `new()`)
+///
+/// # Optional
+/// - `service_name` - For audit log entries
+/// - `audit_logger` - Audit logging backend
+/// - `segment_factory` - For IAM-managed segment creation
+///
+/// # Example
+///
+/// ```ignore
+/// let server = IamServerBuilder::new(listener, policy)
+///     .service_name("my/service")
+///     .audit_logger(Box::new(FileAuditLogger::new(&path)?))
+///     .build();
+/// ```
+pub struct IamServerBuilder<L: CalListener, P: IamPolicy> {
+    listener: L,
+    policy: P,
+    service_name: String,
+    audit_logger: Option<Box<dyn AuditLogger>>,
+    segment_factory: Arc<dyn SegmentFactory>,
+}
+
+impl<L: CalListener, P: IamPolicy> IamServerBuilder<L, P> {
+    /// Creates a new builder with the required listener and policy.
+    pub fn new(listener: L, policy: P) -> Self {
+        Self {
+            listener,
+            policy,
+            service_name: String::new(),
+            audit_logger: None,
+            segment_factory: Arc::new(NoSegmentFactory),
+        }
+    }
+
+    /// Sets the service name for audit events.
+    pub fn service_name(mut self, name: impl Into<String>) -> Self {
+        self.service_name = name.into();
+        self
+    }
+
+    /// Sets the audit logger.
+    pub fn audit_logger(mut self, logger: Box<dyn AuditLogger>) -> Self {
+        self.audit_logger = Some(logger);
+        self
+    }
+
+    /// Sets the segment factory for IAM-managed segment creation.
+    pub fn segment_factory(mut self, factory: Arc<dyn SegmentFactory>) -> Self {
+        self.segment_factory = factory;
+        self
+    }
+
+    /// Builds the [`IamServer`].
+    pub fn build(self) -> IamServer<L, P> {
+        IamServer {
+            listener: self.listener,
+            sessions: HashMap::new(),
+            segment_manager: SegmentManager::new(),
+            policy: self.policy,
+            port_counter: 0,
+            receive_buffer: new_receive_buffer(),
+            audit_logger: self.audit_logger,
+            service_name: self.service_name,
+            segment_factory: self.segment_factory,
+            port_to_service: HashMap::new(),
+            service_consumers: HashMap::new(),
         }
     }
 }
@@ -366,9 +444,10 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         let session_ids: Vec<SessionId> = self.sessions.keys().copied().collect();
         for session_id in session_ids {
             match self.process_session_requests(session_id) {
-                Ok(count) => processed += count,
+                Ok(count) => {
+                    processed += count;
+                }
                 Err(_) => {
-                    // Session error - remove it
                     self.remove_session(session_id);
                 }
             }
@@ -622,7 +701,10 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
                 )
             }
 
-            IamRequest::Detach { service_id, port_id } => {
+            IamRequest::Detach {
+                service_id,
+                port_id,
+            } => {
                 if !handshake_complete {
                     return Ok((
                         IamResponse::ProtocolError {
@@ -677,7 +759,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             // because it needs connection access to receive handles from the client.
             IamRequest::RegisterDynamicSegment { .. } => Ok((
                 IamResponse::ProtocolError {
-                    message: String::from("RegisterDynamicSegment must be handled in dispatch loop"),
+                    message: String::from(
+                        "RegisterDynamicSegment must be handled in dispatch loop",
+                    ),
                 },
                 Vec::new(),
             )),
@@ -745,9 +829,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         messaging_pattern: MessagingPatternKind,
     ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
         // Check policy
-        let decision =
-            self.policy
-                .authorize_create(credentials, service_name, messaging_pattern);
+        let decision = self
+            .policy
+            .authorize_create(credentials, service_name, messaging_pattern);
 
         // Audit the create decision
         self.audit(
@@ -1120,7 +1204,8 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         )?;
 
         // Associate segment with the port
-        self.segment_manager.associate_segment_with_port(segment_id, port_id)?;
+        self.segment_manager
+            .associate_segment_with_port(segment_id, port_id)?;
 
         // Update session resource usage
         if let Some(entry) = self.sessions.get_mut(&session_id) {
@@ -1161,22 +1246,31 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         _service_id: &crate::service::service_id::ServiceId,
         port_id: u128,
     ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
-        // Get port type before removal for Phase 8 cleanup
-        let port_type = self
+        // Get port type and credentials before removal for cleanup and audit
+        let (port_type, credentials) = self
             .sessions
             .get(&session_id)
-            .and_then(|entry| {
-                entry
+            .map(|entry| {
+                let pt = entry
                     .session
                     .ports()
                     .find(|p| p.port_id == port_id)
-                    .map(|p| p.port_type)
-            });
+                    .map(|p| p.port_type);
+                (pt, entry.session.credentials().clone())
+            })
+            .unwrap_or((None, ProcessCredentials::new(0, 0, 0)));
 
         // Remove port from session
         if let Some(entry) = self.sessions.get_mut(&session_id) {
             entry.session.remove_port(port_id);
         }
+
+        // Audit the detach event
+        self.audit(
+            AuditEventKind::Detach { port_id },
+            &credentials,
+            &PolicyDecision::Allow,
+        );
 
         // Phase 8: Clean up tracking mappings based on port type
         if let Some(pt) = port_type {
@@ -1276,9 +1370,7 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             .authorize_add_segment(&credentials, &service_id, segment_size);
 
         self.audit(
-            AuditEventKind::AddSegment {
-                size: segment_size,
-            },
+            AuditEventKind::AddSegment { size: segment_size },
             &credentials,
             &decision,
         );
@@ -1334,10 +1426,7 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             usage.total_memory = usage.total_memory.saturating_add(segment_size);
         }
 
-        Ok((
-            IamResponse::RegisterSegmentOk { segment_id },
-            Vec::new(),
-        ))
+        Ok((IamResponse::RegisterSegmentOk { segment_id }, Vec::new()))
     }
 
     /// Handles `RequestSegmentHandle` — looks up and returns a segment handle for a consumer.
@@ -1398,9 +1487,7 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             .authorize_add_segment(&credentials, &service_id, segment_size);
 
         self.audit(
-            AuditEventKind::AddSegment {
-                size: segment_size,
-            },
+            AuditEventKind::AddSegment { size: segment_size },
             &credentials,
             &decision,
         );
@@ -1473,10 +1560,11 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         sender_port_id: u128,
         segment_index: u8,
     ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
-        match self
-            .segment_manager
-            .get_dynamic_segment_handle(sender_port_id, segment_index, session_id)
-        {
+        match self.segment_manager.get_dynamic_segment_handle(
+            sender_port_id,
+            segment_index,
+            session_id,
+        ) {
             Some((info, handle)) => Ok((
                 IamResponse::DynamicSegmentHandleOk {
                     segment_info: info,
@@ -1501,7 +1589,11 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
     ) -> Option<IamResponse> {
         let (current, max, name) = match port_type {
             PortType::Publisher => (usage.publisher_count, limits.max_publishers, "publishers"),
-            PortType::Subscriber => (usage.subscriber_count, limits.max_subscribers, "subscribers"),
+            PortType::Subscriber => (
+                usage.subscriber_count,
+                limits.max_subscribers,
+                "subscribers",
+            ),
             PortType::Server => (usage.server_count, limits.max_servers, "servers"),
             PortType::Client => (usage.client_count, limits.max_clients, "clients"),
         };
@@ -1525,7 +1617,11 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         // Phase 8: Clean up tracking mappings before removing the session
         if let Some(entry) = self.sessions.get(&session_id) {
             // Collect ports and their types for cleanup
-            let ports: Vec<_> = entry.session.ports().map(|p| (p.port_id, p.port_type)).collect();
+            let ports: Vec<_> = entry
+                .session
+                .ports()
+                .map(|p| (p.port_id, p.port_type))
+                .collect();
 
             for (port_id, port_type) in ports {
                 match port_type {
@@ -1750,10 +1846,7 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
     /// # Returns
     ///
     /// List of session IDs that need to acknowledge the retirement.
-    pub fn begin_segment_retirement(
-        &mut self,
-        segment_id: SegmentId,
-    ) -> Option<Vec<SessionId>> {
+    pub fn begin_segment_retirement(&mut self, segment_id: SegmentId) -> Option<Vec<SessionId>> {
         self.segment_manager
             .begin_retirement(segment_id)
             .map(|set| set.into_iter().collect())
@@ -1822,7 +1915,10 @@ where
     P: IamPolicy + Send + 'static,
 {
     fn process(&self) -> Result<usize, IamServerError> {
-        let mut guard = self.server.lock().map_err(|_| IamServerError::InternalError)?;
+        let mut guard = self
+            .server
+            .lock()
+            .map_err(|_| IamServerError::InternalError)?;
         match guard.as_mut() {
             Some(server) => server.process(),
             None => Ok(0), // Already shut down
@@ -2029,10 +2125,7 @@ mod tests {
             Ok(self.credentials.clone())
         }
 
-        fn send_handles(
-            &self,
-            handles: &[&PlatformHandle],
-        ) -> Result<(), ControlChannelSendError> {
+        fn send_handles(&self, handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError> {
             // We can't clone handles, but for testing we track how many were "sent"
             let _ = handles;
             Ok(())
@@ -2316,14 +2409,16 @@ mod tests {
 
     #[test]
     fn test_calculate_publisher_segment_size() {
-        let size = IamServer::<MockListener, DefaultPolicy>::calculate_publisher_segment_size(8, 1024);
+        let size =
+            IamServer::<MockListener, DefaultPolicy>::calculate_publisher_segment_size(8, 1024);
         // (8 + 1) * 1024 + 4096 = 13312
         assert_eq!(size, 13312);
     }
 
     #[test]
     fn test_calculate_publisher_segment_size_zero_history() {
-        let size = IamServer::<MockListener, DefaultPolicy>::calculate_publisher_segment_size(0, 1024);
+        let size =
+            IamServer::<MockListener, DefaultPolicy>::calculate_publisher_segment_size(0, 1024);
         // (0 + 1) * 1024 + 4096 = 5120
         assert_eq!(size, 5120);
     }
@@ -2354,30 +2449,28 @@ mod tests {
     #[cfg(unix)]
     fn create_test_handle() -> PlatformHandle {
         use std::os::unix::io::AsRawFd;
-        let raw_fd = unsafe {
-            iceoryx2_pal_posix::posix::dup(std::io::stdout().as_raw_fd())
-        };
+        let raw_fd = unsafe { iceoryx2_pal_posix::posix::dup(std::io::stdout().as_raw_fd()) };
         unsafe { PlatformHandle::from_raw_fd(raw_fd) }
     }
 
     #[cfg(windows)]
     fn create_test_handle() -> PlatformHandle {
-        use std::os::windows::io::FromRawHandle;
         use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::FromRawHandle;
         let raw_handle = std::io::stdout().as_raw_handle();
-        let mut dup_handle = std::ptr::null_mut();
+        let mut dup_handle: isize = 0;
         unsafe {
             let current_process = windows_sys::Win32::System::Threading::GetCurrentProcess();
             windows_sys::Win32::Foundation::DuplicateHandle(
                 current_process,
-                raw_handle as *mut _,
+                raw_handle as isize,
                 current_process,
                 &mut dup_handle,
                 0,
                 0,
                 windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
             );
-            PlatformHandle::from_raw_handle(dup_handle)
+            PlatformHandle::from_raw_handle(dup_handle as *mut _)
         }
     }
 
@@ -2445,8 +2538,12 @@ mod tests {
         }
 
         // Create a service ID for testing
-        let service_name = crate::service::service_name::ServiceName::new("test/pub_tracking").unwrap();
-        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe);
+        let service_name =
+            crate::service::service_name::ServiceName::new("test/pub_tracking").unwrap();
+        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name,
+            MessagingPattern::PublishSubscribe,
+        );
 
         let usage = SessionResourceUsage::new();
         let _ = server.handle_attach_publisher(
@@ -2487,16 +2584,16 @@ mod tests {
         }
 
         // Create a service ID for testing
-        let service_name = crate::service::service_name::ServiceName::new("test/sub_tracking").unwrap();
-        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe);
+        let service_name =
+            crate::service::service_name::ServiceName::new("test/sub_tracking").unwrap();
+        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name,
+            MessagingPattern::PublishSubscribe,
+        );
 
         let usage = SessionResourceUsage::new();
-        let _ = server.handle_attach_subscriber(
-            session_id,
-            &test_credentials(),
-            &usage,
-            &service_id,
-        );
+        let _ =
+            server.handle_attach_subscriber(session_id, &test_credentials(), &usage, &service_id);
 
         // Verify service_consumers mapping was populated
         assert!(!server.service_consumers.is_empty());
@@ -2525,18 +2622,24 @@ mod tests {
             entry.handshake_complete = true;
         }
 
-        let service_name = crate::service::service_name::ServiceName::new("test/detach_producer").unwrap();
-        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe);
+        let service_name =
+            crate::service::service_name::ServiceName::new("test/detach_producer").unwrap();
+        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name,
+            MessagingPattern::PublishSubscribe,
+        );
 
         let usage = SessionResourceUsage::new();
-        let (response, _) = server.handle_attach_publisher(
-            session_id,
-            &test_credentials(),
-            &usage,
-            &service_id,
-            8,
-            1024,
-        ).unwrap();
+        let (response, _) = server
+            .handle_attach_publisher(
+                session_id,
+                &test_credentials(),
+                &usage,
+                &service_id,
+                8,
+                1024,
+            )
+            .unwrap();
 
         // Extract port_id from response
         let port_id = match response {
@@ -2573,16 +2676,17 @@ mod tests {
             entry.handshake_complete = true;
         }
 
-        let service_name = crate::service::service_name::ServiceName::new("test/detach_consumer").unwrap();
-        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe);
+        let service_name =
+            crate::service::service_name::ServiceName::new("test/detach_consumer").unwrap();
+        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name,
+            MessagingPattern::PublishSubscribe,
+        );
 
         let usage = SessionResourceUsage::new();
-        let (response, _) = server.handle_attach_subscriber(
-            session_id,
-            &test_credentials(),
-            &usage,
-            &service_id,
-        ).unwrap();
+        let (response, _) = server
+            .handle_attach_subscriber(session_id, &test_credentials(), &usage, &service_id)
+            .unwrap();
 
         let port_id = match response {
             IamResponse::AttachOk { port_id, .. } => port_id,
@@ -2619,18 +2723,24 @@ mod tests {
         }
 
         // Attach a publisher
-        let service_name1 = crate::service::service_name::ServiceName::new("test/session_rm_pub").unwrap();
-        let service_id1 = crate::service::service_id::ServiceId::new::<Sha1>(&service_name1, MessagingPattern::PublishSubscribe);
+        let service_name1 =
+            crate::service::service_name::ServiceName::new("test/session_rm_pub").unwrap();
+        let service_id1 = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name1,
+            MessagingPattern::PublishSubscribe,
+        );
 
         let usage = SessionResourceUsage::new();
-        let (response, _) = server.handle_attach_publisher(
-            session_id,
-            &test_credentials(),
-            &usage,
-            &service_id1,
-            8,
-            1024,
-        ).unwrap();
+        let (response, _) = server
+            .handle_attach_publisher(
+                session_id,
+                &test_credentials(),
+                &usage,
+                &service_id1,
+                8,
+                1024,
+            )
+            .unwrap();
 
         let pub_port_id = match response {
             IamResponse::AttachOk { port_id, .. } => port_id,
@@ -2638,15 +2748,15 @@ mod tests {
         };
 
         // Attach a subscriber
-        let service_name2 = crate::service::service_name::ServiceName::new("test/session_rm_sub").unwrap();
-        let service_id2 = crate::service::service_id::ServiceId::new::<Sha1>(&service_name2, MessagingPattern::PublishSubscribe);
-
-        let _ = server.handle_attach_subscriber(
-            session_id,
-            &test_credentials(),
-            &usage,
-            &service_id2,
+        let service_name2 =
+            crate::service::service_name::ServiceName::new("test/session_rm_sub").unwrap();
+        let service_id2 = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name2,
+            MessagingPattern::PublishSubscribe,
         );
+
+        let _ =
+            server.handle_attach_subscriber(session_id, &test_credentials(), &usage, &service_id2);
 
         // Verify mappings exist
         assert!(server.port_to_service.contains_key(&pub_port_id));
@@ -2669,14 +2779,19 @@ mod tests {
         let policy = DefaultPolicy::with_owner(1000);
         let mut server = IamServer::new(listener, policy);
 
-        let service_name = crate::service::service_name::ServiceName::new("test/no_consumers").unwrap();
-        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe);
+        let service_name =
+            crate::service::service_name::ServiceName::new("test/no_consumers").unwrap();
+        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name,
+            MessagingPattern::PublishSubscribe,
+        );
 
         let handle = create_test_handle();
         let segment_id = SegmentId::new(0);
 
         // Broadcast with no consumers
-        let notified = server.broadcast_segment_to_consumers(&service_id, segment_id, 4096, &handle);
+        let notified =
+            server.broadcast_segment_to_consumers(&service_id, segment_id, 4096, &handle);
 
         assert_eq!(notified, 0);
     }
@@ -2700,16 +2815,15 @@ mod tests {
             entry.handshake_complete = true;
         }
 
-        let service_name = crate::service::service_name::ServiceName::new("test/server_tracking").unwrap();
-        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(&service_name, MessagingPattern::RequestResponse);
+        let service_name =
+            crate::service::service_name::ServiceName::new("test/server_tracking").unwrap();
+        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name,
+            MessagingPattern::RequestResponse,
+        );
 
         let usage = SessionResourceUsage::new();
-        let _ = server.handle_attach_server(
-            session_id,
-            &test_credentials(),
-            &usage,
-            &service_id,
-        );
+        let _ = server.handle_attach_server(session_id, &test_credentials(), &usage, &service_id);
 
         // Server ports are producers, should be in port_to_service
         assert!(!server.port_to_service.is_empty());
@@ -2734,16 +2848,15 @@ mod tests {
             entry.handshake_complete = true;
         }
 
-        let service_name = crate::service::service_name::ServiceName::new("test/client_tracking").unwrap();
-        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(&service_name, MessagingPattern::RequestResponse);
+        let service_name =
+            crate::service::service_name::ServiceName::new("test/client_tracking").unwrap();
+        let service_id = crate::service::service_id::ServiceId::new::<Sha1>(
+            &service_name,
+            MessagingPattern::RequestResponse,
+        );
 
         let usage = SessionResourceUsage::new();
-        let _ = server.handle_attach_client(
-            session_id,
-            &test_credentials(),
-            &usage,
-            &service_id,
-        );
+        let _ = server.handle_attach_client(session_id, &test_credentials(), &usage, &service_id);
 
         // Client ports are consumers, should be in service_consumers
         assert!(!server.service_consumers.is_empty());

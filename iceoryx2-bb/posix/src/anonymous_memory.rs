@@ -129,7 +129,7 @@ impl Seals {
         !self.seal_seal && !self.seal_shrink && !self.seal_grow && !self.seal_write
     }
 
-    fn to_flags(&self) -> posix::int {
+    fn to_flags(self) -> posix::int {
         let mut flags = 0;
         if self.seal_seal {
             flags |= posix::F_SEAL_SEAL;

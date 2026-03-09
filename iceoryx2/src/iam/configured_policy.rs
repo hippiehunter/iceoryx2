@@ -44,6 +44,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 
 use iceoryx2_cal::security::credentials::ProcessCredentials;
 use serde::Deserialize;
@@ -51,8 +52,55 @@ use serde::Deserialize;
 use crate::service::service_id::ServiceId;
 use crate::service::service_name::ServiceName;
 
-use super::policy::{DefaultPolicy, IamPolicy, PolicyDecision, ResourceLimits};
+use super::policy::{DefaultPolicy, IamPolicy, PolicyDecision, QosBounds, ResourceLimits};
 use super::protocol::{DenialReason, MessagingPatternKind, PortType};
+
+// ============================================================================
+// PolicyLoadError
+// ============================================================================
+
+/// Errors that can occur when loading a policy file.
+#[derive(Debug)]
+pub enum PolicyLoadError {
+    /// The policy file was not found for the given service.
+    NotFound,
+    /// An I/O error occurred reading the policy file.
+    IoError(std::io::Error),
+    /// The TOML content could not be parsed.
+    ParseError(String),
+    /// The policy file content is invalid (e.g., service name mismatch).
+    ValidationError(String),
+}
+
+impl fmt::Display for PolicyLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PolicyLoadError::NotFound => write!(f, "Policy file not found"),
+            PolicyLoadError::IoError(e) => write!(f, "I/O error reading policy file: {}", e),
+            PolicyLoadError::ParseError(e) => write!(f, "TOML parse error: {}", e),
+            PolicyLoadError::ValidationError(e) => write!(f, "Policy validation error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for PolicyLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PolicyLoadError::IoError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for PolicyLoadError {
+    fn from(e: std::io::Error) -> Self {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            PolicyLoadError::NotFound
+        } else {
+            PolicyLoadError::IoError(e)
+        }
+    }
+}
 
 // ============================================================================
 // TOML Policy File Structs
@@ -71,6 +119,8 @@ pub struct PolicyFile {
     pub deny: Vec<DenyRule>,
     /// Optional resource limits.
     pub limits: Option<PolicyLimits>,
+    /// Optional QoS bounds.
+    pub qos: Option<PolicyQos>,
 }
 
 /// Service identification section.
@@ -112,7 +162,12 @@ pub enum PrincipalMatcher {
         /// The group ID to match.
         gid: u32,
     },
-    /// Match by UID range (inclusive).
+    /// Match by UID range using array format: `{ uid_range = [2000, 2999] }`.
+    UidRangeArray {
+        /// Two-element array: [min, max] (both inclusive).
+        uid_range: [u32; 2],
+    },
+    /// Match by UID range using named fields: `{ min = 1000, max = 2000 }`.
     UidRange {
         /// Minimum UID (inclusive).
         min: u32,
@@ -152,6 +207,9 @@ impl PrincipalMatcher {
         match self {
             PrincipalMatcher::Uid { uid } => credentials.uid() == *uid,
             PrincipalMatcher::Gid { gid } => credentials.gid() == *gid,
+            PrincipalMatcher::UidRangeArray { uid_range } => {
+                credentials.uid() >= uid_range[0] && credentials.uid() <= uid_range[1]
+            }
             PrincipalMatcher::UidRange { min, max } => {
                 credentials.uid() >= *min && credentials.uid() <= *max
             }
@@ -177,6 +235,22 @@ pub struct PolicyLimits {
     pub max_segments: Option<usize>,
     /// Maximum segment size (human-readable, e.g., "64MB").
     pub max_segment_size: Option<String>,
+}
+
+/// QoS bounds from a TOML policy file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicyQos {
+    /// Maximum buffer size (in elements).
+    pub max_buffer_size: Option<usize>,
+    /// Maximum history depth.
+    pub max_history: Option<usize>,
+}
+
+impl PolicyQos {
+    /// Converts to [`QosBounds`].
+    pub fn to_qos_bounds(&self) -> QosBounds {
+        QosBounds::new(self.max_buffer_size, self.max_history)
+    }
 }
 
 impl PolicyLimits {
@@ -219,9 +293,17 @@ pub fn parse_size_string(s: &str) -> Option<usize> {
 
     let upper = s.to_uppercase();
     if let Some(num_str) = upper.strip_suffix("GB") {
-        num_str.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024 * 1024)
+        num_str
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024 * 1024)
     } else if let Some(num_str) = upper.strip_suffix("MB") {
-        num_str.trim().parse::<usize>().ok().map(|n| n * 1024 * 1024)
+        num_str
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n * 1024 * 1024)
     } else if let Some(num_str) = upper.strip_suffix("KB") {
         num_str.trim().parse::<usize>().ok().map(|n| n * 1024)
     } else {
@@ -247,6 +329,8 @@ pub struct ConfiguredPolicy {
     deny_rules: Vec<DenyRule>,
     /// Parsed resource limits.
     limits: ResourceLimits,
+    /// QoS bounds.
+    qos_bounds: QosBounds,
 }
 
 impl ConfiguredPolicy {
@@ -262,6 +346,24 @@ impl ConfiguredPolicy {
             allow_rules,
             deny_rules,
             limits,
+            qos_bounds: QosBounds::unbounded(),
+        }
+    }
+
+    /// Creates a new configured policy with QoS bounds.
+    pub fn with_qos_bounds(
+        owner_uid: u32,
+        allow_rules: Vec<AllowRule>,
+        deny_rules: Vec<DenyRule>,
+        limits: ResourceLimits,
+        qos_bounds: QosBounds,
+    ) -> Self {
+        Self {
+            owner_uid,
+            allow_rules,
+            deny_rules,
+            limits,
+            qos_bounds,
         }
     }
 
@@ -273,7 +375,19 @@ impl ConfiguredPolicy {
             .map(|l| l.to_resource_limits())
             .unwrap_or_default();
 
-        Self::new(owner_uid, policy_file.allow, policy_file.deny, limits)
+        let qos_bounds = policy_file
+            .qos
+            .as_ref()
+            .map(|q| q.to_qos_bounds())
+            .unwrap_or_default();
+
+        Self::with_qos_bounds(
+            owner_uid,
+            policy_file.allow,
+            policy_file.deny,
+            limits,
+            qos_bounds,
+        )
     }
 
     /// Checks if the credentials match any deny rule.
@@ -295,14 +409,9 @@ impl ConfiguredPolicy {
     }
 
     /// Checks if the credentials match any allow rule with the required role.
-    fn check_allow_with_role(
-        &self,
-        credentials: &ProcessCredentials,
-        required_role: &str,
-    ) -> bool {
+    fn check_allow_with_role(&self, credentials: &ProcessCredentials, required_role: &str) -> bool {
         for rule in &self.allow_rules {
-            if rule.principal.matches(credentials)
-                && rule.roles.iter().any(|r| r == required_role)
+            if rule.principal.matches(credentials) && rule.roles.iter().any(|r| r == required_role)
             {
                 return true;
             }
@@ -426,6 +535,10 @@ impl IamPolicy for ConfiguredPolicy {
     fn get_limits(&self, _credentials: &ProcessCredentials) -> ResourceLimits {
         self.limits
     }
+
+    fn get_qos_bounds(&self, _credentials: &ProcessCredentials) -> QosBounds {
+        self.qos_bounds
+    }
 }
 
 // ============================================================================
@@ -476,9 +589,7 @@ impl IamPolicy for PolicyDispatch {
     ) -> PolicyDecision {
         match self {
             PolicyDispatch::Default(p) => p.authorize_attach(credentials, service_id, port_type),
-            PolicyDispatch::Configured(p) => {
-                p.authorize_attach(credentials, service_id, port_type)
-            }
+            PolicyDispatch::Configured(p) => p.authorize_attach(credentials, service_id, port_type),
         }
     }
 
@@ -504,6 +615,13 @@ impl IamPolicy for PolicyDispatch {
             PolicyDispatch::Configured(p) => p.get_limits(credentials),
         }
     }
+
+    fn get_qos_bounds(&self, credentials: &ProcessCredentials) -> QosBounds {
+        match self {
+            PolicyDispatch::Default(p) => p.get_qos_bounds(credentials),
+            PolicyDispatch::Configured(p) => p.get_qos_bounds(credentials),
+        }
+    }
 }
 
 // ============================================================================
@@ -511,6 +629,18 @@ impl IamPolicy for PolicyDispatch {
 // ============================================================================
 
 /// Loads policy files from a directory by service name.
+///
+/// # Usage
+///
+/// ```ignore
+/// use iceoryx2::iam::{PolicyLoader, PolicyLoadError};
+///
+/// match PolicyLoader::load_for_service(&policy_dir, &service_name) {
+///     Ok(policy) => { /* use configured policy */ }
+///     Err(PolicyLoadError::NotFound) => { /* fall back to default */ }
+///     Err(e) => { /* broken policy file - this is a real error */ }
+/// }
+/// ```
 pub struct PolicyLoader;
 
 impl PolicyLoader {
@@ -520,19 +650,35 @@ impl PolicyLoader {
     /// Service name characters that are not alphanumeric or `-` are replaced
     /// with `_` to form the filename.
     ///
-    /// Returns `None` if no policy file exists or if parsing fails.
+    /// # Errors
+    ///
+    /// - [`PolicyLoadError::NotFound`] if no policy file exists for this service
+    /// - [`PolicyLoadError::IoError`] if the file cannot be read
+    /// - [`PolicyLoadError::ParseError`] if the TOML is malformed
+    /// - [`PolicyLoadError::ValidationError`] if the policy content is invalid
     pub fn load_for_service(
         policy_dir: &std::path::Path,
         service_name: &ServiceName,
-    ) -> Option<ConfiguredPolicy> {
+    ) -> Result<ConfiguredPolicy, PolicyLoadError> {
         let sanitized = sanitize_service_name(service_name.as_str());
         let file_path = policy_dir.join(format!("{}.toml", sanitized));
 
-        let contents = std::fs::read_to_string(&file_path).ok()?;
-        let policy_file: PolicyFile = toml::from_str(&contents).ok()?;
+        let contents = std::fs::read_to_string(&file_path)?;
+        let policy_file: PolicyFile =
+            toml::from_str(&contents).map_err(|e| PolicyLoadError::ParseError(e.to_string()))?;
+
+        // Validate limits if present
+        if let Some(ref limits) = policy_file.limits {
+            let resource_limits = limits.to_resource_limits();
+            if !resource_limits.is_valid() {
+                return Err(PolicyLoadError::ValidationError(
+                    "Resource limits are invalid (check max_segment_size)".into(),
+                ));
+            }
+        }
 
         let owner_uid = ProcessCredentials::from_self().uid();
-        Some(ConfiguredPolicy::from_policy_file(policy_file, owner_uid))
+        Ok(ConfiguredPolicy::from_policy_file(policy_file, owner_uid))
     }
 }
 
@@ -629,14 +775,11 @@ max_segment_size = "64MB"
         let limits = policy_file.limits.unwrap();
         assert_eq!(limits.max_publishers, Some(4));
         assert_eq!(limits.max_subscribers, Some(16));
-        assert_eq!(
-            limits.max_segment_size.as_deref(),
-            Some("64MB")
-        );
+        assert_eq!(limits.max_segment_size.as_deref(), Some("64MB"));
     }
 
     #[test]
-    fn test_parse_policy_file_uid_range() {
+    fn test_parse_policy_file_uid_range_named_fields() {
         let toml_str = r#"
 [service]
 name = "test/range"
@@ -650,8 +793,84 @@ roles = ["publisher"]
         let rule = &policy_file.allow[0];
         assert!(matches!(
             rule.principal,
-            PrincipalMatcher::UidRange { min: 1000, max: 2000 }
+            PrincipalMatcher::UidRange {
+                min: 1000,
+                max: 2000
+            }
         ));
+    }
+
+    #[test]
+    fn test_parse_policy_file_uid_range_array_format() {
+        let toml_str = r#"
+[service]
+name = "test/range-array"
+
+[[allow]]
+principal = { uid_range = [2000, 2999] }
+roles = ["subscriber"]
+"#;
+
+        let policy_file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let rule = &policy_file.allow[0];
+        assert!(matches!(
+            rule.principal,
+            PrincipalMatcher::UidRangeArray {
+                uid_range: [2000, 2999]
+            }
+        ));
+
+        // Verify matching works
+        assert!(rule
+            .principal
+            .matches(&ProcessCredentials::new(1, 2500, 100)));
+        assert!(!rule
+            .principal
+            .matches(&ProcessCredentials::new(1, 1999, 100)));
+        assert!(!rule
+            .principal
+            .matches(&ProcessCredentials::new(1, 3000, 100)));
+    }
+
+    #[test]
+    fn test_parse_policy_file_with_qos() {
+        let toml_str = r#"
+[service]
+name = "test/qos"
+
+[[allow]]
+principal = "any"
+roles = ["publisher", "subscriber"]
+
+[qos]
+max_buffer_size = 1024
+max_history = 10
+"#;
+
+        let policy_file: PolicyFile = toml::from_str(toml_str).unwrap();
+        assert!(policy_file.qos.is_some());
+        let qos = policy_file.qos.unwrap();
+        assert_eq!(qos.max_buffer_size, Some(1024));
+        assert_eq!(qos.max_history, Some(10));
+
+        let bounds = qos.to_qos_bounds();
+        assert!(bounds.check_buffer_size(1024));
+        assert!(!bounds.check_buffer_size(1025));
+    }
+
+    #[test]
+    fn test_parse_policy_file_without_qos() {
+        let toml_str = r#"
+[service]
+name = "test/no-qos"
+
+[[allow]]
+principal = "any"
+roles = ["publisher"]
+"#;
+
+        let policy_file: PolicyFile = toml::from_str(toml_str).unwrap();
+        assert!(policy_file.qos.is_none());
     }
 
     // ========================================================================
@@ -674,7 +893,10 @@ roles = ["publisher"]
 
     #[test]
     fn test_principal_matcher_uid_range() {
-        let matcher = PrincipalMatcher::UidRange { min: 1000, max: 2000 };
+        let matcher = PrincipalMatcher::UidRange {
+            min: 1000,
+            max: 2000,
+        };
         assert!(matcher.matches(&ProcessCredentials::new(1, 1000, 100)));
         assert!(matcher.matches(&ProcessCredentials::new(1, 1500, 100)));
         assert!(matcher.matches(&ProcessCredentials::new(1, 2000, 100)));
@@ -813,6 +1035,40 @@ max_segment_size = "32MB"
     }
 
     #[test]
+    fn test_configured_policy_qos_from_toml() {
+        let toml_str = r#"
+[service]
+name = "test/qos-policy"
+
+[[allow]]
+principal = { uid = 1000 }
+roles = ["publisher"]
+
+[qos]
+max_buffer_size = 512
+max_history = 5
+"#;
+        let policy_file: PolicyFile = toml::from_str(toml_str).unwrap();
+        let policy = ConfiguredPolicy::from_policy_file(policy_file, 1000);
+        let creds = ProcessCredentials::new(1, 1000, 100);
+
+        let bounds = policy.get_qos_bounds(&creds);
+        assert_eq!(bounds.max_buffer_size, Some(512));
+        assert_eq!(bounds.max_history, Some(5));
+        assert!(bounds.check_buffer_size(512));
+        assert!(!bounds.check_buffer_size(513));
+    }
+
+    #[test]
+    fn test_configured_policy_qos_default_unbounded() {
+        let policy = make_test_policy();
+        let creds = ProcessCredentials::new(1, 1000, 100);
+
+        let bounds = policy.get_qos_bounds(&creds);
+        assert_eq!(bounds, QosBounds::unbounded());
+    }
+
+    #[test]
     fn test_configured_policy_add_segment_owner() {
         use crate::service::messaging_pattern::MessagingPattern;
         use iceoryx2_cal::hash::sha1::Sha1;
@@ -907,7 +1163,7 @@ max_segment_size = "32MB"
         let dir = unique_test_dir("missing");
         let service_name = ServiceName::new("nonexistent/service").unwrap();
         let result = PolicyLoader::load_for_service(&dir, &service_name);
-        assert!(result.is_none());
+        assert!(matches!(result, Err(PolicyLoadError::NotFound)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -926,8 +1182,53 @@ roles = ["publisher"]
 
         let service_name = ServiceName::new("test/loader").unwrap();
         let result = PolicyLoader::load_for_service(&dir, &service_name);
-        assert!(result.is_some());
+        assert!(result.is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_policy_loader_malformed_toml() {
+        let dir = unique_test_dir("malformed");
+        std::fs::write(
+            dir.join("test_malformed.toml"),
+            "this is not valid toml {{{",
+        )
+        .unwrap();
+
+        let service_name = ServiceName::new("test/malformed").unwrap();
+        let result = PolicyLoader::load_for_service(&dir, &service_name);
+        assert!(matches!(result, Err(PolicyLoadError::ParseError(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_policy_loader_invalid_limits() {
+        let dir = unique_test_dir("invalid_limits");
+        let toml_content = r#"
+[service]
+name = "test/invalid"
+
+[limits]
+max_segment_size = "0"
+"#;
+        std::fs::write(dir.join("test_invalid.toml"), toml_content).unwrap();
+
+        let service_name = ServiceName::new("test/invalid").unwrap();
+        let result = PolicyLoader::load_for_service(&dir, &service_name);
+        assert!(matches!(result, Err(PolicyLoadError::ValidationError(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_policy_load_error_display() {
+        let e = PolicyLoadError::NotFound;
+        assert_eq!(format!("{}", e), "Policy file not found");
+
+        let e = PolicyLoadError::ParseError("bad toml".into());
+        assert!(format!("{}", e).contains("bad toml"));
+
+        let e = PolicyLoadError::ValidationError("invalid".into());
+        assert!(format!("{}", e).contains("invalid"));
     }
 
     // ========================================================================

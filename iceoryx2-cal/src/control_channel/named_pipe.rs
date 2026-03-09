@@ -55,8 +55,7 @@
 //! let client = ClientBuilder::new(&name).connect().unwrap();
 //! ```
 
-#![cfg(windows)]
-
+#[allow(clippy::disallowed_types)]
 use core::cell::RefCell;
 use core::fmt::Debug;
 use core::time::Duration;
@@ -65,6 +64,7 @@ use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use iceoryx2_bb_container::semantic_string::SemanticString;
 use iceoryx2_bb_system_types::file_name::FileName;
 use iceoryx2_bb_system_types::path::Path;
 use iceoryx2_log::{fail, trace, warn};
@@ -90,8 +90,6 @@ use super::{
     ControlChannelListener, ControlChannelListenerBuilder, ControlChannelListenerCreateError,
     ControlChannelReceiveError, ControlChannelSendError,
 };
-
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
 // ============================================================================
 // Constants
@@ -257,6 +255,7 @@ impl NamedConceptBuilder<Channel> for ListenerBuilder {
 }
 
 impl ControlChannelListenerBuilder<Channel> for ListenerBuilder {
+    #[allow(clippy::disallowed_types)]
     fn create(self) -> Result<Listener, ControlChannelListenerCreateError> {
         let msg = "Unable to create control channel listener";
         let pipe_name = build_pipe_name(&self.name, &self.config);
@@ -293,6 +292,7 @@ impl ControlChannelListenerBuilder<Channel> for ListenerBuilder {
 /// a panic at runtime. If thread-safe access is required, wrap the Listener
 /// in a `Mutex` or use separate Listener instances per thread.
 #[derive(Debug)]
+#[allow(clippy::disallowed_types)]
 pub struct Listener {
     name: FileName,
     inner: RefCell<NamedPipeServer>,
@@ -324,6 +324,9 @@ impl ControlChannelListener for Listener {
                 }))
             }
             Ok(None) => Ok(None),
+            // AlreadyConnected is not an error for the caller - it just means
+            // we already have a connection and can't accept another one yet.
+            Err(NamedPipeError::AlreadyConnected) => Ok(None),
             Err(e) => map_pipe_error_to_accept(e),
         }
     }
@@ -566,7 +569,7 @@ impl ControlChannelClient for Client {
         Err(ControlChannelCredentialsError::InternalFailure)
     }
 
-    fn send_handles(&self, handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError> {
+    fn send_handles(&self, _handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError> {
         // Client sending handles to server is not the primary use case.
         // The server would need to know our PID to receive them.
         // For now, we don't support this direction.
@@ -729,9 +732,9 @@ fn send_handles_to_process(
     // Handle count
     buffer[4..8].copy_from_slice(&(handle_count as u32).to_le_bytes());
     // Handle values
-    for i in 0..handle_count {
+    for (i, &handle_val) in duplicated_handles.iter().enumerate().take(handle_count) {
         let offset = HANDLE_MSG_HEADER_SIZE + i * 8;
-        buffer[offset..offset + 8].copy_from_slice(&duplicated_handles[i].to_le_bytes());
+        buffer[offset..offset + 8].copy_from_slice(&handle_val.to_le_bytes());
     }
 
     match conn.write(&buffer[..msg_size]) {

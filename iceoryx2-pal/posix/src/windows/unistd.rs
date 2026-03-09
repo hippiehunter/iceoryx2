@@ -395,6 +395,16 @@ pub unsafe fn fchown(fd: int, owner: uid_t, group: gid_t) -> int {
     0
 }
 
+pub unsafe fn memfd_create(name: *const c_char, flags: uint) -> int {
+    Errno::set(Errno::ENOSYS);
+    -1
+}
+
+pub unsafe fn pidfd_open(pid: pid_t, flags: uint) -> int {
+    Errno::set(Errno::ENOSYS);
+    -1
+}
+
 pub unsafe fn fsync(fd: int) -> int {
     match HandleTranslator::get_instance().get(fd) {
         Some(FdHandleEntry::File(handle)) => {

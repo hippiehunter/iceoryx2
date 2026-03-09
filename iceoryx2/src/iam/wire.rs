@@ -152,7 +152,9 @@ pub(crate) fn try_receive_message<C: ControlChannelConnection, T: DeserializeOwn
     }
 
     // Deserialize the message
-    Postcard::deserialize(buffer).map_err(|_| IamServerError::SerializationError).map(Some)
+    Postcard::deserialize(buffer)
+        .map_err(|_| IamServerError::SerializationError)
+        .map(Some)
 }
 
 /// Sends platform handles over a CAL connection.
@@ -308,7 +310,9 @@ pub(crate) fn client_try_receive_message<C: ControlChannelClient, T: Deserialize
     buffer.resize(4, 0);
 
     // Try to receive the length prefix (non-blocking)
-    let bytes_read = client.try_receive(buffer).map_err(map_receive_error_client)?;
+    let bytes_read = client
+        .try_receive(buffer)
+        .map_err(map_receive_error_client)?;
 
     if bytes_read == 0 {
         return Ok(None); // No data available
@@ -534,8 +538,7 @@ mod tests {
         assert_eq!(framed.len(), 4 + payload.len());
 
         // Parse length prefix
-        let parsed_len =
-            u32::from_le_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
+        let parsed_len = u32::from_le_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
         assert_eq!(parsed_len, payload.len());
 
         // Deserialize using Postcard trait
@@ -570,8 +573,7 @@ mod tests {
         assert_eq!(framed.len(), 4 + payload.len());
 
         // Parse length prefix
-        let parsed_len =
-            u32::from_le_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
+        let parsed_len = u32::from_le_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
         assert_eq!(parsed_len, payload.len());
 
         // Deserialize using Postcard trait

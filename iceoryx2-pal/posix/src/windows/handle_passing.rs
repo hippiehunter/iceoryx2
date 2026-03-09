@@ -48,8 +48,8 @@ use core::hash::Hash;
 // Windows API imports
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, BOOL, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE,
-    ERROR_INVALID_PARAMETER, FALSE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+    FALSE, HANDLE,
 };
 
 #[cfg(windows)]
@@ -194,7 +194,7 @@ impl DuplicateOptions {
 
     /// Returns the flags to pass to `DuplicateHandle`.
     #[cfg(windows)]
-    fn to_flags(&self) -> u32 {
+    fn to_flags(self) -> u32 {
         let mut flags = 0;
         if self.same_access {
             flags |= DUPLICATE_SAME_ACCESS;
@@ -498,7 +498,9 @@ pub fn duplicate_handle_local(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use alloc::format;
 
     #[test]
     fn test_duplicate_options_same_access() {
@@ -556,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn test_error_traits() {
         // Test Clone
         let error = HandleDuplicationError::AccessDenied;
@@ -679,7 +682,9 @@ mod tests {
         #[test]
         fn test_duplicate_invalid_handle() {
             let options = DuplicateOptions::same_access();
-            let result = duplicate_handle_local(INVALID_HANDLE_VALUE, options);
+            // Use a null handle (0) which is always invalid for DuplicateHandle.
+            // INVALID_HANDLE_VALUE (-1) can behave as a pseudo-handle on Windows.
+            let result = duplicate_handle_local(0, options);
             assert!(result.is_err());
         }
 

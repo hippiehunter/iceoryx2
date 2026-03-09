@@ -408,12 +408,9 @@ impl<
                 "{} since the anonymous client data segment could not be created.", msg);
 
             if let Some(ctx) = service.additional_resource.as_client() {
-                let segment_size = sample_layout.size() * number_of_requests + sample_layout.align() - 1;
-                if let Err(e) = ctx.register_segment(
-                    client_id.value(),
-                    segment_size,
-                    &handle,
-                ) {
+                let segment_size =
+                    sample_layout.size() * number_of_requests + sample_layout.align() - 1;
+                if let Err(e) = ctx.register_segment(client_id.value(), segment_size, &handle) {
                     warn!(from origin,
                         "Failed to register client segment handle with IAM server: {:?}. \
                          Servers will not be able to open this segment via IAM.", e);

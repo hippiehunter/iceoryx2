@@ -299,13 +299,15 @@ impl TypeErasedSecuredContext {
         bucket_size: usize,
         bucket_align: usize,
     ) -> Result<(SegmentId, usize, Vec<PlatformHandle>), IamClientError> {
-        self.inner.add_segment(port_id, requested_size, bucket_size, bucket_align)
+        self.inner
+            .add_segment(port_id, requested_size, bucket_size, bucket_align)
     }
 
     /// Tries to receive a pending notification without blocking.
     pub fn try_receive_notification(
         &self,
-    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError> {
+    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError>
+    {
         self.inner.try_receive_notification()
     }
 }
@@ -423,7 +425,8 @@ impl<C: CalClient> SecuredServiceContext<C> {
         max_slice_len: usize,
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.client
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .attach_publisher(&self.service_id, history_size, max_slice_len)
     }
 
@@ -451,7 +454,8 @@ impl<C: CalClient> SecuredServiceContext<C> {
         buffer_size: usize,
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.client
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .attach_subscriber(&self.service_id, buffer_size)
     }
 
@@ -476,7 +480,8 @@ impl<C: CalClient> SecuredServiceContext<C> {
         max_active_requests: usize,
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.client
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .attach_server(&self.service_id, max_active_requests)
     }
 
@@ -501,7 +506,8 @@ impl<C: CalClient> SecuredServiceContext<C> {
         max_pending_responses: usize,
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.client
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .attach_client(&self.service_id, max_pending_responses)
     }
 
@@ -520,10 +526,12 @@ impl<C: CalClient> SecuredServiceContext<C> {
         segment_size: usize,
         handle: &PlatformHandle,
     ) -> Result<SegmentId, IamClientError> {
-        self.client
-            .lock()
-            .unwrap()
-            .register_segment(&self.service_id, port_id, segment_size, handle)
+        self.client.lock().unwrap().register_segment(
+            &self.service_id,
+            port_id,
+            segment_size,
+            handle,
+        )
     }
 
     /// Requests a segment handle for a sender port's data segment.
@@ -578,16 +586,20 @@ impl<C: CalClient> SecuredServiceContext<C> {
         bucket_size: usize,
         bucket_align: usize,
     ) -> Result<(SegmentId, usize, Vec<PlatformHandle>), IamClientError> {
-        self.client
-            .lock()
-            .unwrap()
-            .add_segment(&self.service_id, port_id, requested_size, bucket_size, bucket_align)
+        self.client.lock().unwrap().add_segment(
+            &self.service_id,
+            port_id,
+            requested_size,
+            bucket_size,
+            bucket_align,
+        )
     }
 
     /// Tries to receive a pending notification without blocking.
     pub fn try_receive_notification(
         &self,
-    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError> {
+    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError>
+    {
         self.client.lock().unwrap().try_receive_notification()
     }
 }
@@ -601,9 +613,7 @@ impl<C: CalClient> ServiceResource for SecuredServiceContext<C> {
 }
 
 // Implement ErasedSecuredContext for SecuredServiceContext to enable type erasure
-impl<C: CalClient + Send + 'static> ErasedSecuredContext
-    for SecuredServiceContext<C>
-{
+impl<C: CalClient + Send + 'static> ErasedSecuredContext for SecuredServiceContext<C> {
     fn attach_publisher(
         &self,
         history_size: usize,
@@ -672,7 +682,13 @@ impl<C: CalClient + Send + 'static> ErasedSecuredContext
         segment_size: usize,
         handle: &PlatformHandle,
     ) -> Result<u8, IamClientError> {
-        SecuredServiceContext::register_dynamic_segment(self, port_id, segment_index, segment_size, handle)
+        SecuredServiceContext::register_dynamic_segment(
+            self,
+            port_id,
+            segment_index,
+            segment_size,
+            handle,
+        )
     }
 
     fn request_dynamic_segment_handle(
@@ -695,7 +711,8 @@ impl<C: CalClient + Send + 'static> ErasedSecuredContext
 
     fn try_receive_notification(
         &self,
-    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError> {
+    ) -> Result<Option<(crate::iam::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError>
+    {
         SecuredServiceContext::try_receive_notification(self)
     }
 }

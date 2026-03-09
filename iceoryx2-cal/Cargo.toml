@@ -46,5 +46,8 @@ iceoryx2-bb-testing = { workspace = true }
 iceoryx2-bb-loggers = { workspace = true }
 generic-tests = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }

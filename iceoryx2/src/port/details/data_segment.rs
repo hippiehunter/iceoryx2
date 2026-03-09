@@ -81,7 +81,9 @@ pub enum DataSegmentAllocationError {
 impl From<ShmAllocationError> for DataSegmentAllocationError {
     fn from(e: ShmAllocationError) -> Self {
         match e {
-            ShmAllocationError::AllocationError(e) => DataSegmentAllocationError::AllocationError(e),
+            ShmAllocationError::AllocationError(e) => {
+                DataSegmentAllocationError::AllocationError(e)
+            }
             ShmAllocationError::ExceedsMaxSupportedAlignment => {
                 DataSegmentAllocationError::ExceedsMaxSupportedAlignment
             }
@@ -278,12 +280,10 @@ impl<Service: service::Service> DataSegment<Service> {
     ) -> Result<ShmPointer, DataSegmentAllocationError> {
         let msg = "Unable to allocate memory from the data segment";
         match &self.memory {
-            MemoryType::Static(memory) => {
-                memory.allocate(layout).map_err(|e| {
-                    iceoryx2_log::error!(from self, "{msg} caused by {:?}.", e);
-                    DataSegmentAllocationError::from(e)
-                })
-            }
+            MemoryType::Static(memory) => memory.allocate(layout).map_err(|e| {
+                iceoryx2_log::error!(from self, "{msg} caused by {:?}.", e);
+                DataSegmentAllocationError::from(e)
+            }),
             MemoryType::Dynamic(memory) => match memory.allocate(layout) {
                 Ok(ptr) => Ok(ptr),
                 Err(ResizableShmAllocationError::ShmAllocationError(e)) => {
@@ -412,8 +412,7 @@ impl<Service: service::Service> DataSegmentView<Service> {
 
         use iceoryx2_bb_container::semantic_string::SemanticString;
         // The name is for debug/identification only — the segment was created anonymously
-        let dummy_name = FileName::new(b"iam_handle_segment")
-            .expect("dummy name should be valid");
+        let dummy_name = FileName::new(b"iam_handle_segment").expect("dummy name should be valid");
 
         let segment_config = data_segment_config::<Service>(global_config);
 
@@ -486,14 +485,12 @@ impl<Service: service::Service> DataSegmentView<Service> {
         access: AccessRights,
     ) -> Result<(), SharedMemoryOpenError> {
         match &self.memory {
-            MemoryViewType::Dynamic(memory) => {
-                memory
-                    .add_segment_from_handle(segment_id, handle, access)
-                    .map_err(|e| {
-                        iceoryx2_log::error!("Failed to add segment from handle: {:?}", e);
-                        SharedMemoryOpenError::DoesNotExist
-                    })
-            }
+            MemoryViewType::Dynamic(memory) => memory
+                .add_segment_from_handle(segment_id, handle, access)
+                .map_err(|e| {
+                    iceoryx2_log::error!("Failed to add segment from handle: {:?}", e);
+                    SharedMemoryOpenError::DoesNotExist
+                }),
             MemoryViewType::Static(_) => {
                 // Static segments don't support adding segments
                 iceoryx2_log::error!(

@@ -95,14 +95,13 @@ use core::alloc::Layout;
 use core::fmt::Debug;
 use core::time::Duration;
 
-
 use crate::named_concept::*;
 use crate::security::HandleBasedOpenError;
+use crate::security::{AccessRights, PlatformHandle};
 use crate::shared_memory::{
     SegmentId, SharedMemory, SharedMemoryCreateError, SharedMemoryOpenError, ShmPointer,
 };
 use crate::shm_allocator::{PointerOffset, ShmAllocationError, ShmAllocator};
-use crate::security::{AccessRights, PlatformHandle};
 
 /// Defines all errors that can occur when calling [`ResizableSharedMemory::allocate()`]
 ///
@@ -175,7 +174,6 @@ impl From<HandleBasedOpenError> for ResizableSharedMemoryError {
         ResizableSharedMemoryError::OpenError(error)
     }
 }
-
 
 /// Creates a [`ResizableSharedMemoryView`] to an existing [`ResizableSharedMemory`] and maps the
 /// [`ResizableSharedMemory`] read-only into the process space.

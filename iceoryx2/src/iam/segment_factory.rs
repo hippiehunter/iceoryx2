@@ -173,9 +173,8 @@ impl<Service: service::Service> ServiceSegmentFactory<Service> {
         let mut counter = self.segment_counter.lock().unwrap();
         *counter += 1;
         let name = alloc::format!("iam_seg_{}", *counter);
-        FileName::new(name.as_bytes()).unwrap_or_else(|_| unsafe {
-            FileName::new_unchecked(b"iam_segment")
-        })
+        FileName::new(name.as_bytes())
+            .unwrap_or_else(|_| unsafe { FileName::new_unchecked(b"iam_segment") })
     }
 }
 
@@ -202,9 +201,8 @@ where
         let bucket_layout = Layout::from_size_align(bucket_size, bucket_align)
             .map_err(|_| IamServerError::InvalidConfiguration)?;
 
-        let allocator_config = iceoryx2_cal::shm_allocator::pool_allocator::Config {
-            bucket_layout,
-        };
+        let allocator_config =
+            iceoryx2_cal::shm_allocator::pool_allocator::Config { bucket_layout };
 
         // Generate a unique segment name
         let segment_name = self.generate_segment_name();

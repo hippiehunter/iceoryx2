@@ -20,8 +20,8 @@ pub mod used_chunk_list;
 use core::fmt::Debug;
 use core::time::Duration;
 
-pub use crate::shared_memory::PointerOffset;
 use crate::security::{AccessRights, HandleBasedOpenError, PlatformHandle};
+pub use crate::shared_memory::PointerOffset;
 pub use iceoryx2_bb_system_types::file_name::*;
 pub use iceoryx2_bb_system_types::path::Path;
 

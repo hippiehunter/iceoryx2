@@ -37,6 +37,8 @@ use windows_sys::Win32::{
     },
 };
 
+use alloc::vec;
+
 use super::settings::MAX_PATH_LENGTH;
 
 impl MemZeroedStruct for WIN32_FIND_DATAA {}

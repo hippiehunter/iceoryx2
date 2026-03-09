@@ -27,6 +27,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Memory::LocalFree;
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::posix::{mode_t, S_IRGRP, S_IROTH, S_IWGRP, S_IWOTH, S_IXGRP, S_IXOTH};
 use crate::posix::{types::*, S_IRUSR, S_IWUSR, S_IXUSR};
 

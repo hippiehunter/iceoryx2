@@ -115,7 +115,7 @@ impl ProcessCredentials {
         use iceoryx2_bb_posix::user::User;
 
         let process = Process::from_self();
-        let pid = process.id().value() as u32;
+        let pid = process.id().value();
 
         // Get uid and gid from user - fallback to 0 if unavailable
         let (uid, gid) = match User::from_self() {
@@ -143,7 +143,7 @@ impl ProcessCredentials {
         use iceoryx2_bb_posix::user::User;
 
         let process = Process::from_self();
-        let pid = process.id().value() as u32;
+        let pid = process.id().value();
 
         // Get uid and gid from user - fallback to 0 if unavailable
         let (uid, gid) = match User::from_self() {
@@ -172,7 +172,7 @@ impl ProcessCredentials {
         use iceoryx2_bb_posix::user::User;
 
         let process = Process::from_self();
-        let pid = process.id().value() as u32;
+        let pid = process.id().value();
 
         // Get uid and gid from user - fallback to 0 if unavailable
         let (uid, gid) = match User::from_self() {
@@ -194,7 +194,7 @@ impl ProcessCredentials {
         use iceoryx2_bb_posix::user::User;
 
         let process = Process::from_self();
-        let pid = process.id().value() as u32;
+        let pid = process.id().value();
 
         // Get uid and gid from user - fallback to 0 if unavailable
         let (uid, gid) = match User::from_self() {

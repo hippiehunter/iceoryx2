@@ -361,3 +361,15 @@ pub const _PC_REC_MIN_XFER_SIZE: int = 100019;
 pub const _PC_REC_XFER_ALIGN: int = 100020;
 pub const _PC_ALLOC_SIZE_MIN: int = 100021;
 pub const _PC_SYMLINK_MAX: int = 100022;
+
+// memfd_create flags (stubs - memfd not supported on Windows)
+pub const MFD_CLOEXEC: uint = 0x0001;
+pub const MFD_ALLOW_SEALING: uint = 0x0002;
+
+// fcntl seal commands and flags (stubs - sealing not supported on Windows)
+pub const F_ADD_SEALS: int = 1033;
+pub const F_GET_SEALS: int = 1034;
+pub const F_SEAL_SEAL: int = 0x0001;
+pub const F_SEAL_SHRINK: int = 0x0002;
+pub const F_SEAL_GROW: int = 0x0004;
+pub const F_SEAL_WRITE: int = 0x0008;

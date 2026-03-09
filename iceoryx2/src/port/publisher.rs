@@ -446,7 +446,8 @@ impl<
 
             // Register the handle with the IAM server
             if let Some(ctx) = service.additional_resource.as_client() {
-                let segment_size = sample_layout.size() * number_of_samples + sample_layout.align() - 1;
+                let segment_size =
+                    sample_layout.size() * number_of_samples + sample_layout.align() - 1;
                 if let Err(e) = ctx.register_segment(
                     publisher_details.publisher_id.value(),
                     segment_size,

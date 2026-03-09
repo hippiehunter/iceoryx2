@@ -274,6 +274,7 @@ use config_scheme::service_tag_config;
 use iceoryx2_bb_container::semantic_string::SemanticString;
 use iceoryx2_bb_elementary::CallbackProgression;
 use iceoryx2_cal::arc_sync_policy::ArcSyncPolicy;
+use iceoryx2_cal::control_channel::ControlChannel;
 use iceoryx2_cal::dynamic_storage::{
     DynamicStorage, DynamicStorageBuilder, DynamicStorageOpenError,
 };
@@ -289,15 +290,14 @@ use iceoryx2_cal::shared_memory::{SharedMemory, SharedMemoryForPoolAllocator};
 use iceoryx2_cal::shm_allocator::bump_allocator::BumpAllocator;
 use iceoryx2_cal::static_storage::*;
 use iceoryx2_cal::zero_copy_connection::ZeroCopyConnection;
-use iceoryx2_cal::control_channel::ControlChannel;
 use iceoryx2_log::{debug, fail, trace, warn};
 use service_id::ServiceId;
 
 use self::dynamic_config::DeregisterNodeState;
-use self::secured_context::TypeErasedSecuredContext;
-use crate::iam::server::TypeErasedIamServer;
 use self::messaging_pattern::MessagingPattern;
+use self::secured_context::TypeErasedSecuredContext;
 use self::service_name::ServiceName;
+use crate::iam::server::TypeErasedIamServer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Error that can be reported when removing a [`Node`](crate::node::Node).

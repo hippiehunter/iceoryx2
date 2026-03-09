@@ -43,6 +43,9 @@ use windows_sys::Win32::{
     System::{Memory::*, IO::OVERLAPPED},
 };
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use super::win32_handle_translator::{FdHandleEntry, FileHandle, HandleTranslator, ShmHandle};
 
 struct FileMappingsSet {
@@ -371,7 +374,11 @@ pub(crate) unsafe fn shm_set_size(fd_handle: HANDLE, shm_size: u64) {
     }
 
     if shm_size > MAX_SUPPORTED_SHM_SIZE {
-        eprintln!("Trying to allocate {shm_size} which is larger than the maximum supported shared memory size of {MAX_SUPPORTED_SHM_SIZE}");
+        #[cfg(feature = "std")]
+        {
+            extern crate std;
+            std::eprintln!("Trying to allocate {shm_size} which is larger than the maximum supported shared memory size of {MAX_SUPPORTED_SHM_SIZE}");
+        }
     }
 
     let mut bytes_written = 0;
@@ -690,7 +697,9 @@ pub fn create_anonymous_mapping(
 
 #[cfg(test)]
 mod anonymous_mapping_tests {
+    extern crate std;
     use super::*;
+    use alloc::format;
 
     #[test]
     fn test_anonymous_mapping_error_display() {
@@ -717,6 +726,7 @@ mod anonymous_mapping_tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn test_anonymous_mapping_error_traits() {
         // Test Clone
         let error = AnonymousMappingError::InvalidSize;

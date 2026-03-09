@@ -57,6 +57,8 @@
 //! ```
 
 pub mod recommended;
+
+#[cfg(unix)]
 pub mod unix_stream;
 
 #[cfg(windows)]

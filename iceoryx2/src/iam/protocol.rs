@@ -899,7 +899,9 @@ mod tests {
         let serialized = postcard::to_allocvec(&response).unwrap();
         let deserialized: IamResponse = postcard::from_bytes(&serialized).unwrap();
         match deserialized {
-            IamResponse::CreateServiceOk { service_id: deser_id } => {
+            IamResponse::CreateServiceOk {
+                service_id: deser_id,
+            } => {
                 assert_eq!(deser_id, service_id);
             }
             _ => panic!("Expected CreateServiceOk response"),

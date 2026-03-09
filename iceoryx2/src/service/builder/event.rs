@@ -32,14 +32,16 @@ use crate::service::static_config::messaging_pattern::MessagingPattern;
 use crate::service::*;
 use crate::service::{self, dynamic_config::event::DynamicConfigSettings};
 
-use iceoryx2_cal::control_channel::{ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder};
+use iceoryx2_cal::control_channel::{
+    ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder,
+};
 use iceoryx2_cal::named_concept::NamedConceptBuilder;
 
 use iceoryx2_bb_container::semantic_string::SemanticString;
 
 use crate::iam::audit::FileAuditLogger;
 use crate::iam::client::IamClient;
-use crate::iam::configured_policy::{PolicyDispatch, PolicyLoader};
+use crate::iam::configured_policy::{PolicyDispatch, PolicyLoadError, PolicyLoader};
 use crate::iam::server::{IamServer, TypeErasedIamServer};
 use crate::iam::DefaultPolicy;
 use crate::service::secured_context::{SecuredServiceContext, TypeErasedSecuredContext};
@@ -167,8 +169,9 @@ impl core::error::Error for EventCreateError {}
 impl From<ServiceState> for EventCreateError {
     fn from(value: ServiceState) -> Self {
         match value {
-            ServiceState::IncompatibleMessagingPattern
-            | ServiceState::IncompatibleSecurityMode => EventCreateError::AlreadyExists,
+            ServiceState::IncompatibleMessagingPattern | ServiceState::IncompatibleSecurityMode => {
+                EventCreateError::AlreadyExists
+            }
             ServiceState::InsufficientPermissions => EventCreateError::InsufficientPermissions,
             ServiceState::HangsInCreation => EventCreateError::HangsInCreation,
             ServiceState::Corrupted => EventCreateError::ServiceInCorruptedState,
@@ -490,12 +493,28 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
                     }
 
                     // Set up IAM client if secured mode is enabled
-                    let security_resource = if self.base.shared_node.config().global.node.security.mode
+                    let security_resource = if self
+                        .base
+                        .shared_node
+                        .config()
+                        .global
+                        .node
+                        .security
+                        .mode
                         == SecurityMode::Secured
                     {
                         // Get IAM endpoint name for this service
-                        let endpoint_base = &self.base.shared_node.config().global.node.security.iam.endpoint_base;
-                        let endpoint_name = iam_endpoint_name(&static_config.service_id(), endpoint_base);
+                        let endpoint_base = &self
+                            .base
+                            .shared_node
+                            .config()
+                            .global
+                            .node
+                            .security
+                            .iam
+                            .endpoint_base;
+                        let endpoint_name =
+                            iam_endpoint_name(&static_config.service_id(), endpoint_base);
 
                         // Connect to the IAM server
                         let client = <<ServiceType as Service>::ControlChannel as ControlChannel>::ClientBuilder::new(&endpoint_name)
@@ -508,14 +527,16 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
                         // Create IAM client and perform handshake
                         let mut iam_client = IamClient::new(client);
                         let node_id = self.base.shared_node.id().unique_system_id();
-                        iam_client.handshake(node_id)
-                            .map_err(|e| {
-                                iceoryx2_log::error!("IAM handshake failed: {:?}", e);
-                                EventOpenError::IamHandshakeFailed
-                            })?;
+                        iam_client.handshake(node_id).map_err(|e| {
+                            iceoryx2_log::error!("IAM handshake failed: {:?}", e);
+                            EventOpenError::IamHandshakeFailed
+                        })?;
 
                         // Wrap in SecuredServiceContext and type-erased container
-                        let ctx = SecuredServiceContext::new(iam_client, static_config.service_id().clone());
+                        let ctx = SecuredServiceContext::new(
+                            iam_client,
+                            static_config.service_id().clone(),
+                        );
                         SecurityResource::SecuredClient(TypeErasedSecuredContext::new(ctx))
                     } else {
                         SecurityResource::None
@@ -644,8 +665,17 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
                     == SecurityMode::Secured
                 {
                     // Get IAM endpoint name for this service
-                    let endpoint_base = &self.base.shared_node.config().global.node.security.iam.endpoint_base;
-                    let endpoint_name = iam_endpoint_name(&self.base.service_config.service_id(), endpoint_base);
+                    let endpoint_base = &self
+                        .base
+                        .shared_node
+                        .config()
+                        .global
+                        .node
+                        .security
+                        .iam
+                        .endpoint_base;
+                    let endpoint_name =
+                        iam_endpoint_name(&self.base.service_config.service_id(), endpoint_base);
 
                     // Create the control channel listener for IAM
                     let listener = <<ServiceType as Service>::ControlChannel as ControlChannel>::ListenerBuilder::new(&endpoint_name)
@@ -658,20 +688,32 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
                     // Load policy for this service (falls back to DefaultPolicy)
                     let iam_config = &self.base.shared_node.config().global.node.security.iam;
                     let service_name_str = self.base.service_config.name().to_string();
-                    let policy_dir_str = core::str::from_utf8(iam_config.policy_dir.as_bytes()).unwrap_or("iam/policies");
-                    let policy = match PolicyLoader::load_for_service(std::path::Path::new(policy_dir_str), self.base.service_config.name()) {
-                        Some(configured) => PolicyDispatch::Configured(configured),
-                        None => PolicyDispatch::Default(DefaultPolicy::new()),
+                    let policy_dir_str = core::str::from_utf8(iam_config.policy_dir.as_bytes())
+                        .unwrap_or("iam/policies");
+                    let policy = match PolicyLoader::load_for_service(
+                        std::path::Path::new(policy_dir_str),
+                        self.base.service_config.name(),
+                    ) {
+                        Ok(configured) => PolicyDispatch::Configured(configured),
+                        Err(PolicyLoadError::NotFound) => {
+                            PolicyDispatch::Default(DefaultPolicy::new())
+                        }
+                        Err(e) => {
+                            iceoryx2_log::warn!("Failed to load IAM policy: {}", e);
+                            PolicyDispatch::Default(DefaultPolicy::new())
+                        }
                     };
 
                     // Create audit logger (best-effort - continues without if file cannot be opened)
-                    let audit_path_str = core::str::from_utf8(iam_config.audit_log_path.as_bytes()).unwrap_or("iam/audit.log");
+                    let audit_path_str = core::str::from_utf8(iam_config.audit_log_path.as_bytes())
+                        .unwrap_or("iam/audit.log");
                     let audit_logger: Option<Box<dyn crate::iam::audit::AuditLogger>> =
                         FileAuditLogger::new(std::path::Path::new(audit_path_str))
                             .ok()
                             .map(|l| Box::new(l) as _);
 
-                    let server = IamServer::new_with_audit(listener, policy, service_name_str, audit_logger);
+                    let server =
+                        IamServer::new_with_audit(listener, policy, service_name_str, audit_logger);
 
                     // Wrap in type-erased container
                     SecurityResource::SecuredServer(TypeErasedIamServer::new(server))

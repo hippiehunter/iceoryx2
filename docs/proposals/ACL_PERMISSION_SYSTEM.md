@@ -2,8 +2,9 @@
 
 ## Status
 
-Draft. Design in progress; no implementation yet. This document tracks ongoing
-decisions and organizes implementation into sub-projects.
+Implemented. All sub-projects (SP1-SP7) have been implemented. See the
+`iceoryx2/src/iam/` module for the IAM core and `iceoryx2-cal/src/security/`
+for the CAL-layer security primitives.
 
 ## Summary
 
@@ -18,45 +19,46 @@ data plane for bulk data transfer.
 
 ## Decisions So Far
 
-- Same-UID/SID clients must not be able to read each other's data.
-- Metadata visibility is acceptable; data-plane access must be protected.
-- Secured services are required to use IAM; no fallback path.
-- IAM is per secured service.
-- Dynamic/resizable shared memory segments must be supported from day one.
-- Resource cleanup is performed by the server/manager, not by clients.
-- Security mode is configured at Node level, enforced at Service level.
-- Handle-passing model is essentially capability-based (aligned with seL4/Capsicum patterns).
+* Same-UID/SID clients must not be able to read each other's data.
+* Metadata visibility is acceptable; data-plane access must be protected.
+* Secured services are required to use IAM; no fallback path.
+* IAM is per secured service.
+* Dynamic/resizable shared memory segments must be supported from day one.
+* Resource cleanup is performed by the server/manager, not by clients.
+* Security mode is configured at Node level, enforced at Service level.
+* Handle-passing model is essentially capability-based
+  (aligned with seL4/Capsicum patterns).
 
 ## Goals
 
-- Prevent client A from snooping on client B even when both share the same
+* Prevent client A from snooping on client B even when both share the same
   user/SID.
-- Support Linux and Windows.
-- Keep zero-copy data paths; avoid copy-based gateways.
-- Allow dynamic segment growth in secured mode.
-- Plan for runtime IAM from the start.
+* Support Linux and Windows.
+* Keep zero-copy data paths; avoid copy-based gateways.
+* Allow dynamic segment growth in secured mode.
+* Plan for runtime IAM from the start.
 
 ## Non-goals
 
-- MAC frameworks (SELinux/AppArmor) integration.
-- Cross-host security; tunnels/gateways are out of scope.
-- Per-message encryption (local shared memory is trusted once authenticated).
+* MAC frameworks (SELinux/AppArmor) integration.
+* Cross-host security; tunnels/gateways are out of scope.
+* Per-message encryption (local shared memory is trusted once authenticated).
 
 ## Current Baseline
 
-- Owner-only permissions by default; optional `dev_permissions` enables
+* Owner-only permissions by default; optional `dev_permissions` enables
   world access.
-- Resource names are derived from public IDs.
-- Port creation and attachment are decentralized (no authorization hook).
+* Resource names are derived from public IDs.
+* Port creation and attachment are decentralized (no authorization hook).
 
 ---
 
-# Part I: Design Overview
+## Part I: Design Overview
 
 ## Security Modes
 
-- `Public`: existing behavior, name-based open.
-- `Secured`: IAM required for create/open/attach; no direct open-by-name for
+* `Public`: existing behavior, name-based open.
+* `Secured`: IAM required for create/open/attach; no direct open-by-name for
   data-plane resources.
 
 Services inherit security mode from their Node's configuration. A Node in
@@ -68,19 +70,19 @@ confused deputy attacks.
 Each secured service has a dedicated IAM endpoint (per-service control plane).
 IAM responsibilities:
 
-- Authenticate clients using OS-verified credentials (kernel-mediated).
-- Authorize create and attach requests based on policy.
-- Create or broker data-plane resources and pass handles.
-- Own and clean up resources.
-- Notify clients of dynamic segment updates.
+* Authenticate clients using OS-verified credentials (kernel-mediated).
+* Authorize create and attach requests based on policy.
+* Create or broker data-plane resources and pass handles.
+* Own and clean up resources.
+* Notify clients of dynamic segment updates.
 
 ## Control Channel (OS IPC)
 
 Shared memory alone cannot authenticate peers or transfer OS handles. A minimal
 control channel is required:
 
-- **Linux**: Unix domain socket (stream) with `SCM_CREDENTIALS` and `SCM_RIGHTS`.
-- **Windows**: Named pipe with `ImpersonateNamedPipeClient` + `DuplicateHandle`.
+* **Linux**: Unix domain socket (stream) with `SCM_CREDENTIALS` and `SCM_RIGHTS`.
+* **Windows**: Named pipe with `ImpersonateNamedPipeClient` + `DuplicateHandle`.
 
 The control channel is used only for authentication and handle passing. Bulk
 data stays in shared memory.
@@ -90,7 +92,7 @@ data stays in shared memory.
 ### Threats Mitigated
 
 | Threat | Mitigation |
-|--------|------------|
+| -------- | ------------ |
 | Same-UID process snooping | Handle-passing; no name-based segment access |
 | Identity spoofing | Kernel-verified credentials (SCM_CREDENTIALS / named pipe impersonation) |
 | Unauthorized attachment | IAM policy gate at Attach* operations |
@@ -100,7 +102,7 @@ data stays in shared memory.
 ### Threats NOT Mitigated (Accepted Risks)
 
 | Threat | Notes |
-|--------|-------|
+| -------- | ------- |
 | Root/CAP_SYS_ADMIN attacks | Privileged processes can bypass any user-space security |
 | Handle re-sharing via fork()/dup() | FDs can be passed to child processes; accepted architecturally |
 | `/proc/<pid>/fd` access | Same-UID attacker can steal FDs; mitigate with `PR_SET_DUMPABLE` |
@@ -109,9 +111,12 @@ data stays in shared memory.
 
 ### Critical Security Requirements
 
-1. **`dev_permissions` feature must be disabled** in secured mode (compile-time or runtime gate)
-2. **Use `pidfd_open()`** on Linux 5.3+ to prevent PID reuse attacks
-3. **Anonymous segments** (`memfd_create` / unnamed `CreateFileMapping`) for data-plane resources
+1. **`dev_permissions` feature must be disabled** in secured mode
+   (compile-time or runtime gate)
+2. **Use `pidfd_open()`** on Linux 5.3+ to prevent
+   PID reuse attacks
+3. **Anonymous segments** (`memfd_create` / unnamed
+   `CreateFileMapping`) for data-plane resources
 
 ## ACL Scope
 
@@ -124,50 +129,51 @@ and handle passing.
 All data-plane objects that could leak data must be opened by handle, not by
 name:
 
-- Shared memory segments (static and dynamic)
-- Zero-copy connections
-- Event channels (if applicable)
-- Blackboard segments
+* Shared memory segments (static and dynamic)
+* Zero-copy connections
+* Event channels (if applicable)
+* Blackboard segments
 
 Named resources may still exist for metadata and discovery but must not be
 sufficient to access data. Data-plane resources should use:
-- Linux: `memfd_create()` for anonymous segments
-- Windows: `CreateFileMapping()` with `lpName=NULL`
+
+* Linux: `memfd_create()` for anonymous segments
+* Windows: `CreateFileMapping()` with `lpName=NULL`
 
 ## Dynamic Segment Support
 
 Dynamic segments are required in secured mode:
 
-- IAM (or the server under IAM policy) creates new segments during resize.
-- IAM notifies authorized clients and passes new handles.
-- Clients register new segment IDs in their local view.
-- Old segments remain valid until all authorized clients have acknowledged; IAM
+* IAM (or the server under IAM policy) creates new segments during resize.
+* IAM notifies authorized clients and passes new handles.
+* Clients register new segment IDs in their local view.
+* Old segments remain valid until all authorized clients have acknowledged; IAM
   decides when to release them.
 
 ## Resource Ownership and Cleanup
 
-- IAM/server owns all data-plane resources and deletes them.
-- Clients never receive delete permission.
-- IAM tracks active attachments and cleans stale resources.
-- **Service creator hosts IAM**: The process that creates a secured service also
+* IAM/server owns all data-plane resources and deletes them.
+* Clients never receive delete permission.
+* IAM tracks active attachments and cleans stale resources.
+* **Service creator hosts IAM**: The process that creates a secured service also
   hosts its IAM endpoint. If that process dies, the service and IAM die together.
-- **No orphan recovery**: Clients detect service death via existing mechanisms
+* **No orphan recovery**: Clients detect service death via existing mechanisms
   (connection close, monitoring) and must reconnect to a newly created service.
   There is no attempt to recover client state across IAM restarts.
 
 ## Metadata Visibility
 
-- Service and port metadata may remain readable.
-- Metadata must never contain secrets or handles required to access data.
+* Service and port metadata may remain readable.
+* Metadata must never contain secrets or handles required to access data.
 
 ---
 
-# Part II: Sub-Project Organization
+## Part II: Sub-Project Organization
 
 This implementation is organized into **7 sub-projects** that can be developed
 with some parallelism. Dependencies are noted.
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                        SP1: Core Security Infrastructure                     │
 │                    (PlatformHandle, HandleBundle, traits)                    │
@@ -316,13 +322,13 @@ pub struct ProcessCredentials {
 
 ### Dependencies
 
-- None (foundation layer)
+* None (foundation layer)
 
 ### Estimated Scope
 
-- ~500-800 lines of Rust
-- Platform-specific conditional compilation
-- Unit tests for handle operations
+* ~500-800 lines of Rust
+* Platform-specific conditional compilation
+* Unit tests for handle operations
 
 ---
 
@@ -433,13 +439,13 @@ impl ControlChannel for UnixStreamControlChannel {
 
 ### Dependencies
 
-- SP1 (PlatformHandle, traits)
+* SP1 (PlatformHandle, traits)
 
 ### Estimated Scope
 
-- ~1500-2000 lines of Rust
-- Extension of existing socket_ancillary.rs patterns
-- Integration tests with FD passing
+* ~1500-2000 lines of Rust
+* Extension of existing socket_ancillary.rs patterns
+* Integration tests with FD passing
 
 ---
 
@@ -557,13 +563,13 @@ impl ControlChannel for NamedPipeControlChannel {
 
 ### Dependencies
 
-- SP1 (PlatformHandle, traits)
+* SP1 (PlatformHandle, traits)
 
 ### Estimated Scope
 
-- ~2000-2500 lines of Rust
-- New Windows-specific code (named pipes not currently in codebase)
-- Win32 API integration via windows-sys
+* ~2000-2500 lines of Rust
+* New Windows-specific code (named pipes not currently in codebase)
+* Win32 API integration via windows-sys
 
 ---
 
@@ -656,14 +662,14 @@ impl SharedMemoryBuilder for PosixSharedMemoryBuilder {
 
 ### Dependencies
 
-- SP1 (PlatformHandle, HandleBasedConcept trait)
-- SP2 or SP3 (for anonymous memory creation functions)
+* SP1 (PlatformHandle, HandleBasedConcept trait)
+* SP2 or SP3 (for anonymous memory creation functions)
 
 ### Estimated Scope
 
-- ~1000-1500 lines of Rust
-- Modifications to existing CAL modules
-- Conformance tests for handle-based operations
+* ~1000-1500 lines of Rust
+* Modifications to existing CAL modules
+* Conformance tests for handle-based operations
 
 ---
 
@@ -940,15 +946,15 @@ pub struct ConfiguredPolicy {
 
 ### Dependencies
 
-- SP1 (PlatformHandle, SecurityMode)
-- SP2 or SP3 (ControlChannel trait implementation)
-- SP4 (HandleBasedConcept for segment creation)
+* SP1 (PlatformHandle, SecurityMode)
+* SP2 or SP3 (ControlChannel trait implementation)
+* SP4 (HandleBasedConcept for segment creation)
 
 ### Estimated Scope
 
-- ~3000-4000 lines of Rust
-- Core IAM logic
-- Extensive integration tests
+* ~3000-4000 lines of Rust
+* Core IAM logic
+* Extensive integration tests
 
 ---
 
@@ -1002,6 +1008,7 @@ pub struct IamConfig {
 ```
 
 **TOML Example:**
+
 ```toml
 [global.node.security]
 mode = "secured"
@@ -1112,14 +1119,14 @@ impl<...> Publisher<...> {
 
 ### Dependencies
 
-- SP5 (IAM client library)
-- SP4 (Handle-based resource opening)
+* SP5 (IAM client library)
+* SP4 (Handle-based resource opening)
 
 ### Estimated Scope
 
-- ~1500-2000 lines of Rust
-- Modifications to existing builders
-- Configuration parsing/validation
+* ~1500-2000 lines of Rust
+* Modifications to existing builders
+* Configuration parsing/validation
 
 ---
 
@@ -1230,21 +1237,21 @@ pub struct SyslogAuditLogger { /* ... */ }
 
 ### Dependencies
 
-- SP5 (IamPolicy trait)
+* SP5 (IamPolicy trait)
 
 ### Estimated Scope
 
-- ~1000-1500 lines of Rust
-- TOML parsing for policies
-- Audit log format and rotation
+* ~1000-1500 lines of Rust
+* TOML parsing for policies
+* Audit log format and rotation
 
 ---
 
-# Part III: Attach-Flow Details
+## Part III: Attach-Flow Details
 
 ## Publish/Subscribe (1 publisher, N subscribers)
 
-```
+```text
 ┌───────────┐          ┌───────────┐          ┌───────────┐
 │ Publisher │          │    IAM    │          │Subscriber │
 └─────┬─────┘          └─────┬─────┘          └─────┬─────┘
@@ -1287,7 +1294,7 @@ pub struct SyslogAuditLogger { /* ... */ }
 
 ## Dynamic Segment Update
 
-```
+```text
 ┌───────────┐          ┌───────────┐          ┌───────────┐
 │ Publisher │          │    IAM    │          │Subscriber │
 └─────┬─────┘          └─────┬─────┘          └─────┬─────┘
@@ -1314,7 +1321,7 @@ pub struct SyslogAuditLogger { /* ... */ }
 
 ---
 
-# Part IV: Configuration Reference
+## Part IV: Configuration Reference
 
 ## Node Configuration (iceoryx2.toml)
 
@@ -1345,7 +1352,8 @@ max-retries = 3
 ## Policy Configuration
 
 Policies are stored in a directory structure:
-```
+
+```text
 /etc/iceoryx2/policies/
 ├── default.toml           # Default policy for unspecified services
 ├── my-service.toml        # Policy for "my-service"
@@ -1354,12 +1362,12 @@ Policies are stored in a directory structure:
 
 ---
 
-# Part V: Open Questions
+## Part V: Open Questions
 
 ## Resolved
 
 | Question | Resolution |
-|----------|------------|
+| ---------- | ------------ |
 | Windows control channel choice | Named Pipes (preferred over AF_UNIX due to native credential support) |
 | Security mode scope | Node-level configuration, Service-level enforcement |
 | Handle re-sharing risk | Accepted; focus on authorization at grant time |
@@ -1372,23 +1380,23 @@ Policies are stored in a directory structure:
 ## Still Open
 
 | Question | Options | Notes |
-|----------|---------|-------|
+| ---------- | --------- | ------- |
 | Policy hot-reload | Supported vs restart required | Nice-to-have; defer to later phase |
 | Discovery in secured mode | Show all vs filter by authorization | TBD based on use cases |
 | Event pattern security | Full IAM vs lightweight auth | Events don't carry data; may simplify |
 
 ---
 
-# Part VI: Implementation Phases
+## Part VI: Implementation Phases
 
 ## Phase 1: Foundation (SP1 + SP4 partial)
 
 **Goal**: Establish core types and handle-based resource access without IAM.
 
-- PlatformHandle, HandleBundle, AccessRights types
-- SecurityMode enum
-- `open_from_handle()` on SharedMemory (Linux only)
-- Unit tests
+* PlatformHandle, HandleBundle, AccessRights types
+* SecurityMode enum
+* `open_from_handle()` on SharedMemory (Linux only)
+* Unit tests
 
 **No behavioral change** to existing code.
 
@@ -1396,10 +1404,10 @@ Policies are stored in a directory structure:
 
 **Goal**: Working credential and handle passing on Linux.
 
-- Unix stream socket with SO_PEERCRED
-- SCM_RIGHTS handle passing
-- memfd_create for anonymous segments
-- Control channel trait
+* Unix stream socket with SO_PEERCRED
+* SCM_RIGHTS handle passing
+* memfd_create for anonymous segments
+* Control channel trait
 
 **No behavioral change** to existing code.
 
@@ -1407,10 +1415,10 @@ Policies are stored in a directory structure:
 
 **Goal**: Basic IAM server/client with authentication.
 
-- Protocol definition
-- IAM server skeleton
-- IAM client library
-- DefaultPolicy (allow all same-UID)
+* Protocol definition
+* IAM server skeleton
+* IAM client library
+* DefaultPolicy (allow all same-UID)
 
 **Testable** in isolation.
 
@@ -1418,10 +1426,10 @@ Policies are stored in a directory structure:
 
 **Goal**: Secured services work end-to-end on Linux.
 
-- Config extension
-- Service builder hooks
-- Publisher/Subscriber secured paths
-- Integration tests
+* Config extension
+* Service builder hooks
+* Publisher/Subscriber secured paths
+* Integration tests
 
 **Secured mode functional** on Linux.
 
@@ -1429,10 +1437,10 @@ Policies are stored in a directory structure:
 
 **Goal**: Full Windows parity.
 
-- Named pipe server/client
-- Handle duplication
-- Anonymous sections
-- Control channel implementation
+* Named pipe server/client
+* Handle duplication
+* Anonymous sections
+* Control channel implementation
 
 **Cross-platform** secured services.
 
@@ -1440,42 +1448,42 @@ Policies are stored in a directory structure:
 
 **Goal**: Production readiness.
 
-- All messaging patterns secured
-- Policy file system
-- Audit logging
-- Performance optimization
-- Documentation
+* All messaging patterns secured
+* Policy file system
+* Audit logging
+* Performance optimization
+* Documentation
 
 ---
 
-# Part VII: References
+## Part VII: References
 
-- POSIX: `SCM_CREDENTIALS`, `SCM_RIGHTS`, `memfd_create(2)`, `pidfd_open(2)`
-- Windows: `DuplicateHandle`, `CreateNamedPipe`, `ImpersonateNamedPipeClient`
-- Android Binder: Kernel-verified credentials + handle passing model
-- D-Bus: Policy-based authorization separation
-- seL4/Capsicum: Capability-based security patterns
-- iceoryx v1: RouDi + group-based access control
+* POSIX: `SCM_CREDENTIALS`, `SCM_RIGHTS`, `memfd_create(2)`, `pidfd_open(2)`
+* Windows: `DuplicateHandle`, `CreateNamedPipe`, `ImpersonateNamedPipeClient`
+* Android Binder: Kernel-verified credentials + handle passing model
+* D-Bus: Policy-based authorization separation
+* seL4/Capsicum: Capability-based security patterns
+* iceoryx v1: RouDi + group-based access control
 
 ---
 
-# Appendix A: Security Checklist
+## Appendix A: Security Checklist
 
 Before declaring secured mode production-ready:
 
-- [ ] `dev_permissions` feature disabled or gated
-- [ ] Anonymous segments used for all data-plane resources
-- [ ] PID stability via pidfd or starttime verification
-- [ ] `/proc/<pid>/fd` risk documented; optional `PR_SET_DUMPABLE` mitigation
-- [ ] Handle re-sharing risk documented
-- [ ] Policy denial logging enabled
-- [ ] Windows credential verification validated
-- [ ] Cross-namespace behavior documented
+* [ ] `dev_permissions` feature disabled or gated
+* [ ] Anonymous segments used for all data-plane resources
+* [ ] PID stability via pidfd or starttime verification
+* [ ] `/proc/<pid>/fd` risk documented; optional `PR_SET_DUMPABLE` mitigation
+* [ ] Handle re-sharing risk documented
+* [ ] Policy denial logging enabled
+* [ ] Windows credential verification validated
+* [ ] Cross-namespace behavior documented
 
-# Appendix B: Performance Expectations
+## Appendix B: Performance Expectations
 
 | Operation | Public Mode | Secured Mode | Notes |
-|-----------|-------------|--------------|-------|
+| ----------- | ------------- | -------------- | ------- |
 | Connection setup | ~10µs | ~30µs | One-time per port |
 | Per-message send | ~500ns | ~500ns | Zero impact |
 | Per-message receive | ~500ns | ~500ns | Zero impact |

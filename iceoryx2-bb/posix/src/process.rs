@@ -500,8 +500,7 @@ impl PidFd {
 
         // Split by whitespace and get field index 19 (0-indexed from after comm)
         // Field 3 is index 0 after splitting, so starttime (field 22) is index 19
-        let mut field_count = 0;
-        for field in fields_str.split_whitespace() {
+        for (field_count, field) in fields_str.split_whitespace().enumerate() {
             if field_count == 19 {
                 // This is starttime
                 match field.parse::<u64>() {
@@ -512,7 +511,6 @@ impl PidFd {
                     }
                 }
             }
-            field_count += 1;
         }
 
         fail!(from "PidFd::read_start_time", with PidFdCreationError::FailedToReadStartTime,

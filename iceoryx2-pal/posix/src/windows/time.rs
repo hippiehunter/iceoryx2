@@ -14,6 +14,8 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(unused_variables)]
 
+extern crate std;
+
 use core::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 

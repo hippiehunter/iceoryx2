@@ -58,8 +58,7 @@ mod integration_tests {
     use crate::iam::client::IamClient;
     use crate::iam::policy::{DefaultPolicy, IamPolicy, PolicyDecision, ResourceLimits};
     use crate::iam::protocol::{
-        DenialReason, IamRequest, IamResponse, MessagingPatternKind, PortType,
-        ProtocolVersion,
+        DenialReason, IamRequest, IamResponse, MessagingPatternKind, PortType, ProtocolVersion,
     };
     use crate::iam::server::IamServer;
     use crate::service::messaging_pattern::MessagingPattern;
@@ -159,10 +158,7 @@ mod integration_tests {
             Ok(self.credentials.clone())
         }
 
-        fn send_handles(
-            &self,
-            handles: &[&PlatformHandle],
-        ) -> Result<(), ControlChannelSendError> {
+        fn send_handles(&self, handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError> {
             let mut handle_count = self.shared.handle_count.lock().unwrap();
             *handle_count += handles.len();
             Ok(())
@@ -203,7 +199,11 @@ mod integration_tests {
 
         fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError> {
             // Server sends responses
-            self.shared.responses.lock().unwrap().push_back(data.to_vec());
+            self.shared
+                .responses
+                .lock()
+                .unwrap()
+                .push_back(data.to_vec());
             Ok(())
         }
 
@@ -328,7 +328,11 @@ mod integration_tests {
 
         fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError> {
             // Client sends requests
-            self.shared.requests.lock().unwrap().push_back(data.to_vec());
+            self.shared
+                .requests
+                .lock()
+                .unwrap()
+                .push_back(data.to_vec());
             Ok(())
         }
 
@@ -382,10 +386,7 @@ mod integration_tests {
         }
 
         /// Creates a new channel pair and queues the server side for acceptance.
-        fn create_channel_pair(
-            &self,
-            credentials: ProcessCredentials,
-        ) -> MockClientChannel {
+        fn create_channel_pair(&self, credentials: ProcessCredentials) -> MockClientChannel {
             let shared = Arc::new(SharedBytes::new());
             let client_channel = MockClientChannel::new(Arc::clone(&shared));
 
@@ -462,7 +463,6 @@ mod integration_tests {
         let service_name = ServiceName::new(name).unwrap();
         ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe)
     }
-
 
     // ========================================================================
     // Handshake Tests
@@ -580,7 +580,10 @@ mod integration_tests {
             IamResponse::Denied { reason, .. } => {
                 assert_eq!(*reason, DenialReason::Unauthorized);
             }
-            _ => panic!("Expected Denied response for unauthorized UID, got {:?}", responses[0]),
+            _ => panic!(
+                "Expected Denied response for unauthorized UID, got {:?}",
+                responses[0]
+            ),
         }
     }
 
@@ -800,7 +803,10 @@ mod integration_tests {
         shared.clear_responses();
 
         // Now detach
-        shared.push_request(&IamRequest::Detach { service_id, port_id });
+        shared.push_request(&IamRequest::Detach {
+            service_id,
+            port_id,
+        });
 
         server.process().unwrap();
 
@@ -901,11 +907,11 @@ mod integration_tests {
     fn test_integration_resource_limit_exceeded() {
         // Create a policy with very low limits
         let limits = ResourceLimits::new(
-            1, // max_publishers = 1
-            1, // max_subscribers
-            1, // max_servers
-            1, // max_clients
-            1, // max_segments
+            1,    // max_publishers = 1
+            1,    // max_subscribers
+            1,    // max_servers
+            1,    // max_clients
+            1,    // max_segments
             1024, // max_segment_size
         );
         let policy = DefaultPolicy::with_limits(1000, limits);

@@ -35,6 +35,7 @@ MODE="check"
 CHECK_ALL=true
 REPO_ROOT=$(get_repo_root)
 MARKDOWNLINT_CONFIG="$REPO_ROOT/.markdownlint.yaml"
+MARKDOWNLINT_IGNORE="$REPO_ROOT/.markdownlintignore"
 
 # Check required tools are installed
 if ! command -v markdownlint &>/dev/null; then
@@ -82,12 +83,12 @@ print_file_list "$MODE" "$md_files"
 # Execute
 if [ "$MODE" = "fix" ]; then
     echo "\nRunning markdownlint to fix other issues..."
-    echo "$md_files" | xargs markdownlint -c "$MARKDOWNLINT_CONFIG" --fix
+    echo "$md_files" | xargs markdownlint -c "$MARKDOWNLINT_CONFIG" -p "$MARKDOWNLINT_IGNORE" --fix
 
     echo "\nMarkdown lint and format fix completed. Please review the changes."
     echo "NOTE: Not all violations may be automatically fixable."
 else
     echo "\nRunning markdownlint to check for issues..."
-    echo "$md_files" | xargs markdownlint -c "$MARKDOWNLINT_CONFIG"
+    echo "$md_files" | xargs markdownlint -c "$MARKDOWNLINT_CONFIG" -p "$MARKDOWNLINT_IGNORE"
     echo "\nMarkdown lint check completed successfully."
 fi

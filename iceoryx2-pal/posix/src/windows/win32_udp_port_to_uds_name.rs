@@ -20,6 +20,9 @@ use windows_sys::Win32::{
     },
 };
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::posix::{c_string_length, types::*};
 use core::ffi::CStr;
 use iceoryx2_pal_concurrency_sync::atomic::Ordering;
@@ -347,6 +350,8 @@ impl PortToUds {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use alloc::vec::Vec;
     use iceoryx2_pal_testing::assert_that;
 
     use crate::os::posix::win32_udp_port_to_uds_name::PATH_LENGTH;

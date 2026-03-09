@@ -40,7 +40,9 @@ pub mod details {
     use crate::security::{
         platform_handle_into_fd, AccessRights, HandleBasedOpenError, PlatformHandle,
     };
-    use iceoryx2_bb_posix::memory_mapping::{MappingBehavior, MappingPermission, MemoryMappingBuilder};
+    use iceoryx2_bb_posix::memory_mapping::{
+        MappingBehavior, MappingPermission, MemoryMappingBuilder,
+    };
     use iceoryx2_bb_posix::shared_memory::SharedMemory as PosixSharedMemory;
 
     fn get_payload_start_address<
@@ -355,9 +357,8 @@ pub mod details {
                 .create()
                 .map_err(|e| map_mapping_error(e, msg))?;
 
-            let details = unsafe {
-                header_data_from_mapping::<AllocatorDetails<Allocator>>(&header_mapping)
-            };
+            let details =
+                unsafe { header_data_from_mapping::<AllocatorDetails<Allocator>>(&header_mapping) };
 
             let total_size = header_size
                 .checked_add(details.mgmt_size)
@@ -442,7 +443,8 @@ pub mod details {
                 use iceoryx2_pal_posix::windows::mman::create_anonymous_mapping;
 
                 let raw_handle = create_anonymous_mapping(total_size, true, None)
-                    .map_err(|_| SharedMemoryCreateError::InternalError)? as *mut _;
+                    .map_err(|_| SharedMemoryCreateError::InternalError)?
+                    as *mut _;
                 let handle = unsafe { PlatformHandle::from_raw_handle(raw_handle) };
                 let mapping_handle = handle
                     .try_clone()
@@ -502,7 +504,9 @@ pub mod details {
 
         match error {
             InsufficientPermissions => HandleBasedOpenError::InsufficientPermissions,
-            MappingLargerThanCorrespondingFile | MappingSizeIsZero => HandleBasedOpenError::SizeMismatch,
+            MappingLargerThanCorrespondingFile | MappingSizeIsZero => {
+                HandleBasedOpenError::SizeMismatch
+            }
             FileDescriptorDoesNotSupportMemoryMappings => HandleBasedOpenError::InvalidHandle,
             _ => {
                 let _ = msg;

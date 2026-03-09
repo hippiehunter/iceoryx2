@@ -62,8 +62,8 @@ pub mod recommended;
 
 use core::{fmt::Debug, time::Duration};
 
-pub use crate::shm_allocator::*;
 use crate::security::{AccessRights, HandleBasedOpenError, PlatformHandle};
+pub use crate::shm_allocator::*;
 use crate::static_storage::file::{NamedConcept, NamedConceptBuilder, NamedConceptMgmt};
 use iceoryx2_bb_system_types::file_name::*;
 use pool_allocator::PoolAllocator;

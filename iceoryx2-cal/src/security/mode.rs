@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// - [`SecurityMode::Public`]: Default mode. No authentication required.
 /// - [`SecurityMode::Secured`]: Requires IAM authentication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ZeroCopySend)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ZeroCopySend,
+)]
 #[serde(rename_all = "kebab-case")]
 #[repr(C)]
 pub enum SecurityMode {

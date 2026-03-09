@@ -90,31 +90,37 @@ pub(crate) mod wire;
 mod tests;
 
 // Re-export audit types
-pub use audit::{AuditEvent, AuditEventKind, AuditLogger, FileAuditLogger};
+#[cfg(all(feature = "syslog", unix))]
+pub use audit::SyslogAuditLogger;
+pub use audit::{
+    AuditEvent, AuditEventKind, AuditLogger, FileAuditLogger, FileAuditLoggerConfig,
+    NullAuditLogger,
+};
 
 // Re-export configured policy types
-pub use configured_policy::{ConfiguredPolicy, PolicyLoader};
+pub use configured_policy::{ConfiguredPolicy, PolicyLoadError, PolicyLoader};
 
 // Re-export error types
 pub use error::{IamClientError, IamServerError};
 
 // Re-export policy types
 pub use policy::{
-    DefaultPolicy, IamPolicy, PolicyDecision, ResourceLimits, MAX_REASONABLE_SEGMENT_SIZE,
+    DefaultPolicy, IamPolicy, PolicyDecision, QosBounds, ResourceLimits,
+    MAX_REASONABLE_SEGMENT_SIZE,
 };
 
 // Re-export protocol types
 pub use protocol::{
     DenialReason, IamNotification, IamRequest, IamResponse, MessagingPatternKind, PortType,
-    ProtocolVersion, SegmentInfo, SessionId, INVALID_SESSION_ID,
-    MAX_ERROR_MESSAGE_LENGTH, MAX_HANDLES_PER_MESSAGE, MAX_SEGMENTS_PER_ATTACH,
+    ProtocolVersion, SegmentInfo, SessionId, INVALID_SESSION_ID, MAX_ERROR_MESSAGE_LENGTH,
+    MAX_HANDLES_PER_MESSAGE, MAX_SEGMENTS_PER_ATTACH,
 };
 
 // Re-export segment manager types
 pub use segment_manager::{ManagedSegment, SegmentManager};
 
 // Re-export server types
-pub use server::IamServer;
+pub use server::{IamServer, IamServerBuilder};
 
 // Re-export session types
 pub use session::{ClientSession, PortInfo, SessionResourceUsage};

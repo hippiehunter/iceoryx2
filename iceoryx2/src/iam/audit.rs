@@ -155,11 +155,7 @@ impl From<&AuditEvent> for SerializableAuditEvent {
         };
 
         let (decision_str, reason_str, message_str) = match &event.decision {
-            PolicyDecision::Allow => (
-                String::from("allow"),
-                String::new(),
-                String::new(),
-            ),
+            PolicyDecision::Allow => (String::from("allow"), String::new(), String::new()),
             PolicyDecision::Deny { reason, message } => (
                 String::from("deny"),
                 format!("{:?}", reason),
@@ -199,11 +195,59 @@ pub trait AuditLogger: Send + Sync {
 // FileAuditLogger
 // ============================================================================
 
+// ============================================================================
+// NullAuditLogger
+// ============================================================================
+
+/// No-op audit logger that discards all events.
+///
+/// Useful for testing or when audit logging is disabled.
+pub struct NullAuditLogger;
+
+impl AuditLogger for NullAuditLogger {
+    fn log(&self, _event: &AuditEvent) {}
+}
+
+// ============================================================================
+// FileAuditLoggerConfig
+// ============================================================================
+
+/// Configuration for [`FileAuditLogger`] log rotation.
+#[derive(Debug, Clone)]
+pub struct FileAuditLoggerConfig {
+    /// Maximum size of a single log file in bytes before rotation.
+    /// Default: 10 MB.
+    pub max_file_size: usize,
+    /// Maximum number of rotated log files to keep.
+    /// When exceeded, the oldest file is deleted.
+    /// Default: 5.
+    pub max_files: usize,
+}
+
+impl Default for FileAuditLoggerConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size: 10 * 1024 * 1024, // 10 MB
+            max_files: 5,
+        }
+    }
+}
+
+// ============================================================================
+// FileAuditLogger
+// ============================================================================
+
 /// Append-only JSON Lines file audit logger with background writer thread.
 ///
 /// Uses an mpsc channel and a background writer thread to avoid blocking
 /// the IAM server's processing loop. Each audit event is serialized as a
 /// single JSON object on one line (JSON Lines format).
+///
+/// # Log Rotation
+///
+/// When a log file exceeds `max_file_size`, the logger rotates files:
+/// - `audit.log` -> `audit.log.1` -> `audit.log.2` -> ... -> deleted
+/// - At most `max_files` rotated files are kept.
 ///
 /// # Drop Behavior
 ///
@@ -215,21 +259,70 @@ pub struct FileAuditLogger {
 }
 
 impl FileAuditLogger {
-    /// Creates a new file audit logger.
+    /// Creates a new file audit logger with default rotation config.
     pub fn new(path: &std::path::Path) -> Result<Self, std::io::Error> {
+        Self::with_config(path, FileAuditLoggerConfig::default())
+    }
+
+    /// Creates a new file audit logger with custom rotation config.
+    pub fn with_config(
+        path: &std::path::Path,
+        config: FileAuditLoggerConfig,
+    ) -> Result<Self, std::io::Error> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
 
+        let file_path = path.to_path_buf();
         let (sender, receiver) = mpsc::channel::<AuditEvent>();
 
         let writer_thread = thread::spawn(move || {
             let mut writer = std::io::BufWriter::new(file);
+            let mut bytes_written: usize = {
+                // Start counting from current file size
+                std::fs::metadata(&file_path)
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0)
+            };
+            let mut write_errors: usize = 0;
+
             for event in receiver {
                 let serializable = SerializableAuditEvent::from(&event);
-                if let Ok(json) = serde_json::to_string(&serializable) {
-                    let _ = writeln!(writer, "{}", json);
+                let json = match serde_json::to_string(&serializable) {
+                    Ok(j) => j,
+                    Err(_) => continue,
+                };
+
+                if writeln!(writer, "{}", json).is_err() {
+                    write_errors += 1;
+                    if write_errors > 100 {
+                        // Too many consecutive errors, stop trying
+                        break;
+                    }
+                    continue;
+                }
+                write_errors = 0;
+                bytes_written += json.len() + 1; // +1 for newline
+
+                // Check if rotation is needed
+                if config.max_file_size > 0 && bytes_written >= config.max_file_size {
+                    let _ = writer.flush();
+
+                    rotate_log_files(&file_path, config.max_files);
+
+                    // Re-open the main file
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&file_path)
+                    {
+                        Ok(new_file) => {
+                            writer = std::io::BufWriter::new(new_file);
+                            bytes_written = 0;
+                        }
+                        Err(_) => break,
+                    }
                 }
             }
             let _ = writer.flush();
@@ -240,6 +333,24 @@ impl FileAuditLogger {
             writer_thread: Some(writer_thread),
         })
     }
+}
+
+/// Rotates log files: path -> path.1 -> path.2 -> ... -> deleted.
+fn rotate_log_files(path: &std::path::Path, max_files: usize) {
+    // Delete the oldest if it exists
+    let oldest = format!("{}.{}", path.display(), max_files);
+    let _ = std::fs::remove_file(&oldest);
+
+    // Shift existing rotated files: .N-1 -> .N
+    for i in (1..max_files).rev() {
+        let from = format!("{}.{}", path.display(), i);
+        let to = format!("{}.{}", path.display(), i + 1);
+        let _ = std::fs::rename(&from, &to);
+    }
+
+    // Rename current file to .1
+    let rotated = format!("{}.1", path.display());
+    let _ = std::fs::rename(path, &rotated);
 }
 
 impl AuditLogger for FileAuditLogger {
@@ -258,6 +369,78 @@ impl Drop for FileAuditLogger {
         if let Some(thread) = self.writer_thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+// ============================================================================
+// SyslogAuditLogger (Unix only, behind feature flag)
+// ============================================================================
+
+/// Syslog-based audit logger for Unix systems.
+///
+/// Sends audit events to the system syslog daemon using the `LOG_AUTH` facility.
+/// Each event is formatted as a single-line JSON message.
+///
+/// Enable with the `syslog` feature flag:
+/// ```toml
+/// [dependencies]
+/// iceoryx2 = { version = "...", features = ["syslog"] }
+/// ```
+///
+/// This is only available on Unix platforms.
+#[cfg(all(feature = "syslog", unix))]
+pub struct SyslogAuditLogger {
+    /// Application identifier for syslog messages.
+    ident: std::ffi::CString,
+}
+
+#[cfg(all(feature = "syslog", unix))]
+impl SyslogAuditLogger {
+    /// Creates a new syslog audit logger.
+    ///
+    /// # Arguments
+    /// * `ident` - Application identifier (e.g., "iceoryx2-iam")
+    pub fn new(ident: &str) -> Self {
+        let ident = std::ffi::CString::new(ident)
+            .unwrap_or_else(|_| std::ffi::CString::new("iceoryx2-iam").unwrap());
+        // Open syslog with LOG_AUTH facility, LOG_PID option
+        unsafe {
+            libc::openlog(
+                ident.as_ptr(),
+                libc::LOG_PID | libc::LOG_NDELAY,
+                libc::LOG_AUTH,
+            );
+        }
+        Self { ident }
+    }
+}
+
+#[cfg(all(feature = "syslog", unix))]
+impl AuditLogger for SyslogAuditLogger {
+    fn log(&self, event: &AuditEvent) {
+        let serializable = SerializableAuditEvent::from(event);
+        if let Ok(json) = serde_json::to_string(&serializable) {
+            if let Ok(msg) = std::ffi::CString::new(json) {
+                let priority = match &event.decision {
+                    PolicyDecision::Allow => libc::LOG_INFO,
+                    PolicyDecision::Deny { .. } => libc::LOG_WARNING,
+                };
+                unsafe {
+                    libc::syslog(priority, b"%s\0".as_ptr() as *const _, msg.as_ptr());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "syslog", unix))]
+impl Drop for SyslogAuditLogger {
+    fn drop(&mut self) {
+        unsafe {
+            libc::closelog();
+        }
+        // Keep ident alive until after closelog
+        let _ = &self.ident;
     }
 }
 
@@ -390,9 +573,7 @@ mod tests {
         let log_path = dir.join("audit_concurrent.log");
 
         {
-            let logger = std::sync::Arc::new(
-                FileAuditLogger::new(&log_path).unwrap(),
-            );
+            let logger = std::sync::Arc::new(FileAuditLogger::new(&log_path).unwrap());
 
             let mut handles = Vec::new();
             for i in 0..10 {
@@ -421,6 +602,66 @@ mod tests {
         assert_eq!(lines.len(), 100);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_null_audit_logger() {
+        let logger = NullAuditLogger;
+        // Should not panic
+        logger.log(&AuditEvent::new(
+            AuditEventKind::Connect,
+            test_credentials(),
+            String::from("test/service"),
+            PolicyDecision::Allow,
+        ));
+    }
+
+    #[test]
+    fn test_file_audit_logger_rotation() {
+        let dir = unique_test_dir("rotation");
+        let log_path = dir.join("audit.log");
+
+        {
+            let config = FileAuditLoggerConfig {
+                max_file_size: 200, // Very small to trigger rotation quickly
+                max_files: 3,
+            };
+            let logger = FileAuditLogger::with_config(&log_path, config).unwrap();
+
+            // Write enough events to trigger rotation
+            for i in 0..20 {
+                logger.log(&AuditEvent::new(
+                    AuditEventKind::Connect,
+                    ProcessCredentials::new(i, 1000, 1000),
+                    String::from("test/rotation"),
+                    PolicyDecision::Allow,
+                ));
+            }
+            // Drop triggers flush
+        }
+
+        // The main file should exist
+        assert!(log_path.exists());
+
+        // At least one rotated file should exist
+        let rotated_1 = dir.join("audit.log.1");
+        assert!(rotated_1.exists(), "Expected audit.log.1 to exist");
+
+        // Old files beyond max_files should not exist
+        let too_old = dir.join("audit.log.4");
+        assert!(
+            !too_old.exists(),
+            "Expected audit.log.4 to NOT exist (max_files=3)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_file_audit_logger_config_default() {
+        let config = FileAuditLoggerConfig::default();
+        assert_eq!(config.max_file_size, 10 * 1024 * 1024);
+        assert_eq!(config.max_files, 5);
     }
 
     #[test]

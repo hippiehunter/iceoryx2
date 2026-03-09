@@ -61,12 +61,15 @@ use windows_sys::Win32::Foundation::{
 };
 
 use windows_sys::Win32::Security::{
-    GetTokenInformation, ImpersonateNamedPipeClient, RevertToSelf, TokenGroups, TokenUser,
-    SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, RevertToSelf, TokenGroups, TokenUser, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
+    TOKEN_QUERY, TOKEN_USER,
 };
+
+use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
 
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 extern crate alloc;
@@ -258,7 +261,7 @@ pub struct TokenSids {
 /// # Safety
 ///
 /// The `psid` pointer must be a valid pointer to a SID structure.
-unsafe fn copy_sid_from_ptr(psid: *const core::ffi::c_void) -> Option<Sid> {
+unsafe fn copy_sid_from_ptr(psid: *mut core::ffi::c_void) -> Option<Sid> {
     if psid.is_null() {
         return None;
     }
@@ -341,7 +344,7 @@ fn get_token_user(token_handle: HANDLE) -> Result<Sid, TokenError> {
     // Allocate buffer with proper alignment for TOKEN_USER.
     // TOKEN_USER contains pointers, so it requires pointer alignment (8 bytes on x64).
     // Vec<u64> provides natural 8-byte alignment.
-    let num_u64s = (return_length as usize + 7) / 8;
+    let num_u64s = (return_length as usize).div_ceil(8);
     let mut buffer: Vec<u64> = vec![0u64; num_u64s];
     let buffer_ptr = buffer.as_mut_ptr() as *mut u8;
 
@@ -398,7 +401,7 @@ fn get_token_groups(token_handle: HANDLE) -> Result<Vec<Sid>, TokenError> {
     // Allocate buffer with proper alignment for TOKEN_GROUPS.
     // TOKEN_GROUPS contains pointers, so it requires pointer alignment (8 bytes on x64).
     // Vec<u64> provides natural 8-byte alignment.
-    let num_u64s = (return_length as usize + 7) / 8;
+    let num_u64s = (return_length as usize).div_ceil(8);
     let mut buffer: Vec<u64> = vec![0u64; num_u64s];
     let buffer_ptr = buffer.as_mut_ptr() as *mut u8;
 
@@ -550,7 +553,10 @@ pub fn get_client_token_sids(pipe_handle: HANDLE) -> Result<TokenSids, TokenErro
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use alloc::format;
+    use alloc::vec;
 
     #[test]
     fn test_token_error_display() {
@@ -581,6 +587,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn test_token_error_traits() {
         // Test Clone
         let error = TokenError::ImpersonationFailed;

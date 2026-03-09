@@ -41,6 +41,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 extern crate alloc;
+extern crate std;
 
 use core::fmt::{self, Display, Formatter};
 use core::time::Duration;
@@ -48,30 +49,28 @@ use core::time::Duration;
 // Windows API imports
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetLastError, BOOL, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_HANDLE,
-    ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-    ERROR_PIPE_LISTENING, ERROR_PIPE_NOT_CONNECTED, ERROR_SUCCESS, FALSE, HANDLE,
-    INVALID_HANDLE_VALUE, TRUE,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE,
+    ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_HANDLE, ERROR_IO_PENDING,
+    ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
+    ERROR_PIPE_NOT_CONNECTED, FALSE, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    TRUE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, OPEN_EXISTING,
+    FILE_SHARE_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    PeekNamedPipe, SetNamedPipeHandleState, PIPE_ACCESS_DUPLEX, PIPE_NOWAIT, PIPE_READMODE_MESSAGE,
-    PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    PeekNamedPipe, SetNamedPipeHandleState, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
+    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    WaitForSingleObject, INFINITE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
@@ -335,16 +334,40 @@ impl PipeProcessCredentials {
 /// The server creates a named pipe and waits for clients to connect.
 /// Once a client connects, a [`NamedPipeConnection`] is returned for
 /// bidirectional communication.
+///
+/// The pipe is created with `FILE_FLAG_OVERLAPPED` to support non-blocking
+/// accept operations. A persistent overlapped accept state is maintained
+/// so the pipe stays in listening mode between `try_accept()` calls,
+/// allowing clients to connect at any time.
 #[cfg(windows)]
 pub struct NamedPipeServer {
     /// Handle to the named pipe instance.
     handle: HANDLE,
-    /// Wide string buffer containing the pipe name.
-    name_wide: [u16; MAX_PIPE_NAME_LENGTH],
-    /// Length of the pipe name (excluding null terminator).
-    name_len: usize,
     /// Whether a client is currently connected.
     is_connected: bool,
+    /// Event handle for persistent overlapped accept.
+    /// 0 means no accept is pending; non-zero means ConnectNamedPipe is pending.
+    accept_event: HANDLE,
+    /// Overlapped structure for persistent accept operation.
+    /// Only valid when accept_event != 0.
+    accept_overlapped: OVERLAPPED,
+}
+
+// SAFETY: NamedPipeServer contains raw handles (isize) and an OVERLAPPED struct
+// which is a plain data struct. All fields are safe to send between threads.
+// The pipe handle is not accessed concurrently - it's protected by Mutex in the
+// CAL layer.
+#[cfg(windows)]
+unsafe impl Send for NamedPipeServer {}
+
+#[cfg(windows)]
+impl fmt::Debug for NamedPipeServer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NamedPipeServer")
+            .field("is_connected", &self.is_connected)
+            .field("accept_pending", &(self.accept_event != 0))
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(windows)]
@@ -371,7 +394,7 @@ impl NamedPipeServer {
     /// This function calls Windows API functions internally.
     #[allow(unused_variables)] // mode parameter is not yet implemented
     pub fn create(name: &[u8], mode: u64) -> Result<Self, NamedPipeError> {
-        let (name_wide, name_len) = pipe_name_to_wide(name)?;
+        let (name_wide, _name_len) = pipe_name_to_wide(name)?;
 
         // TODO: Implement proper security descriptor based on mode parameter.
         // Currently using NULL security descriptor which grants default access.
@@ -383,13 +406,15 @@ impl NamedPipeServer {
             bInheritHandle: FALSE,
         };
 
-        // Create the named pipe
+        // Create the named pipe with FILE_FLAG_OVERLAPPED so that
+        // ConnectNamedPipe can be used in non-blocking/timed modes.
+        // All I/O on this handle (reads, writes, accepts) must use OVERLAPPED structures.
         // SAFETY: We're calling the Windows API with valid parameters.
         // The name_wide buffer is properly null-terminated.
         let handle = unsafe {
             CreateNamedPipeW(
                 name_wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX, // Bidirectional pipe
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, // Bidirectional + overlapped
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 DEFAULT_PIPE_BUFFER_SIZE,
@@ -406,13 +431,18 @@ impl NamedPipeServer {
 
         Ok(Self {
             handle,
-            name_wide,
-            name_len,
             is_connected: false,
+            accept_event: 0,
+            accept_overlapped: unsafe { core::mem::zeroed() },
         })
     }
 
     /// Attempts to accept a connection without blocking.
+    ///
+    /// Uses persistent overlapped I/O state so the pipe remains in listening
+    /// mode between calls. On the first call, `ConnectNamedPipe` is issued and
+    /// the overlapped state is stored. Subsequent calls check if a client has
+    /// connected without re-issuing the syscall.
     ///
     /// # Returns
     /// * `Ok(Some(connection))` - A client connected
@@ -423,32 +453,113 @@ impl NamedPipeServer {
             return Err(NamedPipeError::AlreadyConnected);
         }
 
-        // SAFETY: We're calling ConnectNamedPipe with a valid handle.
-        // NULL for lpOverlapped means synchronous operation.
-        let result = unsafe { ConnectNamedPipe(self.handle, core::ptr::null_mut()) };
+        // If no accept is pending, start one
+        if self.accept_event == 0 {
+            use windows_sys::Win32::System::Threading::CreateEventW;
 
-        if result != 0 {
-            // Connection successful
-            self.is_connected = true;
-            return Ok(Some(NamedPipeConnection::from_server(self.handle)));
+            let event = unsafe { CreateEventW(core::ptr::null(), TRUE, FALSE, core::ptr::null()) };
+            if event == 0 {
+                let error = unsafe { GetLastError() };
+                return Err(NamedPipeError::from_win32(error));
+            }
+
+            self.accept_overlapped = unsafe { core::mem::zeroed() };
+            self.accept_overlapped.hEvent = event;
+            self.accept_event = event;
+
+            // SAFETY: ConnectNamedPipe with overlapped structure for async operation.
+            // The pipe stays in listening state until a client connects or we cancel.
+            let result = unsafe { ConnectNamedPipe(self.handle, &mut self.accept_overlapped) };
+
+            if result != 0 {
+                // Immediate success
+                self.cleanup_accept_state();
+                self.is_connected = true;
+                return Ok(Some(NamedPipeConnection::from_server(self.handle)));
+            }
+
+            let error = unsafe { GetLastError() };
+            match error {
+                ERROR_IO_PENDING => {
+                    // Accept is now pending - fall through to check below
+                }
+                ERROR_PIPE_CONNECTED => {
+                    // Client already connected
+                    self.cleanup_accept_state();
+                    self.is_connected = true;
+                    return Ok(Some(NamedPipeConnection::from_server(self.handle)));
+                }
+                _ => {
+                    self.cleanup_accept_state();
+                    return Err(NamedPipeError::from_win32(error));
+                }
+            }
         }
 
-        let error = unsafe { GetLastError() };
-        match error {
-            ERROR_PIPE_CONNECTED => {
-                // Client connected between CreateNamedPipe and ConnectNamedPipe
-                self.is_connected = true;
-                Ok(Some(NamedPipeConnection::from_server(self.handle)))
+        // Check if the pending accept has completed (non-blocking)
+        let wait_result = unsafe { WaitForSingleObject(self.accept_event, 0) };
+
+        match wait_result {
+            WAIT_OBJECT_0 => {
+                // Client connected
+                let mut bytes_transferred: u32 = 0;
+                let overlapped_result = unsafe {
+                    GetOverlappedResult(
+                        self.handle,
+                        &self.accept_overlapped,
+                        &mut bytes_transferred,
+                        FALSE,
+                    )
+                };
+
+                self.cleanup_accept_state();
+
+                if overlapped_result != 0 {
+                    self.is_connected = true;
+                    Ok(Some(NamedPipeConnection::from_server(self.handle)))
+                } else {
+                    let error = unsafe { GetLastError() };
+                    Err(NamedPipeError::from_win32(error))
+                }
             }
-            ERROR_IO_PENDING | ERROR_PIPE_LISTENING => {
-                // No client waiting
+            WAIT_TIMEOUT => {
+                // No client yet - keep the accept pending (pipe stays in listening state)
                 Ok(None)
             }
-            _ => Err(NamedPipeError::from_win32(error)),
+            _ => {
+                let error = unsafe { GetLastError() };
+                self.cleanup_accept_state();
+                Err(NamedPipeError::from_win32(error))
+            }
+        }
+    }
+
+    /// Cancels any pending overlapped accept and cleans up the event handle.
+    fn cleanup_accept_state(&mut self) {
+        if self.accept_event != 0 {
+            // Cancel any pending I/O before closing the event
+            unsafe { CancelIo(self.handle) };
+            // Wait for the cancellation to complete
+            let mut bytes_transferred: u32 = 0;
+            unsafe {
+                GetOverlappedResult(
+                    self.handle,
+                    &self.accept_overlapped,
+                    &mut bytes_transferred,
+                    TRUE,
+                )
+            };
+            unsafe { CloseHandle(self.accept_event) };
+            self.accept_event = 0;
+            self.accept_overlapped = unsafe { core::mem::zeroed() };
         }
     }
 
     /// Waits for a connection with a timeout.
+    ///
+    /// If a persistent accept is already pending (from a previous `try_accept()` call),
+    /// this method reuses it and waits with the given timeout. Otherwise, it starts
+    /// a new overlapped accept.
     ///
     /// # Arguments
     /// * `timeout` - Maximum time to wait for a connection
@@ -465,101 +576,94 @@ impl NamedPipeServer {
             return Err(NamedPipeError::AlreadyConnected);
         }
 
-        // For timed accept, we need to use overlapped I/O
-        // Create an event for the overlapped structure
-        use windows_sys::Win32::System::Threading::CreateEventW;
+        // If no accept is pending, start one
+        if self.accept_event == 0 {
+            use windows_sys::Win32::System::Threading::CreateEventW;
 
-        // SAFETY: CreateEventW with NULL security attrs and name creates a manual-reset event
-        let event = unsafe { CreateEventW(core::ptr::null(), TRUE, FALSE, core::ptr::null()) };
-        if event == 0 {
-            let error = unsafe { GetLastError() };
-            return Err(NamedPipeError::from_win32(error));
-        }
+            let event = unsafe { CreateEventW(core::ptr::null(), TRUE, FALSE, core::ptr::null()) };
+            if event == 0 {
+                let error = unsafe { GetLastError() };
+                return Err(NamedPipeError::from_win32(error));
+            }
 
-        // SAFETY: OVERLAPPED is a POD (Plain Old Data) struct as defined by MSDN.
-        // Zero-initialization is valid and creates a properly initialized OVERLAPPED
-        // structure where all fields (Internal, InternalHigh, Offset, OffsetHigh, Pointer)
-        // are set to zero/null, which is the correct initial state before use.
-        let mut overlapped: OVERLAPPED = unsafe { core::mem::zeroed() };
-        overlapped.hEvent = event;
+            self.accept_overlapped = unsafe { core::mem::zeroed() };
+            self.accept_overlapped.hEvent = event;
+            self.accept_event = event;
 
-        // SAFETY: ConnectNamedPipe with overlapped structure for async operation
-        let result = unsafe { ConnectNamedPipe(self.handle, &mut overlapped) };
+            let result = unsafe { ConnectNamedPipe(self.handle, &mut self.accept_overlapped) };
 
-        let connect_result = if result != 0 {
-            // Immediate success (shouldn't happen with overlapped I/O, but handle it)
-            self.is_connected = true;
-            Ok(Some(NamedPipeConnection::from_server(self.handle)))
-        } else {
+            if result != 0 {
+                self.cleanup_accept_state();
+                self.is_connected = true;
+                return Ok(Some(NamedPipeConnection::from_server(self.handle)));
+            }
+
             let error = unsafe { GetLastError() };
             match error {
-                ERROR_IO_PENDING => {
-                    // Wait for the connection with timeout
-                    let timeout_ms = timeout.as_millis() as u32;
-                    let wait_result = unsafe { WaitForSingleObject(event, timeout_ms) };
-
-                    match wait_result {
-                        WAIT_OBJECT_0 => {
-                            // Event signaled - check if connection succeeded
-                            let mut bytes_transferred: u32 = 0;
-                            let overlapped_result = unsafe {
-                                GetOverlappedResult(
-                                    self.handle,
-                                    &overlapped,
-                                    &mut bytes_transferred,
-                                    FALSE,
-                                )
-                            };
-
-                            if overlapped_result != 0 {
-                                self.is_connected = true;
-                                Ok(Some(NamedPipeConnection::from_server(self.handle)))
-                            } else {
-                                let error = unsafe { GetLastError() };
-                                Err(NamedPipeError::from_win32(error))
-                            }
-                        }
-                        WAIT_TIMEOUT => {
-                            // Timeout - cancel the pending I/O
-                            unsafe { CancelIo(self.handle) };
-                            // IMPORTANT: After CancelIo, we must wait for the operation to
-                            // actually complete/cancel before cleaning up the OVERLAPPED structure.
-                            // GetOverlappedResult with bWait=TRUE ensures the I/O has finished.
-                            let mut bytes_transferred: u32 = 0;
-                            unsafe {
-                                GetOverlappedResult(
-                                    self.handle,
-                                    &overlapped,
-                                    &mut bytes_transferred,
-                                    TRUE, // bWait=TRUE: block until operation completes/cancels
-                                )
-                            };
-                            // We ignore the result - whether it succeeded or was cancelled,
-                            // we're returning None for timeout anyway
-                            Ok(None)
-                        }
-                        WAIT_ABANDONED => Err(NamedPipeError::Interrupted),
-                        WAIT_FAILED | _ => {
-                            let error = unsafe { GetLastError() };
-                            Err(NamedPipeError::from_win32(error))
-                        }
-                    }
-                }
+                ERROR_IO_PENDING => { /* fall through to wait */ }
                 ERROR_PIPE_CONNECTED => {
+                    self.cleanup_accept_state();
+                    self.is_connected = true;
+                    return Ok(Some(NamedPipeConnection::from_server(self.handle)));
+                }
+                _ => {
+                    self.cleanup_accept_state();
+                    return Err(NamedPipeError::from_win32(error));
+                }
+            }
+        }
+
+        // Wait for the pending accept with timeout
+        let timeout_ms = timeout.as_millis() as u32;
+        let wait_result = unsafe { WaitForSingleObject(self.accept_event, timeout_ms) };
+
+        match wait_result {
+            WAIT_OBJECT_0 => {
+                let mut bytes_transferred: u32 = 0;
+                let overlapped_result = unsafe {
+                    GetOverlappedResult(
+                        self.handle,
+                        &self.accept_overlapped,
+                        &mut bytes_transferred,
+                        FALSE,
+                    )
+                };
+
+                self.cleanup_accept_state();
+
+                if overlapped_result != 0 {
                     self.is_connected = true;
                     Ok(Some(NamedPipeConnection::from_server(self.handle)))
+                } else {
+                    let error = unsafe { GetLastError() };
+                    Err(NamedPipeError::from_win32(error))
                 }
-                _ => Err(NamedPipeError::from_win32(error)),
             }
-        };
-
-        // Clean up the event handle
-        unsafe { CloseHandle(event) };
-
-        connect_result
+            WAIT_TIMEOUT => {
+                // Keep the accept pending - don't cancel it
+                Ok(None)
+            }
+            WAIT_ABANDONED => {
+                self.cleanup_accept_state();
+                Err(NamedPipeError::Interrupted)
+            }
+            WAIT_FAILED => {
+                let error = unsafe { GetLastError() };
+                self.cleanup_accept_state();
+                Err(NamedPipeError::from_win32(error))
+            }
+            _ => {
+                let error = unsafe { GetLastError() };
+                self.cleanup_accept_state();
+                Err(NamedPipeError::from_win32(error))
+            }
+        }
     }
 
     /// Blocks until a client connects.
+    ///
+    /// If a persistent accept is already pending, waits on it with INFINITE timeout.
+    /// Otherwise, starts a new overlapped accept and waits.
     ///
     /// # Returns
     /// * `Ok(connection)` - A client connected
@@ -569,23 +673,80 @@ impl NamedPipeServer {
             return Err(NamedPipeError::AlreadyConnected);
         }
 
-        // SAFETY: ConnectNamedPipe blocks until a client connects when called
-        // without overlapped I/O on a pipe created with PIPE_WAIT.
-        let result = unsafe { ConnectNamedPipe(self.handle, core::ptr::null_mut()) };
+        // If no accept is pending, start one
+        if self.accept_event == 0 {
+            use windows_sys::Win32::System::Threading::CreateEventW;
 
-        if result != 0 {
-            self.is_connected = true;
-            return Ok(NamedPipeConnection::from_server(self.handle));
+            let event = unsafe { CreateEventW(core::ptr::null(), TRUE, FALSE, core::ptr::null()) };
+            if event == 0 {
+                let error = unsafe { GetLastError() };
+                return Err(NamedPipeError::from_win32(error));
+            }
+
+            self.accept_overlapped = unsafe { core::mem::zeroed() };
+            self.accept_overlapped.hEvent = event;
+            self.accept_event = event;
+
+            let result = unsafe { ConnectNamedPipe(self.handle, &mut self.accept_overlapped) };
+
+            if result != 0 {
+                self.cleanup_accept_state();
+                self.is_connected = true;
+                return Ok(NamedPipeConnection::from_server(self.handle));
+            }
+
+            let error = unsafe { GetLastError() };
+            match error {
+                ERROR_IO_PENDING => { /* fall through to wait */ }
+                ERROR_PIPE_CONNECTED => {
+                    self.cleanup_accept_state();
+                    self.is_connected = true;
+                    return Ok(NamedPipeConnection::from_server(self.handle));
+                }
+                _ => {
+                    self.cleanup_accept_state();
+                    return Err(NamedPipeError::from_win32(error));
+                }
+            }
         }
 
-        let error = unsafe { GetLastError() };
-        if error == ERROR_PIPE_CONNECTED {
-            // Client already connected
-            self.is_connected = true;
-            return Ok(NamedPipeConnection::from_server(self.handle));
-        }
+        // Wait indefinitely for the connection
+        let wait_result = unsafe { WaitForSingleObject(self.accept_event, INFINITE) };
 
-        Err(NamedPipeError::from_win32(error))
+        match wait_result {
+            WAIT_OBJECT_0 => {
+                let mut bytes_transferred: u32 = 0;
+                let overlapped_result = unsafe {
+                    GetOverlappedResult(
+                        self.handle,
+                        &self.accept_overlapped,
+                        &mut bytes_transferred,
+                        FALSE,
+                    )
+                };
+
+                self.cleanup_accept_state();
+
+                if overlapped_result != 0 {
+                    self.is_connected = true;
+                    Ok(NamedPipeConnection::from_server(self.handle))
+                } else {
+                    Err(NamedPipeError::from_win32(unsafe { GetLastError() }))
+                }
+            }
+            WAIT_ABANDONED => {
+                self.cleanup_accept_state();
+                Err(NamedPipeError::Interrupted)
+            }
+            WAIT_FAILED => {
+                self.cleanup_accept_state();
+                Err(NamedPipeError::from_win32(unsafe { GetLastError() }))
+            }
+            _ => {
+                self.cleanup_accept_state();
+                Err(NamedPipeError::from_win32(unsafe { GetLastError() }))
+            }
+        }
     }
 
     /// Disconnects the current client and prepares for a new connection.
@@ -624,7 +785,10 @@ impl NamedPipeServer {
 #[cfg(windows)]
 impl Drop for NamedPipeServer {
     fn drop(&mut self) {
-        // Disconnect any connected client first
+        // Cancel any pending accept operation first
+        self.cleanup_accept_state();
+
+        // Disconnect any connected client
         if self.is_connected {
             let _ = self.disconnect();
         }
@@ -638,6 +802,7 @@ impl Drop for NamedPipeServer {
 
 // Non-Windows stub implementation
 #[cfg(not(windows))]
+#[derive(Debug)]
 pub struct NamedPipeServer {
     _marker: core::marker::PhantomData<()>,
 }
@@ -669,6 +834,137 @@ impl NamedPipeServer {
 }
 
 // ============================================================================
+// Overlapped I/O Helpers
+// ============================================================================
+
+/// Performs a blocking read on an overlapped pipe handle.
+///
+/// Creates a temporary OVERLAPPED structure with an event, issues the ReadFile,
+/// and waits for completion. This is required because handles opened with
+/// FILE_FLAG_OVERLAPPED must always use OVERLAPPED structures for I/O.
+#[cfg(windows)]
+fn overlapped_read_blocking(handle: HANDLE, buffer: &mut [u8]) -> Result<usize, NamedPipeError> {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    let event = unsafe { CreateEventW(core::ptr::null(), TRUE, FALSE, core::ptr::null()) };
+    if event == 0 {
+        return Err(NamedPipeError::from_win32(unsafe { GetLastError() }));
+    }
+
+    let mut overlapped: OVERLAPPED = unsafe { core::mem::zeroed() };
+    overlapped.hEvent = event;
+
+    // Note: With overlapped I/O, lpNumberOfBytesRead is unreliable.
+    // Always use GetOverlappedResult to get the actual byte count.
+    let result = unsafe {
+        ReadFile(
+            handle,
+            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            buffer.len() as u32,
+            core::ptr::null_mut(), // Don't use lpNumberOfBytesRead with overlapped
+            &mut overlapped,
+        )
+    };
+
+    let io_result = if result != 0 {
+        // Completed synchronously - get byte count from overlapped result
+        let mut bytes_transferred: u32 = 0;
+        unsafe { GetOverlappedResult(handle, &overlapped, &mut bytes_transferred, FALSE) };
+        Ok(bytes_transferred as usize)
+    } else {
+        let error = unsafe { GetLastError() };
+        match error {
+            ERROR_IO_PENDING => {
+                // Pending - wait for completion
+                let mut bytes_transferred: u32 = 0;
+                let get_result = unsafe {
+                    GetOverlappedResult(handle, &overlapped, &mut bytes_transferred, TRUE)
+                };
+                if get_result != 0 {
+                    Ok(bytes_transferred as usize)
+                } else {
+                    let error = unsafe { GetLastError() };
+                    if error == ERROR_MORE_DATA {
+                        // Buffer too small for message, but partial data was read
+                        Ok(bytes_transferred as usize)
+                    } else {
+                        Err(NamedPipeError::from_win32(error))
+                    }
+                }
+            }
+            ERROR_MORE_DATA => {
+                // Completed synchronously but buffer too small for the full message.
+                // The buffer has been filled. Use GetOverlappedResult for byte count.
+                let mut bytes_transferred: u32 = 0;
+                // GetOverlappedResult will return FALSE with ERROR_MORE_DATA
+                unsafe { GetOverlappedResult(handle, &overlapped, &mut bytes_transferred, FALSE) };
+                Ok(bytes_transferred as usize)
+            }
+            _ => Err(NamedPipeError::from_win32(error)),
+        }
+    };
+
+    unsafe { CloseHandle(event) };
+    io_result
+}
+
+/// Performs a blocking write on an overlapped pipe handle.
+///
+/// Creates a temporary OVERLAPPED structure with an event, issues the WriteFile,
+/// and waits for completion.
+#[cfg(windows)]
+fn overlapped_write_blocking(handle: HANDLE, data: &[u8]) -> Result<usize, NamedPipeError> {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    let event = unsafe { CreateEventW(core::ptr::null(), TRUE, FALSE, core::ptr::null()) };
+    if event == 0 {
+        return Err(NamedPipeError::from_win32(unsafe { GetLastError() }));
+    }
+
+    let mut overlapped: OVERLAPPED = unsafe { core::mem::zeroed() };
+    overlapped.hEvent = event;
+
+    let result = unsafe {
+        WriteFile(
+            handle,
+            data.as_ptr(),
+            data.len() as u32,
+            core::ptr::null_mut(),
+            &mut overlapped,
+        )
+    };
+
+    let io_result = if result != 0 {
+        // Synchronous completion - use GetOverlappedResult for reliable byte count
+        let mut bytes_transferred: u32 = 0;
+        unsafe {
+            GetOverlappedResult(handle, &overlapped, &mut bytes_transferred, FALSE);
+        }
+        Ok(bytes_transferred as usize)
+    } else {
+        let error = unsafe { GetLastError() };
+        match error {
+            ERROR_IO_PENDING => {
+                // Wait for the write to complete
+                let mut bytes_transferred: u32 = 0;
+                let get_result = unsafe {
+                    GetOverlappedResult(handle, &overlapped, &mut bytes_transferred, TRUE)
+                };
+                if get_result != 0 {
+                    Ok(bytes_transferred as usize)
+                } else {
+                    Err(NamedPipeError::from_win32(unsafe { GetLastError() }))
+                }
+            }
+            _ => Err(NamedPipeError::from_win32(error)),
+        }
+    };
+
+    unsafe { CloseHandle(event) };
+    io_result
+}
+
+// ============================================================================
 // NamedPipeConnection
 // ============================================================================
 
@@ -683,8 +979,22 @@ pub struct NamedPipeConnection {
     handle: HANDLE,
     /// Whether this is the server side of the connection.
     is_server_side: bool,
+    /// Whether the handle was opened with FILE_FLAG_OVERLAPPED.
+    /// Server-side connections use overlapped I/O; client-side do not.
+    is_overlapped: bool,
     /// Cached client process ID (lazily fetched).
     cached_client_pid: Option<u32>,
+}
+
+#[cfg(windows)]
+impl fmt::Debug for NamedPipeConnection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NamedPipeConnection")
+            .field("is_server_side", &self.is_server_side)
+            .field("is_overlapped", &self.is_overlapped)
+            .field("cached_client_pid", &self.cached_client_pid)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(windows)]
@@ -708,6 +1018,7 @@ impl NamedPipeConnection {
         Self {
             handle,
             is_server_side: true,
+            is_overlapped: true, // Server pipes are created with FILE_FLAG_OVERLAPPED
             cached_client_pid: None,
         }
     }
@@ -742,15 +1053,10 @@ impl NamedPipeConnection {
         }
 
         // Set the pipe to message-read mode
-        let mut mode: u32 = PIPE_READMODE_MESSAGE;
+        let mode: u32 = PIPE_READMODE_MESSAGE;
         // SAFETY: SetNamedPipeHandleState is called with a valid handle.
         let result = unsafe {
-            SetNamedPipeHandleState(
-                handle,
-                &mut mode,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            )
+            SetNamedPipeHandleState(handle, &mode, core::ptr::null_mut(), core::ptr::null_mut())
         };
 
         if result == 0 {
@@ -762,6 +1068,7 @@ impl NamedPipeConnection {
         Ok(Self {
             handle,
             is_server_side: false,
+            is_overlapped: false, // Client connections use synchronous I/O
             cached_client_pid: None,
         })
     }
@@ -835,6 +1142,10 @@ impl NamedPipeConnection {
     /// * `Ok(bytes_written)` - Number of bytes written
     /// * `Err(NamedPipeError)` - Write failed
     pub fn write(&self, data: &[u8]) -> Result<usize, NamedPipeError> {
+        if self.is_overlapped {
+            return overlapped_write_blocking(self.handle, data);
+        }
+
         let mut bytes_written: u32 = 0;
 
         // SAFETY: WriteFile is called with valid parameters.
@@ -865,6 +1176,12 @@ impl NamedPipeConnection {
     /// * `Ok(bytes_written)` - Number of bytes written (may be 0 if would block)
     /// * `Err(NamedPipeError)` - Write failed
     pub fn try_write(&self, data: &[u8]) -> Result<usize, NamedPipeError> {
+        if self.is_overlapped {
+            // For overlapped handles, writes to named pipes with sufficient buffer
+            // typically complete immediately, so blocking write is acceptable here.
+            return overlapped_write_blocking(self.handle, data);
+        }
+
         // For non-blocking write, we use the same approach but check for would-block errors
         let mut bytes_written: u32 = 0;
 
@@ -900,13 +1217,17 @@ impl NamedPipeConnection {
     /// * `Ok(bytes_read)` - Number of bytes read
     /// * `Err(NamedPipeError)` - Read failed
     pub fn read(&self, buffer: &mut [u8]) -> Result<usize, NamedPipeError> {
+        if self.is_overlapped {
+            return overlapped_read_blocking(self.handle, buffer);
+        }
+
         let mut bytes_read: u32 = 0;
 
         // SAFETY: ReadFile is called with valid parameters.
         let result = unsafe {
             ReadFile(
                 self.handle,
-                buffer.as_mut_ptr(),
+                buffer.as_mut_ptr() as *mut core::ffi::c_void,
                 buffer.len() as u32,
                 &mut bytes_read,
                 core::ptr::null_mut(),
@@ -934,12 +1255,6 @@ impl NamedPipeConnection {
     /// # Returns
     /// * `Ok(bytes_read)` - Number of bytes read (0 if no data available)
     /// * `Err(NamedPipeError)` - Read failed
-    ///
-    /// # Implementation Note
-    /// This implementation uses two syscalls: `PeekNamedPipe` to check for available data,
-    /// followed by `ReadFile` if data is present. This is a known limitation - a more
-    /// efficient implementation could use overlapped I/O with immediate completion check,
-    /// but that would require the pipe to be opened with `FILE_FLAG_OVERLAPPED`.
     pub fn try_read(&self, buffer: &mut [u8]) -> Result<usize, NamedPipeError> {
         // First, peek to see if data is available
         let mut bytes_available: u32 = 0;
@@ -965,7 +1280,7 @@ impl NamedPipeConnection {
             return Ok(0);
         }
 
-        // Data is available, read it
+        // Data is available, read it (for overlapped handles, this uses overlapped I/O)
         self.read(buffer)
     }
 
@@ -1071,6 +1386,7 @@ impl Drop for NamedPipeConnection {
 
 // Non-Windows stub implementation
 #[cfg(not(windows))]
+#[derive(Debug)]
 pub struct NamedPipeConnection {
     _marker: core::marker::PhantomData<()>,
 }
@@ -1135,7 +1451,10 @@ impl NamedPipeConnection {
 #[cfg(test)]
 #[cfg(windows)]
 mod tests {
+    extern crate std;
     use super::*;
+    use alloc::format;
+    use alloc::vec;
 
     #[test]
     fn test_pipe_name_to_wide_basic() {
@@ -1179,7 +1498,7 @@ mod tests {
 
     #[test]
     fn test_pipe_process_credentials_with_sids() {
-        use super::security_descriptor::Sid;
+        use super::super::security_descriptor::Sid;
 
         let user_sid = Sid::everyone();
         let group_sids = vec![Sid::local_system()];
@@ -1260,7 +1579,9 @@ mod tests {
 #[cfg(test)]
 #[cfg(not(windows))]
 mod tests {
+    extern crate std;
     use super::*;
+    use alloc::format;
 
     #[test]
     fn test_pipe_name_to_wide_basic() {

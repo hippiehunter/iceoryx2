@@ -270,7 +270,11 @@ impl ClientSession {
     ///
     /// `true` if the port was found and removed, `false` otherwise.
     pub fn remove_port(&mut self, port_id: u128) -> bool {
-        if let Some(pos) = self.attached_ports.iter().position(|p| p.port_id == port_id) {
+        if let Some(pos) = self
+            .attached_ports
+            .iter()
+            .position(|p| p.port_id == port_id)
+        {
             let port_info = self.attached_ports.remove(pos);
             self.resource_usage.decrement_port(port_info.port_type);
             true

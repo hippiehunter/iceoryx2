@@ -212,7 +212,6 @@ mod security_mode_validation {
             .publish_subscribe::<u64>()
             .create()
             .expect("Failed to create service");
-
         // Open with another secured node
         let node2 = NodeBuilder::new()
             .config(&config)

@@ -317,9 +317,7 @@ impl<C: CalClient> IamClient<C> {
     }
 
     /// Handles the response to a CreateService request.
-    fn handle_create_service_response(
-        response: IamResponse,
-    ) -> Result<ServiceId, IamClientError> {
+    fn handle_create_service_response(response: IamResponse) -> Result<ServiceId, IamClientError> {
         match response {
             IamResponse::CreateServiceOk { service_id } => Ok(service_id),
             IamResponse::Denied { .. } => Err(IamClientError::RequestDenied),
@@ -327,7 +325,6 @@ impl<C: CalClient> IamClient<C> {
             _ => Err(IamClientError::ProtocolError),
         }
     }
-
 
     // ========================================================================
     // Attach Operations
@@ -940,7 +937,8 @@ impl<C: CalClient> IamClient<C> {
     /// ```
     pub fn try_receive_notification(
         &mut self,
-    ) -> Result<Option<(super::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError> {
+    ) -> Result<Option<(super::protocol::IamNotification, Vec<PlatformHandle>)>, IamClientError>
+    {
         self.ensure_active()?;
 
         let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
@@ -1125,7 +1123,11 @@ mod tests {
         fn receive_handles(
             &self,
         ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
-            let handles = self.handles_to_return.borrow_mut().drain(..).collect::<Vec<_>>();
+            let handles = self
+                .handles_to_return
+                .borrow_mut()
+                .drain(..)
+                .collect::<Vec<_>>();
             if handles.is_empty() {
                 Ok(None)
             } else {

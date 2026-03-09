@@ -431,11 +431,7 @@ impl SegmentManager {
             .authorize_session(SegmentId::new(segment_id_key), consumer_session_id)
             .ok()?;
         let segment = self.segments.get(&segment_id_key)?;
-        let info = SegmentInfo::new(
-            SegmentId::new(segment_id_key),
-            segment.size,
-            segment.access,
-        );
+        let info = SegmentInfo::new(SegmentId::new(segment_id_key), segment.size, segment.access);
         Some((info, handle))
     }
 
@@ -526,11 +522,7 @@ impl SegmentManager {
             .authorize_session(SegmentId::new(segment_id_key), consumer_session_id)
             .ok()?;
         let segment = self.segments.get(&segment_id_key)?;
-        let info = SegmentInfo::new(
-            SegmentId::new(segment_id_key),
-            segment.size,
-            segment.access,
-        );
+        let info = SegmentInfo::new(SegmentId::new(segment_id_key), segment.size, segment.access);
         Some((info, handle))
     }
 
@@ -722,7 +714,9 @@ impl SegmentManager {
 
     /// Gets segment info for a single segment.
     pub fn get_segment_info(&self, segment_id: SegmentId) -> Option<SegmentInfo> {
-        self.segments.get(&segment_id.value()).map(|s| s.to_segment_info())
+        self.segments
+            .get(&segment_id.value())
+            .map(|s| s.to_segment_info())
     }
 
     /// Gets segment info for all segments a session is authorized for.
@@ -752,30 +746,28 @@ mod tests {
     #[cfg(unix)]
     fn create_test_handle() -> PlatformHandle {
         use std::os::unix::io::AsRawFd;
-        let raw_fd = unsafe {
-            iceoryx2_pal_posix::posix::dup(std::io::stdout().as_raw_fd())
-        };
+        let raw_fd = unsafe { iceoryx2_pal_posix::posix::dup(std::io::stdout().as_raw_fd()) };
         unsafe { PlatformHandle::from_raw_fd(raw_fd) }
     }
 
     #[cfg(windows)]
     fn create_test_handle() -> PlatformHandle {
-        use std::os::windows::io::FromRawHandle;
         use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::FromRawHandle;
         let raw_handle = std::io::stdout().as_raw_handle();
-        let mut dup_handle = std::ptr::null_mut();
+        let mut dup_handle: isize = 0;
         unsafe {
             let current_process = windows_sys::Win32::System::Threading::GetCurrentProcess();
             windows_sys::Win32::Foundation::DuplicateHandle(
                 current_process,
-                raw_handle as *mut _,
+                raw_handle as isize,
                 current_process,
                 &mut dup_handle,
                 0,
                 0,
                 windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS,
             );
-            PlatformHandle::from_raw_handle(dup_handle)
+            PlatformHandle::from_raw_handle(dup_handle as *mut _)
         }
     }
 
@@ -786,7 +778,8 @@ mod tests {
     #[test]
     fn test_managed_segment_new() {
         let handle = create_test_handle();
-        let segment = ManagedSegment::new(SegmentId::new(0), handle, 4096, AccessRights::read_write());
+        let segment =
+            ManagedSegment::new(SegmentId::new(0), handle, 4096, AccessRights::read_write());
 
         assert_eq!(segment.id().value(), 0);
         assert_eq!(segment.size(), 4096);
@@ -800,7 +793,8 @@ mod tests {
     #[test]
     fn test_managed_segment_to_segment_info() {
         let handle = create_test_handle();
-        let segment = ManagedSegment::new(SegmentId::new(5), handle, 8192, AccessRights::read_only());
+        let segment =
+            ManagedSegment::new(SegmentId::new(5), handle, 8192, AccessRights::read_only());
 
         let info = segment.to_segment_info();
         assert_eq!(info.segment_id().value(), 5);

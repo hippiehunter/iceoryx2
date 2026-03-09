@@ -178,7 +178,9 @@ impl<
         // For secured services, request authorization from the IAM server before creating the port.
         // The IAM server verifies the process credentials and policy before allowing attachment.
         if let Some(ctx) = service.additional_resource.as_client() {
-            let buffer_size = config.buffer_size.unwrap_or(static_config.subscriber_max_buffer_size);
+            let buffer_size = config
+                .buffer_size
+                .unwrap_or(static_config.subscriber_max_buffer_size);
             match ctx.attach_subscriber(buffer_size) {
                 Ok((_port_id, _segments, _handles)) => {
                     // IAM authorization successful. In a future iteration, the returned handles

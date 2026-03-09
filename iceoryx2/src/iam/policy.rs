@@ -144,6 +144,65 @@ impl Default for ResourceLimits {
 /// This prevents accidental misconfiguration that could cause memory exhaustion.
 pub const MAX_REASONABLE_SEGMENT_SIZE: usize = 1024 * 1024 * 1024;
 
+// ============================================================================
+// QosBounds
+// ============================================================================
+
+/// Quality of Service bounds for policy enforcement.
+///
+/// These bounds constrain the QoS parameters that clients can request
+/// when attaching to a service. Values of `None` indicate no constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QosBounds {
+    /// Maximum buffer size (in elements) a port may request.
+    pub max_buffer_size: Option<usize>,
+    /// Maximum history depth a subscriber may request.
+    pub max_history: Option<usize>,
+}
+
+impl Default for QosBounds {
+    fn default() -> Self {
+        Self {
+            max_buffer_size: None,
+            max_history: None,
+        }
+    }
+}
+
+impl QosBounds {
+    /// Creates unbounded QoS (no constraints).
+    pub const fn unbounded() -> Self {
+        Self {
+            max_buffer_size: None,
+            max_history: None,
+        }
+    }
+
+    /// Creates QoS bounds with explicit limits.
+    pub const fn new(max_buffer_size: Option<usize>, max_history: Option<usize>) -> Self {
+        Self {
+            max_buffer_size,
+            max_history,
+        }
+    }
+
+    /// Checks whether a requested buffer size is within bounds.
+    pub fn check_buffer_size(&self, requested: usize) -> bool {
+        match self.max_buffer_size {
+            Some(max) => requested <= max,
+            None => true,
+        }
+    }
+
+    /// Checks whether a requested history depth is within bounds.
+    pub fn check_history(&self, requested: usize) -> bool {
+        match self.max_history {
+            Some(max) => requested <= max,
+            None => true,
+        }
+    }
+}
+
 impl ResourceLimits {
     /// Creates a new ResourceLimits with the specified values.
     ///
@@ -297,6 +356,17 @@ pub trait IamPolicy: Send + Sync {
     fn authorize_connect(&self, _credentials: &ProcessCredentials) -> PolicyDecision {
         // Default: allow all connections, authorize per-operation
         PolicyDecision::Allow
+    }
+
+    /// Get QoS bounds for a principal.
+    ///
+    /// # Arguments
+    /// * `credentials` - The credentials of the requesting process
+    ///
+    /// # Returns
+    /// The [`QosBounds`] for the principal. Default: unbounded.
+    fn get_qos_bounds(&self, _credentials: &ProcessCredentials) -> QosBounds {
+        QosBounds::unbounded()
     }
 }
 
@@ -816,8 +886,7 @@ mod tests {
         let service_name = ServiceName::new("test/segment").unwrap();
         let service_id = ServiceId::new::<Sha1>(&service_name, MessagingPattern::PublishSubscribe);
 
-        let decision =
-            policy.authorize_add_segment(&credentials, &service_id, 2048); // Request 2KB
+        let decision = policy.authorize_add_segment(&credentials, &service_id, 2048); // Request 2KB
         assert!(decision.is_denied());
         match decision {
             PolicyDecision::Deny { reason, .. } => {
@@ -972,11 +1041,7 @@ mod tests {
             PortType::Client,
         ] {
             let decision = policy.authorize_attach(&credentials, &service_id, port_type);
-            assert!(
-                decision.is_allowed(),
-                "Expected allow for {:?}",
-                port_type
-            );
+            assert!(decision.is_allowed(), "Expected allow for {:?}", port_type);
         }
     }
 
@@ -994,5 +1059,47 @@ mod tests {
             let decision = policy.authorize_create(&credentials, &service_name, pattern);
             assert!(decision.is_allowed(), "Expected allow for {:?}", pattern);
         }
+    }
+
+    // ========================================================================
+    // QosBounds Tests
+    // ========================================================================
+
+    #[test]
+    fn test_qos_bounds_default_is_unbounded() {
+        let bounds = QosBounds::default();
+        assert_eq!(bounds.max_buffer_size, None);
+        assert_eq!(bounds.max_history, None);
+    }
+
+    #[test]
+    fn test_qos_bounds_unbounded_allows_all() {
+        let bounds = QosBounds::unbounded();
+        assert!(bounds.check_buffer_size(usize::MAX));
+        assert!(bounds.check_history(usize::MAX));
+    }
+
+    #[test]
+    fn test_qos_bounds_with_limits() {
+        let bounds = QosBounds::new(Some(1024), Some(10));
+        assert!(bounds.check_buffer_size(1024));
+        assert!(!bounds.check_buffer_size(1025));
+        assert!(bounds.check_history(10));
+        assert!(!bounds.check_history(11));
+    }
+
+    #[test]
+    fn test_qos_bounds_partial_limits() {
+        let bounds = QosBounds::new(Some(512), None);
+        assert!(!bounds.check_buffer_size(513));
+        assert!(bounds.check_history(usize::MAX));
+    }
+
+    #[test]
+    fn test_default_policy_qos_bounds_are_unbounded() {
+        let policy = DefaultPolicy::with_owner(1000);
+        let creds = ProcessCredentials::new(1, 1000, 100);
+        let bounds = policy.get_qos_bounds(&creds);
+        assert_eq!(bounds, QosBounds::unbounded());
     }
 }

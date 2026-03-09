@@ -56,6 +56,11 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
 
+use alloc::format;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use core::fmt::{self, Display, Formatter};
 use core::hash::Hash;
 
@@ -303,6 +308,13 @@ pub struct SecurityDescriptor {
 }
 
 #[cfg(windows)]
+impl core::fmt::Debug for SecurityDescriptor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SecurityDescriptor").finish_non_exhaustive()
+    }
+}
+
+#[cfg(windows)]
 impl SecurityDescriptor {
     /// Creates a security descriptor from an SDDL string.
     ///
@@ -538,7 +550,10 @@ impl SecurityDescriptor {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
+    use alloc::format;
+    use alloc::vec;
 
     #[test]
     fn test_security_error_display() {
@@ -561,6 +576,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
     fn test_security_error_traits() {
         // Test Clone
         let error = SecurityError::InvalidSddlString;
