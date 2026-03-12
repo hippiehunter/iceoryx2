@@ -1095,10 +1095,13 @@ mod string {
         assert_that!(sut_1.push_bytes(b"funzel"), is_ok);
         assert_that!(sut_2.push_bytes(b"rafunzel"), is_ok);
 
-        assert_that!(sut_1 == sut_1, eq true);
+        let mut sut_3 = factory.create_sut();
+        assert_that!(sut_3.push_bytes(b"funzel"), is_ok);
+        // sut_1 and sut_3 have same content
+        assert_that!(sut_1 == sut_3, eq true);
         assert_that!(sut_1 == sut_2, eq false);
 
-        assert_that!(*sut_1 == *sut_1, eq true);
+        assert_that!(*sut_1 == *sut_3, eq true);
         assert_that!(*sut_1 == *sut_2, eq false);
     }
 
