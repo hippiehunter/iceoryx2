@@ -68,6 +68,13 @@ pub enum ClientCreateError {
     MaxActiveRequestsExceedsMaxSupportedActiveRequestsOfService,
     /// The [`UniqueClientId`](crate::identifiers::UniqueClientId) could not be generated.
     UnableToGenerateUniqueClientId,
+    /// The IAM server denied the attach request for this client.
+    /// This typically occurs when the IAM policy does not allow the requesting
+    /// process to create clients on this service.
+    IamAuthorizationDenied,
+    /// Failed to communicate with the IAM server.
+    /// The IAM connection may have been lost or the server may be unavailable.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for ClientCreateError {

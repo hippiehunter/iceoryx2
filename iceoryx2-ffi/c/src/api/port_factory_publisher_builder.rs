@@ -61,7 +61,10 @@ impl From<AllocationStrategy> for iox2_allocation_strategy_e {
     fn from(value: AllocationStrategy) -> Self {
         match value {
             AllocationStrategy::Static => iox2_allocation_strategy_e::STATIC,
-            AllocationStrategy::BestFit => iox2_allocation_strategy_e::BEST_FIT,
+            // IamManaged is an internal strategy for secured mode, not exposed to C.
+            AllocationStrategy::BestFit | AllocationStrategy::IamManaged => {
+                iox2_allocation_strategy_e::BEST_FIT
+            }
             AllocationStrategy::PowerOfTwo => iox2_allocation_strategy_e::POWER_OF_TWO,
         }
     }
@@ -115,6 +118,10 @@ pub enum iox2_publisher_create_error_e {
     FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY,
     UNABLE_TO_CREATE_PORT_TAG,
     UNABLE_TO_GENERATE_UNIQUE_PUBLISHER_ID,
+    #[CStr = "iam authorization denied"]
+    IAM_AUTHORIZATION_DENIED,
+    #[CStr = "iam connection failed"]
+    IAM_CONNECTION_FAILED,
 }
 
 impl IntoCInt for PublisherCreateError {
@@ -134,6 +141,12 @@ impl IntoCInt for PublisherCreateError {
             }
             PublisherCreateError::UnableToGenerateUniquePublisherId => {
                 iox2_publisher_create_error_e::UNABLE_TO_GENERATE_UNIQUE_PUBLISHER_ID
+            }
+            PublisherCreateError::IamAuthorizationDenied => {
+                iox2_publisher_create_error_e::IAM_AUTHORIZATION_DENIED
+            }
+            PublisherCreateError::IamConnectionFailed => {
+                iox2_publisher_create_error_e::IAM_CONNECTION_FAILED
             }
         }) as c_int
     }

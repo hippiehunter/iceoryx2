@@ -71,7 +71,7 @@ mod os;
 #[cfg(not(platform_override))]
 #[cfg(target_os = "windows")]
 #[path = "windows/os.rs"]
-mod os;
+pub mod os;
 
 #[cfg(not(platform_override))]
 #[cfg(target_os = "none")]
@@ -116,3 +116,12 @@ pub mod posix {
 
     pub use crate::os::posix::*;
 }
+
+/// Re-export of Windows-specific PAL modules.
+///
+/// On Windows, the `os::posix` module contains Windows-specific submodules
+/// (e.g., `handle_passing`, `named_pipe`, `mman`, `win32_handle_translator`)
+/// that are not part of the POSIX API surface. This re-export makes them
+/// accessible via `iceoryx2_pal_posix::windows::*`.
+#[cfg(target_os = "windows")]
+pub use os::posix as windows;

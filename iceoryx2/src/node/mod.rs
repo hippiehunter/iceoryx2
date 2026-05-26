@@ -176,6 +176,7 @@ use iceoryx2_bb_posix::mutex::MutexType;
 use iceoryx2_bb_posix::process::Process;
 use iceoryx2_bb_posix::process::ProcessId;
 use iceoryx2_bb_posix::signal::SignalHandler;
+use iceoryx2_bb_posix::unique_system_id::UniqueSystemId;
 use iceoryx2_bb_system_types::file_name::FileName;
 use iceoryx2_cal::bag::BagFamily;
 use iceoryx2_cal::bag::BagHandleFamily;
@@ -208,6 +209,13 @@ impl UniqueNodeId {
     pub(crate) fn as_file_name(&self) -> FileName {
         fatal_panic!(from self, when FileName::new(self.0.value().to_string().as_bytes()),
                         "This should never happen! The NodeId shall be always a valid FileName.")
+    }
+
+    /// Returns the node id as [`UniqueSystemId`] for the IAM handshake. The raw id is
+    /// reinterpreted, which is lossless for ids produced by the default
+    /// [`UniqueSystemIdGenerator`](crate::unique_id_generator::unique_system_id::UniqueSystemIdGenerator).
+    pub(crate) fn unique_system_id(&self) -> UniqueSystemId {
+        UniqueSystemId::from(self.0.value())
     }
 }
 

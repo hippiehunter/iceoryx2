@@ -39,6 +39,10 @@ pub enum iox2_server_create_error_e {
     FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY,
     UNABLE_TO_CREATE_PORT_TAG,
     UNABLE_TO_GENERATE_UNIQUE_SERVER_ID,
+    #[CStr = "iam authorization denied"]
+    IAM_AUTHORIZATION_DENIED,
+    #[CStr = "iam connection failed"]
+    IAM_CONNECTION_FAILED,
 }
 
 impl IntoCInt for ServerCreateError {
@@ -58,6 +62,12 @@ impl IntoCInt for ServerCreateError {
             }
             ServerCreateError::UnableToGenerateUniqueServerId => {
                 iox2_server_create_error_e::UNABLE_TO_GENERATE_UNIQUE_SERVER_ID
+            }
+            ServerCreateError::IamAuthorizationDenied => {
+                iox2_server_create_error_e::IAM_AUTHORIZATION_DENIED
+            }
+            ServerCreateError::IamConnectionFailed => {
+                iox2_server_create_error_e::IAM_CONNECTION_FAILED
             }
         }) as c_int
     }

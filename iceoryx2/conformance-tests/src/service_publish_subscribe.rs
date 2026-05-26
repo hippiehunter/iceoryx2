@@ -2941,7 +2941,7 @@ pub mod service_publish_subscribe {
         while let Ok(Some(sample)) = subscriber.receive() {
             sample_count += 1;
             let expected_sample_value = HISTORY_SIZE / 2 + sample_count;
-            assert_that!(*sample, eq(expected_sample_value as _));
+            assert_that!(*sample, eq(expected_sample_value as u64));
         }
 
         assert_that!(sample_count, eq(HISTORY_SIZE / 2));
@@ -2986,7 +2986,7 @@ pub mod service_publish_subscribe {
         while let Ok(Some(sample)) = subscriber1.receive() {
             sample_count += 1;
             let expected_sample_value = HISTORY_SIZE / 2 + sample_count;
-            assert_that!(*sample, eq(expected_sample_value as _));
+            assert_that!(*sample, eq(expected_sample_value as u64));
         }
         assert_that!(sample_count, eq(HISTORY_SIZE / 2));
 
@@ -2994,7 +2994,7 @@ pub mod service_publish_subscribe {
         while let Ok(Some(sample)) = subscriber2.receive() {
             sample_count += 1;
             let expected_sample_value = (HISTORY_SIZE - HISTORY_SIZE / 4) + sample_count;
-            assert_that!(*sample, eq(expected_sample_value as _));
+            assert_that!(*sample, eq(expected_sample_value as u64));
         }
         assert_that!(sample_count, eq(HISTORY_SIZE / 4));
     }

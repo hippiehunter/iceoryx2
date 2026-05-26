@@ -40,6 +40,10 @@ pub enum iox2_subscriber_create_error_e {
     HISTORY_REQUEST_EXCEEDS_HISTORY_SIZE_OF_SERVICE,
     HISTORY_REQUEST_EXCEEDS_BUFFER_SIZE_OF_SUBSCRIBER,
     UNABLE_TO_GENERATE_UNIQUE_SUBSCRIBER_ID,
+    #[CStr = "iam authorization denied"]
+    IAM_AUTHORIZATION_DENIED,
+    #[CStr = "iam connection failed"]
+    IAM_CONNECTION_FAILED,
 }
 
 impl IntoCInt for SubscriberCreateError {
@@ -65,6 +69,12 @@ impl IntoCInt for SubscriberCreateError {
             }
             SubscriberCreateError::UnableToGenerateUniqueSubscriberId => {
                 iox2_subscriber_create_error_e::UNABLE_TO_GENERATE_UNIQUE_SUBSCRIBER_ID
+            }
+            SubscriberCreateError::IamAuthorizationDenied => {
+                iox2_subscriber_create_error_e::IAM_AUTHORIZATION_DENIED
+            }
+            SubscriberCreateError::IamConnectionFailed => {
+                iox2_subscriber_create_error_e::IAM_CONNECTION_FAILED
             }
         }) as c_int
     }

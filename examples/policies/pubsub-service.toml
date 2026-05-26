@@ -1,0 +1,35 @@
+# Example policy for a publish-subscribe service.
+#
+# Place policy files in the directory configured by
+# [global.node.security.iam.policy_dir] in iceoryx2.toml.
+# File name must match the sanitized service name (slashes become underscores).
+
+[service]
+name = "sensor/data"
+
+# Allow user 1000 to publish and subscribe
+[[allow]]
+principal = { uid = 1000 }
+roles = ["publisher", "subscriber"]
+
+# Allow anyone in group 100 to subscribe
+[[allow]]
+principal = { gid = 100 }
+roles = ["subscriber"]
+
+# Allow UIDs 2000-2999 to subscribe (array format)
+[[allow]]
+principal = { uid_range = [2000, 2999] }
+roles = ["subscriber"]
+
+# Resource limits
+[limits]
+max_publishers = 1
+max_subscribers = 100
+max_segments = 16
+max_segment_size = "64MB"
+
+# QoS bounds
+[qos]
+max_buffer_size = 1024
+max_history = 10

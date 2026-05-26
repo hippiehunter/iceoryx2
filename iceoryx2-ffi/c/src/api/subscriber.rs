@@ -36,6 +36,7 @@ pub enum iox2_receive_error_e {
     EXCEEDS_MAX_BORROWS = IOX2_OK as isize + 1,
     FAILED_TO_ESTABLISH_CONNECTION,
     UNABLE_TO_MAP_SENDERS_DATA_SEGMENT,
+    SEGMENT_HANDLE_NOT_AVAILABLE,
 }
 
 impl IntoCInt for ReceiveError {
@@ -48,6 +49,9 @@ impl IntoCInt for ReceiveError {
             ReceiveError::ConnectionFailure(ConnectionFailure::UnableToMapSendersDataSegment(
                 _,
             )) => iox2_receive_error_e::UNABLE_TO_MAP_SENDERS_DATA_SEGMENT,
+            ReceiveError::ConnectionFailure(ConnectionFailure::SegmentHandleNotAvailable) => {
+                iox2_receive_error_e::SEGMENT_HANDLE_NOT_AVAILABLE
+            }
         }) as c_int
     }
 }
@@ -57,6 +61,7 @@ impl IntoCInt for ReceiveError {
 pub enum iox2_connection_failure_e {
     FAILED_TO_ESTABLISH_CONNECTION,
     UNABLE_TO_MAP_SENDERS_DATA_SEGMENT,
+    SEGMENT_HANDLE_NOT_AVAILABLE,
 }
 
 impl IntoCInt for ConnectionFailure {
@@ -67,6 +72,9 @@ impl IntoCInt for ConnectionFailure {
             }
             ConnectionFailure::UnableToMapSendersDataSegment(_) => {
                 iox2_connection_failure_e::UNABLE_TO_MAP_SENDERS_DATA_SEGMENT
+            }
+            ConnectionFailure::SegmentHandleNotAvailable => {
+                iox2_connection_failure_e::SEGMENT_HANDLE_NOT_AVAILABLE
             }
         }) as c_int
     }

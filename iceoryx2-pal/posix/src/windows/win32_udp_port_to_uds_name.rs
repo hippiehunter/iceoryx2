@@ -20,6 +20,9 @@ use windows_sys::Win32::{
     },
 };
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::posix::{c_string_length, types::*};
 use core::ffi::CStr;
 use core::hint::spin_loop;

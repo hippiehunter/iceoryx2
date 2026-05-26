@@ -49,6 +49,7 @@ use super::{publisher::PortFactoryPublisher, subscriber::PortFactorySubscriber};
 use crate::identifiers::UniqueServiceId;
 use crate::node::NodeListFailure;
 use crate::service::attribute::AttributeSet;
+use crate::service::resource::Secured;
 use crate::service::resource::publish_subscribe::PublishSubscribeResources;
 use crate::service::service_hash::ServiceHash;
 use crate::service::service_name::ServiceName;
@@ -71,7 +72,7 @@ pub struct PortFactory<
     Payload: IceoryxSend + Debug + ?Sized,
     UserHeader: Debug + ZeroCopySend,
 > {
-    pub(crate) service: SharedServiceState<Service, PublishSubscribeResources<Service>>,
+    pub(crate) service: SharedServiceState<Service, Secured<PublishSubscribeResources<Service>>>,
     _payload: PhantomData<Payload>,
     _user_header: PhantomData<UserHeader>,
 }
@@ -155,7 +156,9 @@ impl<
     UserHeader: Debug + ZeroCopySend,
 > PortFactory<Service, Payload, UserHeader>
 {
-    pub(crate) fn new(service: ServiceState<Service, PublishSubscribeResources<Service>>) -> Self {
+    pub(crate) fn new(
+        service: ServiceState<Service, Secured<PublishSubscribeResources<Service>>>,
+    ) -> Self {
         Self {
             service: SharedServiceState {
                 state: Arc::new(service),
@@ -219,6 +222,7 @@ impl<
     pub fn type_definition(&self) -> Option<&<Service::StaticStorage as StaticStorage>::View> {
         self.service
             .additional_resource()
+            .inner
             .type_definition()
             .map(|v| v.view())
     }

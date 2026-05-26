@@ -32,6 +32,7 @@ use crate::service::builder::{
 use crate::service::dynamic_config::MessagingPatternSettings;
 use crate::service::dynamic_config::request_response::DynamicConfigSettings;
 use crate::service::port_factory::request_response;
+use crate::service::resource::Secured;
 use crate::service::resource::ServiceResource;
 use crate::service::resource::request_response::{
     RequestResponseResourceConfig, RequestResponseResources,
@@ -108,6 +109,19 @@ pub enum RequestResponseOpenError {
     /// When using a serialized format such as Flatbuffers, the iceoryx2 service requires a specific
     /// type definition format. If the wrong type definition format was provided, this error is returned.
     InvalidTypeDefinition,
+    /// The [`Service`] was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
+    /// Failed to connect to the IAM server when opening a secured service.
+    /// This can happen if the service creator has crashed or the control channel is unavailable.
+    IamConnectionFailed,
+    /// The IAM handshake failed when opening a secured service.
+    /// This can happen if the protocol version is incompatible or the server rejected the connection.
+    IamHandshakeFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for RequestResponseOpenError {
@@ -135,6 +149,9 @@ impl From<ServiceState> for RequestResponseOpenError {
             ServiceState::Corrupted => RequestResponseOpenError::ServiceInCorruptedState,
             ServiceState::InternalFailure => RequestResponseOpenError::InternalFailure,
             ServiceState::VersionMismatch => RequestResponseOpenError::VersionMismatch,
+            ServiceState::IncompatibleSecurityMode => {
+                RequestResponseOpenError::IncompatibleSecurityMode
+            }
         }
     }
 }
@@ -173,6 +190,9 @@ impl From<ServiceOpenError> for RequestResponseOpenError {
             ServiceOpenError::Interrupt => RequestResponseOpenError::Interrupt,
             ServiceOpenError::UnableToAcquireTypeDefinition => {
                 RequestResponseOpenError::UnableToAcquireTypeDefinition
+            }
+            ServiceOpenError::IncompatibleSecurityMode => {
+                RequestResponseOpenError::IncompatibleSecurityMode
             }
         }
     }
@@ -219,7 +239,13 @@ impl From<RequestResponseOpenError> for ServiceOpenError {
             | RequestResponseOpenError::IncompatibleAttributes
             | RequestResponseOpenError::IncompatibleBehaviorForFireAndForgetRequests
             | RequestResponseOpenError::IncompatibleOverflowBehaviorForRequests
-            | RequestResponseOpenError::IncompatibleOverflowBehaviorForResponses => ServiceOpenError::InternalFailure,
+            | RequestResponseOpenError::IncompatibleOverflowBehaviorForResponses
+            | RequestResponseOpenError::IamConnectionFailed
+            | RequestResponseOpenError::IamHandshakeFailed
+            | RequestResponseOpenError::DevPermissionsIncompatibleWithSecuredMode => ServiceOpenError::InternalFailure,
+            RequestResponseOpenError::IncompatibleSecurityMode => {
+                ServiceOpenError::IncompatibleSecurityMode
+            }
             RequestResponseOpenError::UnableToAcquireTypeDefinition => ServiceOpenError::UnableToAcquireTypeDefinition
         }
     }
@@ -257,6 +283,13 @@ pub enum RequestResponseCreateError {
     InvalidTypeDefinition,
     /// The [`UniqueServiceId`] could not be generated.
     UnableToGenerateUniqueServiceId,
+    /// Failed to create the IAM server for a secured service.
+    /// This can happen if the control channel listener cannot be created.
+    IamServerCreationFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for RequestResponseCreateError {
@@ -273,7 +306,8 @@ impl From<ServiceState> for RequestResponseCreateError {
             ServiceState::Interrupt => RequestResponseCreateError::Interrupt,
             ServiceState::IncompatiblePayload
             | ServiceState::IncompatibleMessagingPattern
-            | ServiceState::VersionMismatch => RequestResponseCreateError::AlreadyExists,
+            | ServiceState::VersionMismatch
+            | ServiceState::IncompatibleSecurityMode => RequestResponseCreateError::AlreadyExists,
             ServiceState::InsufficientPermissions => {
                 RequestResponseCreateError::InsufficientPermissions
             }
@@ -881,6 +915,11 @@ impl<
     > {
         let msg = "Unable to create request response service";
 
+        if self.base.dev_permissions_conflicts_with_secured() {
+            fail!(from self, with RequestResponseCreateError::DevPermissionsIncompatibleWithSecuredMode,
+                "{} since the dev_permissions feature is incompatible with secured services.", msg);
+        }
+
         let generate_dynamic_config = |service_config: &StaticConfig| {
             let reqres_config = service_config.request_response();
             let dynamic_config_setting = DynamicConfigSettings {
@@ -921,7 +960,7 @@ impl<
             |_| Ok(()),
             generate_dynamic_config,
             |service_config| {
-                RequestResponseResources::create(
+                let inner = RequestResponseResources::create(
                     service_config,
                     &RequestResponseResourceConfig::<ServiceType> {
                         request: TypeDefinition {
@@ -938,7 +977,12 @@ impl<
                         },
                         shared_node: self.base.shared_node.clone(),
                     },
-                )
+                )?;
+                let security = super::secured::create_secured_resource::<ServiceType>(
+                    &self.base.shared_node,
+                    service_config,
+                )?;
+                Ok(Secured::new(inner, security))
             },
             |_| {},
             |service_config| {
@@ -981,6 +1025,11 @@ impl<
             }
         }
 
+        if self.base.dev_permissions_conflicts_with_secured() {
+            fail!(from self, with RequestResponseOpenError::DevPermissionsIncompatibleWithSecuredMode,
+                "{} since the dev_permissions feature is incompatible with secured services.", msg);
+        }
+
         let service_state = self.base.open(
             msg,
             || self.is_service_available(msg),
@@ -988,7 +1037,7 @@ impl<
                 self.verify_service_configuration(msg, existing_service_config, required_attributes)
             },
             |service_config| {
-                RequestResponseResources::open(
+                let inner = RequestResponseResources::open(
                     service_config,
                     &RequestResponseResourceConfig::<ServiceType> {
                         request: TypeDefinition {
@@ -1007,7 +1056,12 @@ impl<
                         },
                         shared_node: self.base.shared_node.clone(),
                     },
-                )
+                )?;
+                let security = super::secured::open_secured_resource::<ServiceType>(
+                    &self.base.shared_node,
+                    service_config,
+                )?;
+                Ok(Secured::new(inner, security))
             },
         )?;
 

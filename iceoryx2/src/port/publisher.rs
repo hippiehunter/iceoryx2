@@ -131,6 +131,7 @@ use iceoryx2_cal::zero_copy_connection::{
 };
 use iceoryx2_log::{fail, warn};
 
+use crate::iam::error::IamClientError;
 use crate::port::details::chunk::ChunkMut;
 use crate::port::details::data_segment_shared_state::DataSegmentSharedState;
 use crate::port::details::sender::*;
@@ -146,6 +147,7 @@ use crate::service::marker::{CustomHeaderMarker, CustomPayloadMarker};
 use crate::service::naming_scheme::data_segment_name;
 use crate::service::port_factory::publisher::{LocalPublisherConfig, PortFactoryPublisher};
 use crate::service::resource::publish_subscribe::PublishSubscribeResources;
+use crate::service::resource::{Secured, ServiceResource};
 use crate::service::static_config::message_type_details::TypeVariant;
 use crate::service::{self};
 
@@ -172,6 +174,13 @@ pub enum PublisherCreateError {
     UnableToCreatePortTag,
     /// The [`UniquePublisherId`] could not be generated.
     UnableToGenerateUniquePublisherId,
+    /// The IAM server denied the attach request for this publisher.
+    /// This typically occurs when the IAM policy does not allow the requesting
+    /// process to create publishers on this service.
+    IamAuthorizationDenied,
+    /// Failed to communicate with the IAM server.
+    /// The IAM connection may have been lost or the server may be unavailable.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for PublisherCreateError {
@@ -201,7 +210,7 @@ impl OffsetAndSize {
 #[derive(Debug)]
 pub struct PublisherSharedState<Service: service::Service> {
     config: LocalPublisherConfig,
-    pub(crate) sender: Sender<Service, PublishSubscribeResources<Service>>,
+    pub(crate) sender: Sender<Service, Secured<PublishSubscribeResources<Service>>>,
     subscriber_list_state: UnsafeCell<<Service::Bag as BagFamily>::BagState<SubscriberDetails>>,
     history: Option<UnsafeCell<Queue<OffsetAndSize>>>,
     is_active: AtomicBool,
@@ -263,7 +272,7 @@ impl<Service: service::Service> Abandonable for PublisherSharedState<Service> {
     unsafe fn abandon_in_place(mut this: NonNull<Self>) {
         let this = unsafe { this.as_mut() };
         unsafe {
-            Sender::<Service, PublishSubscribeResources<Service>>::abandon_in_place(
+            Sender::<Service, Secured<PublishSubscribeResources<Service>>>::abandon_in_place(
                 NonNull::from_mut(&mut this.sender),
             )
         }
@@ -316,7 +325,7 @@ impl<Service: service::Service> PublisherSharedState<Service> {
     }
 
     fn update_connections(&self) -> Result<(), ConnectionFailure> {
-        if unsafe {
+        let connections_changed = unsafe {
             self.sender
                 .service_state
                 .dynamic_storage()
@@ -324,7 +333,20 @@ impl<Service: service::Service> PublisherSharedState<Service> {
                 .publish_subscribe()
                 .subscribers
                 .update_state(&mut *self.subscriber_list_state.get())
-        } {
+        };
+        // In secured mode the publisher (producer) creates the connection channel and brokers it
+        // by handle; establishing a connection to a known subscriber can transiently fail (e.g. a
+        // channel create/register hiccup). The subscriber-list change counter is edge-triggered
+        // and will not fire again for an already-known subscriber, so re-attempt every cycle in
+        // secured mode to self-heal. The public (non-secured) path keeps the edge-gated behaviour
+        // byte-for-byte.
+        let force_secured = self
+            .sender
+            .service_state
+            .additional_resource()
+            .as_client()
+            .is_some();
+        if connections_changed || force_secured {
             fail!(from self, when self.force_update_connections(),
                 "Connections were updated only partially since at least one connection to a Subscriber port failed.");
         }
@@ -334,7 +356,7 @@ impl<Service: service::Service> PublisherSharedState<Service> {
 
     fn deliver_sample_history(
         &self,
-        connection: &Connection<Service, PublishSubscribeResources<Service>>,
+        connection: &Connection<Service, Secured<PublishSubscribeResources<Service>>>,
         history_request: usize,
     ) {
         match &self.history {
@@ -468,6 +490,29 @@ impl<
         let origin = "Publisher::new()";
         let config = &publisher_factory.config;
         let service = &publisher_factory.factory.service;
+
+        // For secured services, request authorization from the IAM server before creating the port.
+        // The IAM server verifies the process credentials and policy before allowing attachment.
+        let secured_ctx = service.additional_resource().as_client();
+        if let Some(ctx) = secured_ctx {
+            match ctx.attach_publisher(
+                service.static_config().publish_subscribe().history_size,
+                config.initial_max_slice_len,
+            ) {
+                Ok((_port_id, _segments, _handles)) => {
+                    // IAM authorization successful.
+                }
+                Err(IamClientError::RequestDenied) => {
+                    fail!(from origin, with PublisherCreateError::IamAuthorizationDenied,
+                        "{} since the IAM server denied the attach request.", msg);
+                }
+                Err(e) => {
+                    fail!(from origin, with PublisherCreateError::IamConnectionFailed,
+                        "{} since communication with the IAM server failed: {:?}.", msg, e);
+                }
+            }
+        }
+
         let port_id = fail!(from origin,
             when UniquePublisherId::new::<Service>(config.port_name, service.shared_node().id_generator()),
             with PublisherCreateError::UnableToGenerateUniquePublisherId,
@@ -527,26 +572,95 @@ impl<
         let global_config = service.shared_node().config();
 
         let segment_name = data_segment_name(publisher_details.publisher_id.value());
-        let data_segment = match data_segment_type {
-            DataSegmentType::Static => DataSegment::create_static_segment(
-                &segment_name,
-                sample_layout,
-                global_config,
-                number_of_samples,
-            ),
-            DataSegmentType::Dynamic => DataSegment::create_dynamic_segment(
-                &segment_name,
-                sample_layout,
-                global_config,
-                number_of_samples,
-                config.allocation_strategy,
-            ),
-        };
 
-        let data_segment = fail!(from origin,
-                when data_segment,
+        // In secured mode with static segments, create anonymous segments and register
+        // the handle with IAM for brokering to subscribers.
+        let is_secured = service.additional_resource().as_client().is_some();
+        let data_segment = if is_secured && data_segment_type == DataSegmentType::Static {
+            let (segment, handle) = fail!(from origin,
+                when DataSegment::create_anonymous_static_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_samples,
+                ),
                 with PublisherCreateError::UnableToCreateDataSegment,
-                "{} since the data segment could not be acquired.", msg);
+                "{} since the anonymous data segment could not be created.", msg);
+
+            // Register the handle with the IAM server
+            if let Some(ctx) = service.additional_resource().as_client() {
+                let segment_size =
+                    sample_layout.size() * number_of_samples + sample_layout.align() - 1;
+                if let Err(e) = ctx.register_segment(
+                    publisher_details.publisher_id.value(),
+                    segment_size,
+                    &handle,
+                ) {
+                    warn!(from origin,
+                        "Failed to register segment handle with IAM server: {:?}. \
+                         Subscribers will not be able to open this segment via IAM.", e);
+                }
+            }
+            segment
+        } else if is_secured && data_segment_type == DataSegmentType::Dynamic {
+            // IAM-managed resizable segments: create the management segment and the initial data
+            // segment (segment id 0) anonymously (memfd-backed) and broker their handles via IAM,
+            // mirroring the static path. Runtime growth segments continue to flow through the
+            // NeedSegment -> ctx.add_segment(...) path. Registration MUST happen before the port
+            // announces itself (add_publisher_id below) so a subscriber that discovers this
+            // publisher always finds the handles registered.
+            let (segment, handles) = fail!(from origin,
+                when DataSegment::create_dynamic_segment_iam_managed(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_samples,
+                ),
+                with PublisherCreateError::UnableToCreateDataSegment,
+                "{} since the IAM-managed dynamic data segment could not be created.", msg);
+
+            if let Some(ctx) = service.additional_resource().as_client() {
+                let port = publisher_details.publisher_id.value();
+                if let Err(e) =
+                    ctx.register_mgmt_segment(port, handles.mgmt_size, &handles.mgmt_handle)
+                {
+                    warn!(from origin,
+                        "Failed to register management segment handle with IAM server: {:?}. \
+                         Subscribers will not be able to open this segment via IAM.", e);
+                }
+                if let Err(e) = ctx.register_dynamic_segment(
+                    port,
+                    handles.initial_segment_id.value(),
+                    handles.initial_segment_size,
+                    &handles.initial_segment_handle,
+                ) {
+                    warn!(from origin,
+                        "Failed to register initial dynamic segment handle with IAM server: {:?}. \
+                         Subscribers will not be able to open this segment via IAM.", e);
+                }
+            }
+            segment
+        } else {
+            let result = match data_segment_type {
+                DataSegmentType::Static => DataSegment::create_static_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_samples,
+                ),
+                DataSegmentType::Dynamic => DataSegment::create_dynamic_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_samples,
+                    config.allocation_strategy,
+                ),
+            };
+            fail!(from origin,
+                when result,
+                with PublisherCreateError::UnableToCreateDataSegment,
+                "{} since the data segment could not be acquired.", msg)
+        };
 
         let publisher_shared_state =
             <Service as service::Service>::ArcThreadSafetyPolicy::new(PublisherSharedState {

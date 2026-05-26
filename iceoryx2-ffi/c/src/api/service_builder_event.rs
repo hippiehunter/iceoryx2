@@ -77,6 +77,8 @@ pub enum iox2_event_open_or_create_error_e {
     O_IS_MARKED_FOR_DESTRUCTION,
     #[CStr = "interrupt"]
     O_INTERRUPT,
+    #[CStr = "incompatible security mode"]
+    O_INCOMPATIBLE_SECURITY_MODE,
     #[CStr = "service in corrupted state"]
     C_SERVICE_IN_CORRUPTED_STATE,
     #[CStr = "internal failure"]
@@ -97,6 +99,16 @@ pub enum iox2_event_open_or_create_error_e {
     C_OLD_CONNECTION_STILL_ACTIVE,
     #[CStr = "interrupt"]
     C_INTERRUPT,
+    #[CStr = "IAM server creation failed"]
+    C_IAM_SERVER_CREATION_FAILED,
+    #[CStr = "IAM connection failed"]
+    O_IAM_CONNECTION_FAILED,
+    #[CStr = "IAM handshake failed"]
+    O_IAM_HANDSHAKE_FAILED,
+    #[CStr = "dev_permissions feature is incompatible with secured mode"]
+    O_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
+    #[CStr = "dev_permissions feature is incompatible with secured mode"]
+    C_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
     #[CStr = "same service is created and removed repeatedly"]
     SYSTEM_IN_FLUX,
     #[CStr = "unique service id could not be generated"]
@@ -162,6 +174,18 @@ impl IntoCInt for EventOpenError {
             EventOpenError::VersionMismatch => {
                 iox2_event_open_or_create_error_e::O_VERSION_MISMATCH
             }
+            EventOpenError::IncompatibleSecurityMode => {
+                iox2_event_open_or_create_error_e::O_INCOMPATIBLE_SECURITY_MODE
+            }
+            EventOpenError::IamConnectionFailed => {
+                iox2_event_open_or_create_error_e::O_IAM_CONNECTION_FAILED
+            }
+            EventOpenError::IamHandshakeFailed => {
+                iox2_event_open_or_create_error_e::O_IAM_HANDSHAKE_FAILED
+            }
+            EventOpenError::DevPermissionsIncompatibleWithSecuredMode => {
+                iox2_event_open_or_create_error_e::O_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE
+            }
         }) as c_int
     }
 }
@@ -195,6 +219,12 @@ impl IntoCInt for EventCreateError {
             }
             EventCreateError::UnableToGenerateUniqueServiceId => {
                 iox2_event_open_or_create_error_e::C_UNABLE_TO_GENERATE_UNIQUE_SERVICE_ID
+            }
+            EventCreateError::IamServerCreationFailed => {
+                iox2_event_open_or_create_error_e::C_IAM_SERVER_CREATION_FAILED
+            }
+            EventCreateError::DevPermissionsIncompatibleWithSecuredMode => {
+                iox2_event_open_or_create_error_e::C_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE
             }
         }) as c_int
     }

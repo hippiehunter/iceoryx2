@@ -25,12 +25,13 @@ use iceoryx2_bb_elementary_traits::testing::abandonable::Abandonable;
 use crate::{
     config,
     service::{
-        self,
+        self, SecurityResource,
         builder::{ServiceCreateError, ServiceOpenError},
         resource::{
             blackboard::BlackboardResources, publish_subscribe::PublishSubscribeResources,
             request_response::RequestResponseResources,
         },
+        secured_context::TypeErasedSecuredContext,
         static_config::{StaticConfig, messaging_pattern::MessagingPattern},
     },
 };
@@ -84,6 +85,17 @@ pub trait ServiceResource: Abandonable + Debug + Send {
     /// Acquires the ownership of the additional resources. When the objects go out of scope the
     /// underlying resources will be removed.
     fn acquire_ownership(&self);
+
+    /// Returns the secured client context when this resource carries an active IAM client
+    /// connection. Defaults to `None` for unsecured resources; overridden by [`Secured`] to
+    /// expose the wrapped [`SecurityResource`]'s client context.
+    ///
+    /// `TypeErasedSecuredContext` is deliberately `pub(crate)`: this accessor is an internal
+    /// security hook consumed by the ports, not part of the public `ServiceResource` contract.
+    #[allow(private_interfaces)]
+    fn as_client(&self) -> Option<&TypeErasedSecuredContext> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -117,4 +129,79 @@ impl ServiceResource for NoResource {
 
 impl Abandonable for NoResource {
     unsafe fn abandon_in_place(_this: NonNull<Self>) {}
+}
+
+/// A [`ServiceResource`] wrapper that composes an inner per-service resource `R` with an
+/// optional [`SecurityResource`] (IAM client/server context).
+///
+/// This is the single `R` slot used by every secured-capable service: the inner resource keeps
+/// upstream's create / open / `remove_stale_resources` / ownership / abandon semantics, while the
+/// security context rides alongside and is surfaced through [`ServiceResource::as_client`]. Both
+/// lifecycles are driven together by this one trait implementation, so a secured service's IAM
+/// context is acquired, abandoned, and cleaned up in lockstep with its regular resources.
+///
+/// The wrapped [`SecurityResource`] is currently always [`SecurityResource::None`] on the
+/// create/open path; the IAM wiring that populates `SecuredClient` / `SecuredServer` is
+/// established separately by the service builders while the connection/server is set up.
+#[derive(Debug)]
+pub(crate) struct Secured<R: ServiceResource> {
+    pub(crate) inner: R,
+    pub(crate) security: SecurityResource,
+}
+
+impl<R: ServiceResource> Secured<R> {
+    /// Wraps `inner` without an active security context (public service access).
+    pub(crate) fn public(inner: R) -> Self {
+        Self {
+            inner,
+            security: SecurityResource::None,
+        }
+    }
+
+    /// Wraps `inner` together with an established security context (secured service).
+    pub(crate) fn new(inner: R, security: SecurityResource) -> Self {
+        Self { inner, security }
+    }
+}
+
+impl<R: ServiceResource> ServiceResource for Secured<R> {
+    type Config = R::Config;
+
+    fn create(
+        static_config: &StaticConfig,
+        resource_config: &Self::Config,
+    ) -> Result<Self, ServiceCreateError> {
+        Ok(Self::public(R::create(static_config, resource_config)?))
+    }
+
+    fn open(
+        static_config: &StaticConfig,
+        resource_config: &Self::Config,
+    ) -> Result<Self, ServiceOpenError> {
+        Ok(Self::public(R::open(static_config, resource_config)?))
+    }
+
+    fn acquire_ownership(&self) {
+        self.inner.acquire_ownership();
+        self.security.acquire_ownership();
+    }
+
+    unsafe fn remove_stale_resources(
+        config: &config::Config,
+        static_config: &StaticConfig,
+    ) -> Result<(), RemoveStaleResourcesError> {
+        unsafe { R::remove_stale_resources(config, static_config) }
+    }
+
+    fn as_client(&self) -> Option<&TypeErasedSecuredContext> {
+        self.security.as_client()
+    }
+}
+
+impl<R: ServiceResource> Abandonable for Secured<R> {
+    unsafe fn abandon_in_place(mut this: NonNull<Self>) {
+        let this = unsafe { this.as_mut() };
+        unsafe { R::abandon_in_place(NonNull::from_mut(&mut this.inner)) };
+        unsafe { SecurityResource::abandon_in_place(NonNull::from_mut(&mut this.security)) };
+    }
 }

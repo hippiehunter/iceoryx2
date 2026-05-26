@@ -47,8 +47,10 @@ use crate::{
     prelude::AttributeSet,
     service::{
         self, ServiceState, SharedServiceState, dynamic_config,
-        resource::request_response::RequestResponseResources, service_hash::ServiceHash,
-        service_name::ServiceName, static_config,
+        resource::{Secured, request_response::RequestResponseResources},
+        service_hash::ServiceHash,
+        service_name::ServiceName,
+        static_config,
     },
 };
 use alloc::sync::Arc;
@@ -72,7 +74,7 @@ pub struct PortFactory<
     ResponsePayload: Debug + IceoryxSend + ?Sized,
     ResponseHeader: Debug + ZeroCopySend,
 > {
-    pub(crate) service: SharedServiceState<Service, RequestResponseResources<Service>>,
+    pub(crate) service: SharedServiceState<Service, Secured<RequestResponseResources<Service>>>,
     _request_payload: PhantomData<RequestPayload>,
     _request_header: PhantomData<RequestHeader>,
     _response_payload: PhantomData<ResponsePayload>,
@@ -190,7 +192,9 @@ impl<
     ResponseHeader: Debug + ZeroCopySend,
 > PortFactory<Service, RequestPayload, RequestHeader, ResponsePayload, ResponseHeader>
 {
-    pub(crate) fn new(service: ServiceState<Service, RequestResponseResources<Service>>) -> Self {
+    pub(crate) fn new(
+        service: ServiceState<Service, Secured<RequestResponseResources<Service>>>,
+    ) -> Self {
         Self {
             service: SharedServiceState {
                 state: Arc::new(service),
@@ -276,6 +280,7 @@ impl<
     ) -> Option<&<Service::StaticStorage as StaticStorage>::View> {
         self.service
             .additional_resource()
+            .inner
             .request_type_definition()
             .map(|v| v.view())
     }
@@ -286,6 +291,7 @@ impl<
     ) -> Option<&<Service::StaticStorage as StaticStorage>::View> {
         self.service
             .additional_resource()
+            .inner
             .response_type_definition()
             .map(|v| v.view())
     }

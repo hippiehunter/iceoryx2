@@ -25,4 +25,11 @@ pub enum AllocationStrategy {
     /// The memory is not increased. This may lead to an out-of-memory error when allocating.
     #[default]
     Static,
+    /// IAM-managed allocation strategy. When out of memory, the allocator reports that a new
+    /// segment is required instead of auto-creating one. The caller is responsible for requesting
+    /// a segment from the IAM server and adding it to the resizable shared memory.
+    ///
+    /// This strategy is used in secured mode to ensure all segment creation goes through
+    /// the IAM server for proper authorization and handle-based access control.
+    IamManaged,
 }

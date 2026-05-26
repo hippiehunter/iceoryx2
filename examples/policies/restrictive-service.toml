@@ -1,0 +1,34 @@
+# Example of a restrictive policy with explicit deny-all default.
+#
+# Deny rules are always evaluated before allow rules.
+# If no allow rule matches, access is denied by default.
+
+[service]
+name = "secure/vault"
+
+# Deny all by default (evaluated first)
+[[deny]]
+principal = { uid = 0 }
+reason = "Root access explicitly denied for this service"
+
+# Only specific UIDs may publish
+[[allow]]
+principal = { uid = 500 }
+roles = ["publisher"]
+
+# Only specific UIDs may subscribe
+[[allow]]
+principal = { uid = 501 }
+roles = ["subscriber"]
+
+# Tight resource limits
+[limits]
+max_publishers = 1
+max_subscribers = 1
+max_segments = 4
+max_segment_size = "1MB"
+
+# Strict QoS
+[qos]
+max_buffer_size = 64
+max_history = 1

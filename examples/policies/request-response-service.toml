@@ -1,0 +1,24 @@
+# Example policy for a request-response service.
+
+[service]
+name = "rpc/calculator"
+
+# Service owner can act as server
+[[allow]]
+principal = { uid = 1000 }
+roles = ["server"]
+
+# Any authenticated user can be a client
+[[allow]]
+principal = "any"
+roles = ["client"]
+
+# Block a specific user
+[[deny]]
+principal = { uid = 9999 }
+reason = "Service account not allowed for RPC"
+
+[limits]
+max_servers = 2
+max_clients = 50
+max_segment_size = "16MB"

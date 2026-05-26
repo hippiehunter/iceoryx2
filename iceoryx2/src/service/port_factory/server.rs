@@ -76,6 +76,13 @@ pub enum ServerCreateError {
     UnableToCreatePortTag,
     /// The [`UniqueServerId`](crate::identifiers::UniqueServerId) could not be generated.
     UnableToGenerateUniqueServerId,
+    /// The IAM server denied the attach request for this server.
+    /// This typically occurs when the IAM policy does not allow the requesting
+    /// process to create servers on this service.
+    IamAuthorizationDenied,
+    /// Failed to communicate with the IAM server.
+    /// The IAM connection may have been lost or the server may be unavailable.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for ServerCreateError {

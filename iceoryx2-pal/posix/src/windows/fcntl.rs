@@ -350,6 +350,13 @@ unsafe fn handle_to_file_path(handle: HANDLE) -> Option<[u8; MAX_PATH_LENGTH]> {
 
 pub unsafe fn fchmod(fd: int, mode: mode_t) -> int {
     let handle = match HandleTranslator::get_instance().get(fd) {
+        // Anonymous shared memory has no backing file whose DACL could be changed; access
+        // is governed solely by the rights of the (brokered) mapping handle.
+        Some(FdHandleEntry::SharedMemory(handle))
+            if handle.state_handle == INVALID_HANDLE_VALUE =>
+        {
+            return 0;
+        }
         Some(FdHandleEntry::SharedMemory(handle)) => handle.state_handle,
         Some(FdHandleEntry::File(handle)) => handle.handle,
         Some(FdHandleEntry::DirectoryStream(handle)) => return 0,

@@ -40,6 +40,9 @@ impl From<iceoryx2::prelude::AllocationStrategy> for AllocationStrategy {
             iceoryx2::prelude::AllocationStrategy::Static => AllocationStrategy::Static,
             iceoryx2::prelude::AllocationStrategy::BestFit => AllocationStrategy::BestFit,
             iceoryx2::prelude::AllocationStrategy::PowerOfTwo => AllocationStrategy::PowerOfTwo,
+            // IamManaged is an internal strategy for secured mode, not exposed to Python.
+            // Map to BestFit for exhaustive matching (should never occur in practice).
+            iceoryx2::prelude::AllocationStrategy::IamManaged => AllocationStrategy::BestFit,
         }
     }
 }

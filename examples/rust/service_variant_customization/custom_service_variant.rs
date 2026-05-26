@@ -59,6 +59,8 @@ impl iceoryx2::service::Service for CustomServiceVariant {
         CustomServiceVariant,
     >;
     type NameGenerator = iceoryx2::name_generator::default_name_generator::DefaultNameGenerator;
+    // control channel for IAM (secured mode) communication
+    type ControlChannel = iceoryx2_cal::control_channel::recommended::Ipc;
 }
 
 impl iceoryx2::service::internal::ServiceInternal<CustomServiceVariant> for CustomServiceVariant {}

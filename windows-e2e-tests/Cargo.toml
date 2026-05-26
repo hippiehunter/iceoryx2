@@ -1,0 +1,36 @@
+[package]
+name = "windows-e2e-tests"
+description = "iceoryx2: [internal] Windows end-to-end integration tests"
+categories = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+keywords = { workspace = true }
+license = { workspace = true }
+readme = false
+repository = { workspace = true }
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[lib]
+name = "windows_e2e_tests"
+path = "common/src/lib.rs"
+
+[[bin]]
+name = "win-e2e-server"
+path = "bins/src/server.rs"
+
+[[bin]]
+name = "win-e2e-client"
+path = "bins/src/client.rs"
+
+[dependencies]
+clap = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+iceoryx2-pal-posix = { workspace = true }
+iceoryx2-cal = { workspace = true, features = ["std"] }
+iceoryx2-bb-system-types = { workspace = true }
+iceoryx2-bb-posix = { workspace = true }
+iceoryx2-bb-loggers = { workspace = true, features = ["std", "console"] }
+iceoryx2-log = { workspace = true }
+windows-sys = { workspace = true }

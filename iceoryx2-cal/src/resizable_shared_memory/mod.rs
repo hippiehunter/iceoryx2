@@ -103,10 +103,89 @@ use iceoryx2_bb_elementary_traits::testing::abandonable::Abandonable;
 use iceoryx2_bb_posix::file::AccessMode;
 
 use crate::named_concept::*;
+use crate::security::HandleBasedOpenError;
+use crate::security::{AccessRights, PlatformHandle};
 use crate::shared_memory::{
     SegmentId, SharedMemory, SharedMemoryCreateError, SharedMemoryOpenError, ShmPointer,
 };
-use crate::shm_allocator::{PointerOffset, ShmAllocator};
+use crate::shm_allocator::{AllocationError, PointerOffset, ShmAllocator};
+
+/// Defines all errors that can occur when calling
+/// [`ResizableSharedMemory::allocate_or_request_segment()`]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub enum ResizableShmAllocationError {
+    /// Returned when using [`AllocationStrategy::IamManaged`] and the current segment
+    /// is out of memory. The caller should request a new segment from the IAM server
+    /// and add it via [`ResizableSharedMemory::add_segment()`] before retrying allocation.
+    ///
+    /// The `requested_size` field contains the recommended minimum size for the new segment
+    /// based on the allocator's resize hint.
+    NeedSegment {
+        /// The recommended minimum size for the new segment.
+        requested_size: usize,
+    },
+    /// An error occurred during allocation, e.g. the underlying allocator is out-of-memory or
+    /// the resize limit of the [`ResizableSharedMemory`] was hit.
+    AllocationError(AllocationError),
+}
+
+impl From<AllocationError> for ResizableShmAllocationError {
+    fn from(v: AllocationError) -> Self {
+        ResizableShmAllocationError::AllocationError(v)
+    }
+}
+
+impl core::fmt::Display for ResizableShmAllocationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ResizableShmAllocationError::{self:?}")
+    }
+}
+
+impl core::error::Error for ResizableShmAllocationError {}
+
+/// Errors that can occur when managing handle-based segments in a
+/// [`ResizableSharedMemoryView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResizableSharedMemoryError {
+    SegmentAlreadyExists,
+    SegmentDoesNotExist,
+    SegmentInUse,
+    InvalidSegmentId,
+    OpenError(HandleBasedOpenError),
+    InternalError,
+}
+
+impl core::fmt::Display for ResizableSharedMemoryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "ResizableSharedMemoryError::{self:?}")
+    }
+}
+
+impl core::error::Error for ResizableSharedMemoryError {}
+
+impl From<HandleBasedOpenError> for ResizableSharedMemoryError {
+    fn from(error: HandleBasedOpenError) -> Self {
+        ResizableSharedMemoryError::OpenError(error)
+    }
+}
+
+/// Handles + sizes for the management and initial data segment of an anonymous
+/// [`ResizableSharedMemory`], produced by
+/// [`ResizableSharedMemoryBuilder::create_and_extract_handles()`] and consumed (brokered via IAM)
+/// by [`ResizableSharedMemoryViewBuilder::open_from_handle()`].
+#[derive(Debug)]
+pub struct ResizableSharedMemoryHandles {
+    /// Platform handle to the (anonymous) management segment.
+    pub mgmt_handle: PlatformHandle,
+    /// Size in bytes of the management segment payload.
+    pub mgmt_size: usize,
+    /// Segment id of the initial data segment (always `SegmentId::new(0)`).
+    pub initial_segment_id: SegmentId,
+    /// Platform handle to the (anonymous) initial data segment.
+    pub initial_segment_handle: PlatformHandle,
+    /// Size in bytes of the initial data segment payload.
+    pub initial_segment_size: usize,
+}
 
 /// Creates a [`ResizableSharedMemoryView`] to an existing [`ResizableSharedMemory`] and maps the
 /// [`ResizableSharedMemory`] read-only into the process space.
@@ -128,6 +207,31 @@ pub trait ResizableSharedMemoryViewBuilder<
     /// Opens already existing [`SharedMemory`]. If it does not exist or the initialization is not
     /// yet finished the method will fail.
     fn open(self, access_mode: AccessMode) -> Result<ResizableShmView, SharedMemoryOpenError>;
+
+    /// Opens a [`ResizableSharedMemoryView`] from the management-segment and initial-data-segment
+    /// handles brokered via IAM, with no name-based rendezvous. The management segment is mapped
+    /// but never read; the initial data segment is registered (pinned) at segment id 0.
+    ///
+    /// Implementations that do not support handle-based access should return
+    /// [`HandleBasedOpenError::InternalError`].
+    fn open_from_handle(
+        self,
+        mgmt_handle: PlatformHandle,
+        initial_segment_id: SegmentId,
+        initial_segment_handle: PlatformHandle,
+        access: AccessRights,
+    ) -> Result<ResizableShmView, HandleBasedOpenError>
+    where
+        Self: Sized,
+    {
+        let _ = (
+            mgmt_handle,
+            initial_segment_id,
+            initial_segment_handle,
+            access,
+        );
+        Err(HandleBasedOpenError::InternalError)
+    }
 }
 
 /// Creates a new [`ResizableSharedMemory`] which the process will own. As soon as the
@@ -155,6 +259,23 @@ pub trait ResizableSharedMemoryBuilder<
 
     /// Creates new [`SharedMemory`]. If it already exists the method will fail.
     fn create(self) -> Result<ResizableShm, SharedMemoryCreateError>;
+
+    /// Creates a new anonymous [`ResizableSharedMemory`] whose management segment and initial data
+    /// segment (segment id 0) are memfd-backed and invisible on the filesystem, returning it with
+    /// the [`PlatformHandle`]s (and sizes) for both so they can be brokered to other processes via
+    /// IAM. The peer reconstructs the view with
+    /// [`ResizableSharedMemoryViewBuilder::open_from_handle()`].
+    ///
+    /// Implementations that do not support handle extraction should return
+    /// [`SharedMemoryCreateError::InternalError`].
+    fn create_and_extract_handles(
+        self,
+    ) -> Result<(ResizableShm, ResizableSharedMemoryHandles), SharedMemoryCreateError>
+    where
+        Self: Sized,
+    {
+        Err(SharedMemoryCreateError::InternalError)
+    }
 }
 
 /// A read-only view to a [`ResizableSharedMemory`]. Can be created by arbitrary many processes.
@@ -186,6 +307,30 @@ pub trait ResizableSharedMemoryView<Allocator: ShmAllocator, Shm: SharedMemory<A
 
     /// Returns the number of active [`SharedMemory`] segments.
     fn number_of_active_segments(&self) -> usize;
+
+    /// Adds a new [`SharedMemory`] segment from a handle received via IAM with the provided
+    /// access rights.
+    ///
+    /// # Note
+    ///
+    /// This method takes `&self` despite mutating internal state because the underlying
+    /// implementation uses interior mutability (`UnsafeCell`). This allows segments to be
+    /// added from shared references, which is necessary in the receiver path where only
+    /// shared access to connections is available.
+    fn add_segment_from_handle(
+        &self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        access: AccessRights,
+    ) -> Result<(), ResizableSharedMemoryError>;
+
+    /// Retires a segment after IAM confirmed it can be released.
+    ///
+    /// # Note
+    ///
+    /// This method takes `&self` despite mutating internal state because the underlying
+    /// implementation uses interior mutability (`UnsafeCell`).
+    fn retire_segment(&self, segment_id: SegmentId) -> Result<(), ResizableSharedMemoryError>;
 }
 
 /// The [`ResizableSharedMemory`] can be only owned by exactly one process that is allowed to
@@ -223,6 +368,42 @@ pub trait ResizableSharedMemory<Allocator: ShmAllocator, Shm: SharedMemory<Alloc
 
     /// Returns the configured [`AllocationStrategy`].
     fn allocation_strategy(&self) -> AllocationStrategy;
+
+    /// Behaves like [`Allocate::allocate()`] but, when using [`AllocationStrategy::IamManaged`]
+    /// and a new segment is required, returns [`ResizableShmAllocationError::NeedSegment`] with
+    /// the recommended segment size instead of a generic out-of-memory error.
+    fn allocate_or_request_segment(
+        &self,
+        layout: Layout,
+    ) -> Result<ShmPointer, ResizableShmAllocationError>;
+
+    /// Add a segment created externally (by IAM) to this resizable shared memory.
+    ///
+    /// This is called after receiving a [`ResizableShmAllocationError::NeedSegment`] error
+    /// and obtaining a segment handle from the IAM server. The segment is opened from the
+    /// provided handle and added to the internal segment map.
+    ///
+    /// # Arguments
+    ///
+    /// * `segment_id` - The segment ID assigned by the IAM server
+    /// * `handle` - The platform handle to the shared memory segment
+    /// * `config` - The allocator configuration for the new segment
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - The segment was successfully added
+    /// * `Err(ResizableSharedMemoryError)` - The segment could not be added
+    ///
+    /// # Note
+    ///
+    /// This method is only relevant when using [`AllocationStrategy::IamManaged`].
+    /// For other allocation strategies, segments are created internally.
+    fn add_segment(
+        &self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        config: &Allocator::Configuration,
+    ) -> Result<(), ResizableSharedMemoryError>;
 }
 
 pub trait ResizableSharedMemoryForPoolAllocator<Shm: SharedMemory<PoolAllocator>>:

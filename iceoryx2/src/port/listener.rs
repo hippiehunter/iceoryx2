@@ -66,7 +66,7 @@ use crate::service::config_scheme::event_config;
 use crate::service::dynamic_config::event::ListenerDetails;
 use crate::service::naming_scheme::event_concept_name;
 use crate::service::port_factory::listener::ListenerConfig;
-use crate::service::resource::NoResource;
+use crate::service::resource::{NoResource, Secured};
 use crate::{identifiers::UniqueListenerId, service};
 use alloc::format;
 use core::ptr::NonNull;
@@ -120,7 +120,7 @@ pub struct Listener<Service: service::Service> {
     dynamic_listener_handle: <Service::Bag as BagFamily>::BagHandle,
     listener:
         Service::ArcThreadSafetyPolicy<<Service::Event as iceoryx2_cal::event::Event>::Listener>,
-    service_state: SharedServiceState<Service, NoResource>,
+    service_state: SharedServiceState<Service, Secured<NoResource>>,
     listener_details: &'static ListenerDetails,
     // IMPORTANT!
     // Fields of a rust struct are dropped in declaration order. Since this tag is our marker that the
@@ -183,7 +183,7 @@ impl<Service: service::Service> Drop for Listener<Service> {
 
 impl<Service: service::Service> Listener<Service> {
     pub(crate) fn new(
-        service: SharedServiceState<Service, NoResource>,
+        service: SharedServiceState<Service, Secured<NoResource>>,
         config: ListenerConfig,
     ) -> Result<Self, ListenerCreateError> {
         let msg = "Failed to create listener";

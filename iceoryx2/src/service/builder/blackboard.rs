@@ -80,6 +80,9 @@ pub enum BlackboardOpenError {
     UnableToCreateServiceTag,
     /// The iceoryx2 service version does not match the one of the [`Service`].
     VersionMismatch,
+    /// The [`Service`] was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
 }
 
 impl core::fmt::Display for BlackboardOpenError {
@@ -103,6 +106,7 @@ impl From<ServiceState> for BlackboardOpenError {
             ServiceState::Corrupted => BlackboardOpenError::ServiceInCorruptedState,
             ServiceState::InternalFailure => BlackboardOpenError::InternalFailure,
             ServiceState::VersionMismatch => BlackboardOpenError::VersionMismatch,
+            ServiceState::IncompatibleSecurityMode => BlackboardOpenError::IncompatibleSecurityMode,
         }
     }
 }
@@ -134,6 +138,9 @@ impl From<ServiceOpenError> for BlackboardOpenError {
                 BlackboardOpenError::UnableToCreateServiceTag
             }
             ServiceOpenError::VersionMismatch => BlackboardOpenError::VersionMismatch,
+            ServiceOpenError::IncompatibleSecurityMode => {
+                BlackboardOpenError::IncompatibleSecurityMode
+            }
         }
     }
 }
@@ -180,7 +187,8 @@ impl From<ServiceState> for BlackboardCreateError {
             ServiceState::Interrupt => BlackboardCreateError::Interrupt,
             ServiceState::IncompatiblePayload
             | ServiceState::IncompatibleMessagingPattern
-            | ServiceState::VersionMismatch => BlackboardCreateError::AlreadyExists,
+            | ServiceState::VersionMismatch
+            | ServiceState::IncompatibleSecurityMode => BlackboardCreateError::AlreadyExists,
             ServiceState::InsufficientPermissions => BlackboardCreateError::InsufficientPermissions,
             ServiceState::HangsInCreation => BlackboardCreateError::HangsInCreation,
             ServiceState::Corrupted => BlackboardCreateError::ServiceInCorruptedState,

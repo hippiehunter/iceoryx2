@@ -169,7 +169,7 @@ unsafe impl<P: Pointer<u8>, A: Grow<P>> Allocator for ResizableMemory<P, A> {
                     "{msg} since the allocation strategy is static.");
             }
             AllocationStrategy::PowerOfTwo => (self.current_layout.size() + 1).next_power_of_two(),
-            AllocationStrategy::BestFit => {
+            AllocationStrategy::BestFit | AllocationStrategy::IamManaged => {
                 (self.current_layout.size() + 1).next_multiple_of(self.current_layout.align())
             }
         };

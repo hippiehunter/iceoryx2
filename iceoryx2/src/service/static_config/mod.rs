@@ -34,6 +34,7 @@ use alloc::format;
 
 use iceoryx2_bb_elementary::package_version::PackageVersion;
 use iceoryx2_bb_elementary_traits::zero_copy_send::ZeroCopySend;
+use iceoryx2_cal::security::mode::SecurityMode;
 use iceoryx2_log::fatal_panic;
 
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,14 @@ pub struct StaticConfig {
     pub(crate) unique_service_id: UniqueServiceId,
     pub(crate) attributes: AttributeSet,
     pub(crate) messaging_pattern: MessagingPattern,
+    /// The security mode the service was created with.
+    /// This is persisted with the service and used to validate mode compatibility
+    /// when clients open the service.
+    ///
+    /// For backward compatibility with services created before SP6, this field
+    /// defaults to [`SecurityMode::Public`] when deserializing old service configs.
+    #[serde(default)]
+    pub(crate) security_mode: SecurityMode,
 }
 
 unsafe impl ZeroCopySend for StaticConfig {}
@@ -80,6 +89,7 @@ impl StaticConfig {
             service_name: *service_name,
             messaging_pattern,
             attributes: AttributeSet::new(),
+            security_mode: config.global.node.security.mode,
         }
     }
 
@@ -98,6 +108,7 @@ impl StaticConfig {
             service_name: *service_name,
             messaging_pattern,
             attributes: AttributeSet::new(),
+            security_mode: config.global.node.security.mode,
         }
     }
 
@@ -117,6 +128,7 @@ impl StaticConfig {
             service_name: *service_name,
             messaging_pattern,
             attributes: AttributeSet::new(),
+            security_mode: config.global.node.security.mode,
         }
     }
 
@@ -135,6 +147,7 @@ impl StaticConfig {
             service_name: *service_name,
             messaging_pattern,
             attributes: AttributeSet::new(),
+            security_mode: config.global.node.security.mode,
         }
     }
 
@@ -166,6 +179,14 @@ impl StaticConfig {
     /// Returns the [`MessagingPattern`] of the [`crate::service::Service`]
     pub fn messaging_pattern(&self) -> &MessagingPattern {
         &self.messaging_pattern
+    }
+
+    /// Returns the [`SecurityMode`] the service was created with.
+    ///
+    /// This determines whether the service operates in public mode (no authentication)
+    /// or secured mode (IAM authentication required).
+    pub fn security_mode(&self) -> SecurityMode {
+        self.security_mode
     }
 
     pub(crate) fn has_same_messaging_pattern(&self, rhs: &StaticConfig) -> bool {

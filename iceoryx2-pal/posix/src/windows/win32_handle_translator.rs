@@ -17,6 +17,9 @@ use windows_sys::Win32::{
     System::Threading::{INFINITE, WaitOnAddress, WakeByAddressSingle},
 };
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::posix::{c_string_length, types::*};
 use core::fmt::Debug;
 use core::panic;

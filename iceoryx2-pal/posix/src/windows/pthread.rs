@@ -14,6 +14,8 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(unused_variables)]
 
+extern crate std;
+
 use alloc::sync::Arc;
 use core::panic;
 
@@ -46,6 +48,8 @@ use windows_sys::Win32::{
         },
     },
 };
+
+use alloc::vec::Vec;
 
 pub use crate::posix::MemZeroedStruct;
 use crate::posix::*;

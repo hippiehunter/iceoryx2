@@ -66,6 +66,9 @@ impl crate::service::Service for Service {
     type BlackboardPayload = shared_memory::recommended::Local<BumpAllocator>;
     type UniqueId = crate::unique_id_generator::unique_system_id::UniqueSystemIdGenerator<Service>;
     type NameGenerator = crate::name_generator::default_name_generator::DefaultNameGenerator;
+    // Local services don't use IAM, but we provide the type for trait completeness.
+    // In practice, local services are always SecurityMode::Public.
+    type ControlChannel = control_channel::recommended::Ipc;
 }
 
 impl crate::service::internal::ServiceInternal<Service> for Service {}

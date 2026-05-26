@@ -103,6 +103,9 @@ members = [
     "benchmarks/queue",
 
     "component-tests/rust",
+
+    "windows-e2e-tests",
+    "linux-e2e-tests",
 ]
 
 [workspace.package]
@@ -168,6 +171,7 @@ iceoryx2-link-gateway = { version = "0.10.999", path = "iceoryx2-link/gateway", 
 iceoryx2-link-conformance-tests = { version = "0.10.999", path = "iceoryx2-link/conformance-tests" }
 iceoryx2-link-host-to-host-tests = { version = "0.10.999", path = "iceoryx2-link/host-to-host-tests" }
 iceoryx2-userland-record-and-replay = { version = "0.10.999", path = "iceoryx2-userland/record-and-replay" }
+windows-e2e-tests = { version = "0.10.999", path = "windows-e2e-tests" }
 
 ################################################################################
 # Not Published, No Version Number
@@ -262,6 +266,7 @@ windows-sys = { version = "0.48.0", features = [
     "Win32_Networking_WinSock",
     "Win32_System_SystemServices",
     "Win32_System_ProcessStatus",
+    "Win32_System_Pipes",
 ] }
 
 [profile.dev]
