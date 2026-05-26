@@ -23,6 +23,8 @@ extern crate iceoryx2_bb_loggers;
 
 pub mod arc_sync_policy;
 pub mod communication_channel;
+#[cfg(feature = "std")]
+pub mod control_channel;
 pub mod dynamic_storage;
 pub mod event;
 pub mod hash;
@@ -30,6 +32,7 @@ pub mod monitoring;
 pub mod named_concept;
 pub mod reactor;
 pub mod resizable_shared_memory;
+pub mod security;
 pub mod serialize;
 pub mod shared_memory;
 pub mod shm_allocator;

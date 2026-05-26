@@ -1,0 +1,5 @@
+# Git symlink placeholders (contain only a relative path, not actual Markdown)
+iceoryx2-ffi/python/README.md
+
+# Internal agent planning files
+.agent/

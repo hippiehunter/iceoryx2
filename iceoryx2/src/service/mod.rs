@@ -255,6 +255,8 @@ pub mod marker;
 
 pub(crate) mod config_scheme;
 pub(crate) mod naming_scheme;
+/// Secured service context for IAM-protected services.
+pub(crate) mod secured_context;
 
 #[doc(hidden)]
 pub mod resource;
@@ -300,6 +302,7 @@ use builder::event::EventOpenError;
 use dynamic_config::PortCleanupAction;
 use iceoryx2_bb_elementary::CallbackProgression;
 use iceoryx2_cal::arc_sync_policy::ArcSyncPolicy;
+use iceoryx2_cal::control_channel::ControlChannel;
 use iceoryx2_cal::dynamic_storage::{
     DynamicStorage, DynamicStorageBuilder, DynamicStorageOpenError,
 };
@@ -322,7 +325,9 @@ use service_hash::ServiceHash;
 
 use self::dynamic_config::DeregisterNodeState;
 use self::messaging_pattern::MessagingPattern;
+use self::secured_context::TypeErasedSecuredContext;
 use self::service_name::ServiceName;
+use crate::iam::server::TypeErasedIamServer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Error that can be reported when removing a [`Node`](crate::node::Node).
@@ -932,12 +937,70 @@ pub mod internal {
     }
 }
 
+/// Security resource for [`ServiceState`].
+///
+/// This enum allows [`ServiceState`] to hold either no security context (for public services)
+/// or a type-erased IAM client/server (for secured services) without exposing the generic
+/// control channel parameter throughout the API.
+///
+/// It is used as the [`ServiceResource`] (`R`) type parameter of [`ServiceState`] and therefore
+/// implements the [`ServiceResource`] trait defined in [`crate::service::resource`]. The
+/// resource-lifecycle methods (`create`/`open`/`remove_stale_resources`) are no-ops because a
+/// [`SecurityResource`] is not constructed from the static service config; it is created
+/// explicitly by the service builders (e.g. as [`SecurityResource::SecuredClient`]) while the
+/// IAM connection/server is established.
+#[derive(Debug)]
+pub(crate) enum SecurityResource {
+    /// No security - public service access.
+    None,
+    /// Secured service - opener with IAM client connection.
+    SecuredClient(TypeErasedSecuredContext),
+    /// Secured service - creator hosting the IAM server. Also holds a self-client so the
+    /// creator's own ports authorize and broker segments through IAM exactly like any opener.
+    SecuredServer {
+        server: TypeErasedIamServer,
+        client: TypeErasedSecuredContext,
+    },
+}
+
+impl SecurityResource {
+    /// Returns the secured client context if this is a `SecuredClient`.
+    #[inline]
+    pub fn as_client(&self) -> Option<&TypeErasedSecuredContext> {
+        match self {
+            SecurityResource::SecuredClient(ctx) => Some(ctx),
+            SecurityResource::SecuredServer { client, .. } => Some(client),
+            SecurityResource::None => None,
+        }
+    }
+
+    /// Releases ownership of the security context so its underlying IAM resources are cleaned up
+    /// when the last owner drops. Invoked by the `Secured` resource wrapper as part of its
+    /// resource lifecycle.
+    pub(crate) fn acquire_ownership(&self) {
+        match self {
+            SecurityResource::None => {}
+            SecurityResource::SecuredClient(ctx) => ctx.disconnect(),
+            SecurityResource::SecuredServer { server, client } => {
+                client.disconnect();
+                server.shutdown();
+            }
+        }
+    }
+}
+
+impl Abandonable for SecurityResource {
+    unsafe fn abandon_in_place(_this: NonNull<Self>) {}
+}
+
 /// Represents a service. Used to create or open new services with the
 /// [`crate::node::Node::service_builder()`].
 /// Contains the building blocks a [`Service`] requires to create the underlying resources and
 /// establish communication.
 #[allow(private_bounds)]
-pub trait Service: Debug + Sized + internal::ServiceInternal<Self> + Clone + Send + Sync {
+pub trait Service:
+    Debug + Sized + internal::ServiceInternal<Self> + Clone + Send + Sync + 'static
+{
     /// Every service name will be hashed, to allow arbitrary [`ServiceName`]s with as less
     /// restrictions as possible. The hash of the [`ServiceName`] is the [`Service`]s uuid.
     type ServiceNameHasher: Hash;
@@ -959,7 +1022,10 @@ pub trait Service: Debug + Sized + internal::ServiceInternal<Self> + Clone + Sen
     type DynamicStorage<T: Debug + Send + Sync + ZeroCopySend + 'static>: DynamicStorage<T>;
 
     /// The memory used to store the payload.
-    type SharedMemory: SharedMemoryForPoolAllocator;
+    ///
+    /// The `Send + Sync + 'static` bounds are required for IAM-managed dynamic segment
+    /// creation, where the segment factory must be stored in a type-erased container.
+    type SharedMemory: SharedMemoryForPoolAllocator + Send + Sync + 'static;
 
     /// The dynamic memory used to store dynamic payload
     type ResizableSharedMemory: ResizableSharedMemoryForPoolAllocator<Self::SharedMemory>;
@@ -989,6 +1055,11 @@ pub trait Service: Debug + Sized + internal::ServiceInternal<Self> + Clone + Sen
 
     /// Defines the construct used to store the payload data of the blackboard service.
     type BlackboardPayload: SharedMemory<BumpAllocator>;
+
+    /// The control channel used for IAM (Identity and Access Management) communication.
+    /// This is used for secure inter-process communication between the IAM server
+    /// (service creator) and IAM clients (service openers) in secured mode.
+    type ControlChannel: ControlChannel;
 
     /// Checks if a service under a given [`config::Config`] does exist
     ///

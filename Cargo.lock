@@ -676,10 +676,15 @@ dependencies = [
  "iceoryx2-cal",
  "iceoryx2-log",
  "iceoryx2-pal-configuration",
+ "iceoryx2-pal-posix",
+ "iceoryx2-pal-testing",
  "iceoryx2-tests-common",
+ "postcard",
  "serde",
+ "serde_json",
  "tiny-fn",
  "toml",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1235,11 +1240,14 @@ dependencies = [
  "iceoryx2-bb-testing",
  "iceoryx2-cal-tests-common",
  "iceoryx2-log",
+ "iceoryx2-pal-posix",
+ "libc",
  "postcard",
  "serde",
  "sha1_smol",
  "tiny-fn",
  "toml",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1775,6 +1783,17 @@ dependencies = [
  "anstyle",
  "clap",
  "escape8259",
+]
+
+[[package]]
+name = "linux-e2e-tests"
+version = "0.9.999"
+dependencies = [
+ "clap",
+ "iceoryx2",
+ "iceoryx2-bb-loggers",
+ "iceoryx2-cal",
+ "libc",
 ]
 
 [[package]]
@@ -2643,6 +2662,20 @@ dependencies = [
  "windows-link 0.1.3",
  "windows-result 0.3.4",
  "windows-strings",
+]
+
+[[package]]
+name = "windows-e2e-tests"
+version = "0.9.999"
+dependencies = [
+ "clap",
+ "iceoryx2-bb-loggers",
+ "iceoryx2-bb-posix",
+ "iceoryx2-bb-system-types",
+ "iceoryx2-cal",
+ "iceoryx2-log",
+ "iceoryx2-pal-posix",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

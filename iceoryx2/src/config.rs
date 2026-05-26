@@ -83,6 +83,7 @@ use iceoryx2_bb_posix::{
 use iceoryx2_bb_system_types::file_name::FileName;
 use iceoryx2_bb_system_types::file_path::FilePath;
 use iceoryx2_bb_system_types::path::Path;
+use iceoryx2_cal::security::mode::SecurityMode;
 use serde::{Deserialize, Serialize};
 
 use iceoryx2_log::{debug, fail, fatal_panic, info, trace, warn};
@@ -180,6 +181,90 @@ impl Default for Service {
     }
 }
 
+/// IAM (Identity and Access Management) configuration for secured services.
+///
+/// This configuration is only used when [`NodeSecurity::mode`] is set to
+/// [`SecurityMode::Secured`].
+#[non_exhaustive]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+#[serde(default)]
+pub struct IamConfig {
+    /// Base path for IAM control channel endpoints.
+    ///
+    /// On Linux, IAM endpoints will be created as Unix domain sockets under this path.
+    /// On Windows, named pipes will be created with names derived from this path.
+    pub endpoint_base: Path,
+    /// Connection timeout for IAM client handshake.
+    ///
+    /// This is the maximum time a client will wait when connecting to an IAM server.
+    pub connect_timeout: Duration,
+    /// Directory containing TOML policy files for per-service authorization.
+    ///
+    /// Policy files are named `{sanitized_service_name}.toml` and loaded
+    /// automatically when a secured service is created. If no policy file
+    /// exists for a service, the [`DefaultPolicy`](crate::iam::DefaultPolicy)
+    /// is used.
+    pub policy_dir: Path,
+    /// Path to the audit log file for recording IAM authorization decisions.
+    ///
+    /// The file is opened in append mode and written in JSON Lines format.
+    /// Set to an empty path to disable audit logging.
+    pub audit_log_path: Path,
+}
+
+impl Default for IamConfig {
+    fn default() -> Self {
+        Self {
+            endpoint_base: Path::new(b"iam").unwrap(),
+            connect_timeout: Duration::from_secs(5),
+            policy_dir: Path::new(b"iam/policies").unwrap(),
+            audit_log_path: Path::new(b"iam/audit.log").unwrap(),
+        }
+    }
+}
+
+/// Security configuration for a [`Node`](crate::node::Node).
+///
+/// Controls whether services created by this node operate in public mode (default)
+/// or secured mode with IAM authentication.
+///
+/// # Example TOML Configuration
+///
+/// ```toml
+/// [global.node.security]
+/// mode = "secured"
+///
+/// [global.node.security.iam]
+/// endpoint-base = "iam"
+///
+/// [global.node.security.iam.connect-timeout]
+/// secs = 5
+/// nanos = 0
+/// ```
+#[non_exhaustive]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+#[serde(default)]
+pub struct NodeSecurity {
+    /// Security mode for all services created by this node.
+    ///
+    /// - [`SecurityMode::Public`]: Default mode, no authentication required.
+    /// - [`SecurityMode::Secured`]: IAM authentication required for all service operations.
+    pub mode: SecurityMode,
+    /// IAM configuration (only used when mode is [`SecurityMode::Secured`]).
+    pub iam: IamConfig,
+}
+
+impl Default for NodeSecurity {
+    fn default() -> Self {
+        Self {
+            mode: SecurityMode::Public,
+            iam: IamConfig::default(),
+        }
+    }
+}
+
 /// All configurable settings of a [`Node`](crate::node::Node).
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
@@ -206,6 +291,8 @@ pub struct Node {
     /// cleans up all their stale resources whenever an existing [`Node`](crate::node::Node) is
     /// going out of scope.
     pub cleanup_dead_nodes_on_destruction: bool,
+    /// Security configuration for services created by this node.
+    pub security: NodeSecurity,
 }
 
 impl Default for Node {
@@ -219,6 +306,7 @@ impl Default for Node {
             port_tag_suffix: unsafe { FileName::new_unchecked_const(b".port_tag") },
             cleanup_dead_nodes_on_creation: true,
             cleanup_dead_nodes_on_destruction: true,
+            security: NodeSecurity::default(),
         }
     }
 }

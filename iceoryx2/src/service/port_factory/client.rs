@@ -65,6 +65,13 @@ pub enum ClientCreateError {
     /// When the [`Client`] requires more active requests than the
     /// [`Service`](crate::service::Service) offers, the creation will fail.
     MaxActiveRequestsExceedsMaxSupportedActiveRequestsOfService,
+    /// The IAM server denied the attach request for this client.
+    /// This typically occurs when the IAM policy does not allow the requesting
+    /// process to create clients on this service.
+    IamAuthorizationDenied,
+    /// Failed to communicate with the IAM server.
+    /// The IAM connection may have been lost or the server may be unavailable.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for ClientCreateError {

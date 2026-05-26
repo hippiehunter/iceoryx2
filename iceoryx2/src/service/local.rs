@@ -63,6 +63,9 @@ impl crate::service::Service for Service {
     type BlackboardMgmt<KeyType: Send + Sync + Debug + ZeroCopySend + 'static> =
         dynamic_storage::recommended::Local<KeyType>;
     type BlackboardPayload = shared_memory::recommended::Local<BumpAllocator>;
+    // Local services don't use IAM, but we provide the type for trait completeness.
+    // In practice, local services are always SecurityMode::Public.
+    type ControlChannel = control_channel::recommended::Ipc;
 }
 
 impl crate::service::internal::ServiceInternal<Service> for Service {}

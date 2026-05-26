@@ -52,6 +52,7 @@ use iceoryx2_cal::dynamic_storage::DynamicStorage;
 use iceoryx2_cal::zero_copy_connection::{CHANNEL_STATE_OPEN, ChannelId};
 use iceoryx2_log::{fail, warn};
 
+use crate::iam::error::IamClientError;
 use crate::port::port_name::PortName;
 use crate::port::update_connections::UpdateConnections;
 use crate::service::SharedServiceState;
@@ -59,6 +60,7 @@ use crate::service::dynamic_config::publish_subscribe::{PublisherDetails, Subscr
 use crate::service::header::publish_subscribe::Header;
 use crate::service::marker::CustomPayloadMarker;
 use crate::service::port_factory::subscriber::SubscriberConfig;
+use crate::service::resource::{Secured, ServiceResource};
 use crate::service::resource::publish_subscribe::PublishSubscribeResources;
 use crate::service::static_config::publish_subscribe::StaticConfig;
 use crate::{raw_sample::RawSample, sample::Sample, service};
@@ -92,6 +94,13 @@ pub enum SubscriberCreateError {
     HistoryRequestExceedsHistorySizeOfService,
     /// When the [`Subscriber`] requests a larger history than its buffer can hold.
     HistoryRequestExceedsBufferSizeOfSubscriber,
+    /// The IAM server denied the attach request for this subscriber.
+    /// This typically occurs when the IAM policy does not allow the requesting
+    /// process to create subscribers on this service.
+    IamAuthorizationDenied,
+    /// Failed to communicate with the IAM server.
+    /// The IAM connection may have been lost or the server may be unavailable.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for SubscriberCreateError {
@@ -104,7 +113,7 @@ impl core::error::Error for SubscriberCreateError {}
 
 #[derive(Debug)]
 pub(crate) struct SubscriberSharedState<Service: service::Service> {
-    pub(crate) receiver: Receiver<Service, PublishSubscribeResources<Service>>,
+    pub(crate) receiver: Receiver<Service, Secured<PublishSubscribeResources<Service>>>,
     pub(crate) publisher_list_state: UnsafeCell<ContainerState<PublisherDetails>>,
     // IMPORTANT!
     // Fields of a rust struct are dropped in declaration order. Since this tag is our marker that the
@@ -201,12 +210,35 @@ impl<
 > Subscriber<Service, Payload, UserHeader>
 {
     pub(crate) fn new(
-        service: SharedServiceState<Service, PublishSubscribeResources<Service>>,
+        service: SharedServiceState<Service, Secured<PublishSubscribeResources<Service>>>,
         static_config: &StaticConfig,
         config: SubscriberConfig,
     ) -> Result<Self, SubscriberCreateError> {
         let msg = "Failed to create Subscriber port";
         let origin = "Subscriber::new()";
+
+        // For secured services, request authorization from the IAM server before creating the port.
+        // The IAM server verifies the process credentials and policy before allowing attachment.
+        if let Some(ctx) = service.additional_resource().as_client() {
+            let buffer_size = config
+                .buffer_size
+                .unwrap_or(static_config.subscriber_max_buffer_size);
+            match ctx.attach_subscriber(buffer_size) {
+                Ok((_port_id, _segments, _handles)) => {
+                    // IAM authorization successful. In a future iteration, the returned handles
+                    // will be used to open segments instead of creating them by name.
+                }
+                Err(IamClientError::RequestDenied) => {
+                    fail!(from origin, with SubscriberCreateError::IamAuthorizationDenied,
+                        "{} since the IAM server denied the attach request.", msg);
+                }
+                Err(e) => {
+                    fail!(from origin, with SubscriberCreateError::IamConnectionFailed,
+                        "{} since communication with the IAM server failed: {:?}.", msg, e);
+                }
+            }
+        }
+
         let subscriber_id = UniqueSubscriberId::new();
         // !MUST! be the first thing that is created when a new port is instantiated otherwise the
         // port resources might leak if this process is killed in between.
@@ -437,7 +469,7 @@ impl<
 {
     fn update_connections(&self) -> Result<(), ConnectionFailure> {
         let subscriber_shared_state = self.subscriber_shared_state.lock();
-        if unsafe {
+        let connections_changed = unsafe {
             subscriber_shared_state
                 .receiver
                 .service_state
@@ -446,7 +478,19 @@ impl<
                 .publish_subscribe()
                 .publishers
                 .update_state(&mut *subscriber_shared_state.publisher_list_state.get())
-        } {
+        };
+        // In secured mode the connection channel is created by the producer and brokered by
+        // handle; a consumer that discovered the producer before it registered the channel gets no
+        // handle on the first attempt. The peer-list change counter is edge-triggered and will not
+        // fire again for an already-known producer, so re-attempt every cycle in secured mode. The
+        // public (non-secured) path keeps the edge-gated behaviour byte-for-byte.
+        let force_secured = subscriber_shared_state
+            .receiver
+            .service_state
+            .additional_resource()
+            .as_client()
+            .is_some();
+        if connections_changed || force_secured {
             fail!(from self, when Self::force_update_connections(&subscriber_shared_state),
                 "Connections were updated only partially since at least one connection to a publisher failed.");
         }

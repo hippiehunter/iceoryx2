@@ -363,3 +363,15 @@ pub const _PC_REC_MIN_XFER_SIZE: int = libc::_PC_REC_MIN_XFER_SIZE as _;
 pub const _PC_REC_XFER_ALIGN: int = libc::_PC_REC_XFER_ALIGN as _;
 pub const _PC_ALLOC_SIZE_MIN: int = libc::_PC_ALLOC_SIZE_MIN as _;
 pub const _PC_SYMLINK_MAX: int = libc::_PC_SYMLINK_MAX as _;
+
+// memfd_create flags
+pub const MFD_CLOEXEC: uint = 0x0001;
+pub const MFD_ALLOW_SEALING: uint = 0x0002;
+
+// fcntl seal commands and flags
+pub const F_ADD_SEALS: int = 1033;
+pub const F_GET_SEALS: int = 1034;
+pub const F_SEAL_SEAL: int = 0x0001;
+pub const F_SEAL_SHRINK: int = 0x0002;
+pub const F_SEAL_GROW: int = 0x0004;
+pub const F_SEAL_WRITE: int = 0x0008;

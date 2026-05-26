@@ -175,8 +175,9 @@ use iceoryx2_bb_posix::mutex::Mutex;
 use iceoryx2_bb_posix::mutex::MutexBuilder;
 use iceoryx2_bb_posix::mutex::MutexHandle;
 use iceoryx2_bb_posix::mutex::MutexType;
-use iceoryx2_bb_posix::process::Process;
+use iceoryx2_bb_posix::process::{Process, ProcessId};
 use iceoryx2_bb_posix::signal::SignalHandler;
+use iceoryx2_bb_posix::unique_system_id::UniqueSystemId;
 use iceoryx2_bb_system_types::file_name::FileName;
 use iceoryx2_cal::named_concept::{NamedConceptPathHintRemoveError, NamedConceptRemoveError};
 use iceoryx2_cal::{
@@ -206,6 +207,11 @@ impl UniqueNodeId {
     pub(crate) fn as_file_name(&self) -> FileName {
         fatal_panic!(from self, when FileName::new(self.0.to_string().as_bytes()),
                         "This should never happen! The NodeId shall be always a valid FileName.")
+    }
+
+    /// Returns the inner [`UniqueSystemId`] for IAM handshake.
+    pub(crate) fn unique_system_id(&self) -> UniqueSystemId {
+        self.0
     }
 }
 

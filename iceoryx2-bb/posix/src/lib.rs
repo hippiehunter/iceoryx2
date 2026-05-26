@@ -19,6 +19,7 @@
 
 extern crate alloc;
 
+use anonymous_memory::AnonymousMemoryCreationError;
 use barrier::BarrierCreationError;
 use clock::ClockError;
 use directory::DirectoryError;
@@ -34,10 +35,12 @@ use shared_memory::SharedMemoryCreationError;
 use signal::SignalError;
 use thread::ThreadError;
 use unix_datagram_socket::UnixDatagramError;
+use unix_stream_socket::UnixStreamError;
 use user::UserError;
 
 pub mod access_mode;
 pub mod adaptive_wait;
+pub mod anonymous_memory;
 pub mod barrier;
 pub mod clock;
 pub mod config;
@@ -76,10 +79,12 @@ pub mod testing;
 pub mod thread;
 pub mod unique_system_id;
 pub mod unix_datagram_socket;
+pub mod unix_stream_socket;
 pub mod user;
 
 enum_gen! {Error
   generalization:
+    AnonymousMemory <= AnonymousMemoryCreationError,
     Barrier <= BarrierCreationError,
     Clock <= ClockError,
     Directory <= DirectoryError,
@@ -94,5 +99,6 @@ enum_gen! {Error
     Signal <= SignalError,
     Thread <= ThreadError,
     User <= UserError,
-    UnixDatagramSocket <= UnixDatagramError
+    UnixDatagramSocket <= UnixDatagramError,
+    UnixStreamSocket <= UnixStreamError
 }

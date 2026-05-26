@@ -71,6 +71,7 @@ use iceoryx2_bb_posix::file::AccessMode;
 use iceoryx2_bb_system_types::file_name::*;
 use tiny_fn::tiny_fn;
 
+use crate::security::{AccessRights, HandleBasedOpenError, PlatformHandle};
 use crate::static_storage::file::{NamedConcept, NamedConceptBuilder, NamedConceptMgmt};
 
 tiny_fn! {
@@ -166,6 +167,17 @@ pub trait DynamicStorageBuilder<'builder, T: Send + Sync + ZeroCopySend, D: Dyna
     /// removed without corrupting already opened [`DynamicStorage`]s.
     fn create(self) -> Result<D, DynamicStorageCreateError>;
 
+    /// Initializes a [`DynamicStorage`] from an existing shared memory mapping.
+    ///
+    /// Implementations that do not support this should return
+    /// [`DynamicStorageCreateError::InternalError`].
+    fn init_from_shared_memory(
+        self,
+        _shm: iceoryx2_bb_posix::shared_memory::SharedMemory,
+    ) -> Result<D, DynamicStorageCreateError> {
+        Err(DynamicStorageCreateError::InternalError)
+    }
+
     /// Opens a [`DynamicStorage`]. The implementation must ensure that a [`DynamicStorage`]
     /// which is in the midst of creation cannot be opened. If the [`DynamicStorage`] does not
     /// exist or is not initialized it fails.
@@ -173,6 +185,32 @@ pub trait DynamicStorageBuilder<'builder, T: Send + Sync + ZeroCopySend, D: Dyna
 
     /// Opens the [`DynamicStorage`] if it exists, otherwise it creates it.
     fn open_or_create(self) -> Result<D, DynamicStorageOpenOrCreateError>;
+
+    /// Opens a [`DynamicStorage`] from a platform handle with a known total size.
+    ///
+    /// Implementations that do not support handle-based access should return
+    /// [`HandleBasedOpenError::InternalError`].
+    fn open_from_handle(
+        self,
+        _handle: PlatformHandle,
+        _access: AccessRights,
+        _total_size: usize,
+    ) -> Result<D, HandleBasedOpenError> {
+        Err(HandleBasedOpenError::InternalError)
+    }
+
+    /// Creates a new anonymous (memfd/`CreateFileMapping`-backed) [`DynamicStorage`] that is not
+    /// visible on the filesystem, returning it together with a [`PlatformHandle`] that can be
+    /// brokered to other processes via IAM (SCM_RIGHTS). The peer reconstructs it with
+    /// [`DynamicStorageBuilder::open_from_handle()`].
+    ///
+    /// Implementations that do not support handle extraction should return
+    /// [`DynamicStorageCreateError::InternalError`].
+    fn create_and_extract_handle(
+        self,
+    ) -> Result<(D, PlatformHandle), DynamicStorageCreateError> {
+        Err(DynamicStorageCreateError::InternalError)
+    }
 }
 
 /// Is being built by the [`DynamicStorageBuilder`]. The [`DynamicStorage`] trait shall provide

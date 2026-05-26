@@ -633,11 +633,11 @@ impl UnixDatagramSender {
 
         if bytes_sent > 0 {
             if bytes_sent as usize == uds_msg.len() {
-                fail!(from self, with UnixDatagramSendMsgError::MessagePartiallySend(bytes_sent as u64),
-                    "{} since only {} bytes were sent. {} bytes remain unsent.", msg, bytes_sent, uds_msg.len() - bytes_sent as usize );
+                return Ok(true);
             }
 
-            return Ok(true);
+            fail!(from self, with UnixDatagramSendMsgError::MessagePartiallySend(bytes_sent as u64),
+                "{} since only {} bytes were sent. {} bytes remain unsent.", msg, bytes_sent, uds_msg.len() - bytes_sent as usize );
         }
 
         handle_errno!(UnixDatagramSendMsgError, from self,
@@ -663,13 +663,38 @@ impl UnixDatagramSender {
         uds_msg: &mut SocketAncillary,
     ) -> Result<bool, UnixDatagramSendMsgError> {
         fail!(from self, when self.set_non_blocking(true),
-                "Unable to try send message since the socket could not bet set into unblocking state.");
+                "Unable to try send message since the socket could not be set into unblocking state.");
         self.send_msg(uds_msg)
     }
 
-    // NOTE: 'timed_send_msg' and 'blocking_send_msg' do not work on all platforms, most notably FreeBSD and Windows;
-    //       on FreeBSD, instead of blocking when the buffer is full, the `send` call immediately returns with ENOBUFS;
-    //       since theses calls are not used in our code base, they were removed
+    /// Blocks until the [`SocketAncillary`] message can be sent or the timeout has passed.
+    /// Returns true if the message was sent, otherwise false.
+    pub fn timed_send_msg(
+        &self,
+        uds_msg: &mut SocketAncillary,
+        timeout: Duration,
+    ) -> Result<bool, UnixDatagramSendMsgError> {
+        let msg = "Unable to timed send message";
+        fail!(from self, when self.set_non_blocking(false),
+                "{} since the socket could not be set into blocking state.", msg);
+        fail!(from self, when  self._set_timeout(timeout),
+                "{} since the socket timeout could not be set.", msg);
+        self.send_msg(uds_msg)
+    }
+
+    /// Blocks until the [`SocketAncillary`] message can be sent.
+    pub fn blocking_send_msg(
+        &self,
+        uds_msg: &mut SocketAncillary,
+    ) -> Result<(), UnixDatagramSendMsgError> {
+        let msg = "Unable to blocking send message";
+        fail!(from self, when self.set_non_blocking(false),
+                "{} since the socket could not be set into blocking state.", msg);
+        fail!(from self, when  self._set_timeout(BLOCKING_TIMEOUT),
+                "{} since the socket blocking timeout could not be set.", msg);
+        self.send_msg(uds_msg)?;
+        Ok(())
+    }
 
     fn send(&self, data: &[u8]) -> Result<bool, UnixDatagramSendError> {
         let bytes_sent = unsafe {
@@ -712,13 +737,32 @@ impl UnixDatagramSender {
     /// If the data was sent it returns true, otherwise false.
     pub fn try_send(&self, data: &[u8]) -> Result<bool, UnixDatagramSendError> {
         fail!(from self, when self.set_non_blocking(true),
-                "Unable to try send data since the socket could not bet set into unblocking state.");
+                "Unable to try send data since the socket could not be set into unblocking state.");
         self.send(data)
     }
 
-    // NOTE: 'timed_send' and 'blocking_send' do not work on all platforms, most notably FreeBSD and Windows;
-    //       on FreeBSD, instead of blocking when the buffer is full, the `send` call immediately returns with ENOBUFS;
-    //       since theses calls are not used in our code base, they were removed
+    /// Blocks until the data was sent or the timeout has passed.
+    /// If the data was sent it returns true, otherwise false.
+    pub fn timed_send(&self, data: &[u8], timeout: Duration) -> Result<(), UnixDatagramSendError> {
+        let msg = "Unable to timed send data";
+        fail!(from self, when self.set_non_blocking(true),
+                "{} since the socket could not be set into blocking state.", msg);
+        fail!(from self, when  self._set_timeout(timeout),
+                "{} since the socket timeout could not be set.", msg);
+        self.send(data)?;
+        Ok(())
+    }
+
+    /// Blocks until the data was sent.
+    pub fn blocking_send(&self, data: &[u8]) -> Result<(), UnixDatagramSendError> {
+        let msg = "Unable to blocking send data";
+        fail!(from self, when self.set_non_blocking(true),
+                "{} since the socket could not be set into blocking state.", msg);
+        fail!(from self, when  self._set_timeout(BLOCKING_TIMEOUT),
+                "{} since the socket blocking timeout could not be set.", msg);
+        self.send(data)?;
+        Ok(())
+    }
 }
 
 impl FileDescriptorBased for UnixDatagramSender {
@@ -855,7 +899,7 @@ impl UnixDatagramReceiver {
     /// block and return 0.
     pub fn try_receive(&self, buffer: &mut [u8]) -> Result<u64, UnixDatagramReceiveError> {
         fail!(from self, when self.set_non_blocking(true),
-                "Unable to try receive data since the socket could not bet set into unblocking state.");
+                "Unable to try receive data since the socket could not be set into unblocking state.");
         self.internal_receive(0, buffer)
     }
 
@@ -868,7 +912,7 @@ impl UnixDatagramReceiver {
     ) -> Result<u64, UnixDatagramReceiveError> {
         let msg = "Unable to timed receive data";
         fail!(from self, when self.set_non_blocking(false),
-                "{} since the socket could not bet set into blocking state.", msg);
+                "{} since the socket could not be set into blocking state.", msg);
         fail!(from self, when  self.set_timeout(timeout),
                 "{} since the socket timeout could not be set.", msg);
         self.internal_receive(0, buffer)
@@ -880,7 +924,7 @@ impl UnixDatagramReceiver {
 
         loop {
             fail!(from self, when self.set_non_blocking(false),
-                "{} since the socket could not bet set into blocking state.", msg);
+                "{} since the socket could not be set into blocking state.", msg);
             fail!(from self, when self.set_timeout(BLOCKING_TIMEOUT),
                 "{} since the socket blocking timeout could not be set.", msg);
 
@@ -896,7 +940,7 @@ impl UnixDatagramReceiver {
     /// the queue and remains to be peeked or received again. If no data present it returns 0.
     pub fn try_peek(&self, buffer: &mut [u8]) -> Result<u64, UnixDatagramReceiveError> {
         fail!(from self, when self.set_non_blocking(true),
-                "Unable to try peek data since the socket could not bet set into unblocking state.");
+                "Unable to try peek data since the socket could not be set into unblocking state.");
         self.internal_receive(posix::MSG_PEEK, buffer)
     }
 
@@ -909,7 +953,7 @@ impl UnixDatagramReceiver {
     ) -> Result<u64, UnixDatagramReceiveError> {
         let msg = "Unable to timed peek data";
         fail!(from self, when self.set_non_blocking(false),
-                "{} since the socket could not bet set into blocking state.", msg);
+                "{} since the socket could not be set into blocking state.", msg);
         fail!(from self, when  self.set_timeout(timeout),
                 "{} since the socket timeout could not be set.", msg);
         self.internal_receive(posix::MSG_PEEK, buffer)
@@ -920,7 +964,7 @@ impl UnixDatagramReceiver {
     pub fn blocking_peek(&self, buffer: &mut [u8]) -> Result<u64, UnixDatagramReceiveError> {
         let msg = "Unable to blocking peek data";
         fail!(from self, when self.set_non_blocking(false),
-                "{} since the socket could not bet set into blocking state.", msg);
+                "{} since the socket could not be set into blocking state.", msg);
         fail!(from self, when  self.set_timeout(BLOCKING_TIMEOUT),
                 "{} since the socket blocking timeout could not be set.", msg);
         self.internal_receive(posix::MSG_PEEK, buffer)
@@ -967,7 +1011,7 @@ impl UnixDatagramReceiver {
         socket_msg: &mut SocketAncillary,
     ) -> Result<bool, UnixDatagramReceiveFdError> {
         fail!(from self, when self.set_non_blocking(true),
-                "Unable to try receive message since the socket could not bet set into unblocking state.");
+                "Unable to try receive message since the socket could not be set into unblocking state.");
         self.receive_msg(socket_msg)
     }
 
@@ -981,7 +1025,7 @@ impl UnixDatagramReceiver {
     ) -> Result<bool, UnixDatagramReceiveFdError> {
         let msg = "Unable to timed receive message";
         fail!(from self, when self.set_non_blocking(false),
-                "{} since the socket could not bet set into blocking state.", msg);
+                "{} since the socket could not be set into blocking state.", msg);
         fail!(from self, when  self.set_timeout(timeout),
                 "{} since the socket timeout could not be set.", msg);
         self.receive_msg(socket_msg)
@@ -995,7 +1039,7 @@ impl UnixDatagramReceiver {
     ) -> Result<bool, UnixDatagramReceiveFdError> {
         let msg = "Unable to blocking receive message";
         fail!(from self, when self.set_non_blocking(false),
-                "{} since the socket could not bet set into blocking state.", msg);
+                "{} since the socket could not be set into blocking state.", msg);
         fail!(from self, when  self.set_timeout(BLOCKING_TIMEOUT),
                 "{} since the socket blocking timeout could not be set.", msg);
         self.receive_msg(socket_msg)

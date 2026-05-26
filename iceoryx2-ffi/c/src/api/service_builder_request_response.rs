@@ -102,6 +102,8 @@ pub enum iox2_request_response_open_or_create_error_e {
     O_INTERRUPT,
     #[CStr = "unable to acquire type definition"]
     O_UNABLE_TO_ACQUIRE_TYPE_DEFINITION,
+    #[CStr = "incompatible security mode"]
+    O_INCOMPATIBLE_SECURITY_MODE,
     #[CStr = "already exists"]
     C_ALREADY_EXISTS,
     #[CStr = "internal failure"]
@@ -122,6 +124,16 @@ pub enum iox2_request_response_open_or_create_error_e {
     C_INTERRUPT,
     #[CStr = "unable to acquire type definition"]
     C_UNABLE_TO_ACQUIRE_TYPE_DEFINITION,
+    #[CStr = "IAM server creation failed"]
+    C_IAM_SERVER_CREATION_FAILED,
+    #[CStr = "IAM connection failed"]
+    O_IAM_CONNECTION_FAILED,
+    #[CStr = "IAM handshake failed"]
+    O_IAM_HANDSHAKE_FAILED,
+    #[CStr = "dev_permissions feature is incompatible with secured mode"]
+    O_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
+    #[CStr = "dev_permissions feature is incompatible with secured mode"]
+    C_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
     #[CStr = "system in flux"]
     SYSTEM_IN_FLUX,
 }
@@ -152,7 +164,11 @@ impl IntoCInt for RequestResponseOpenError {
             RequestResponseOpenError::ServiceInCorruptedState => iox2_request_response_open_or_create_error_e::O_SERVICE_IN_CORRUPTED_STATE,
             RequestResponseOpenError::UnableToCreateServiceTag => iox2_request_response_open_or_create_error_e::O_UNABLE_TO_CREATE_SERVICE_TAG,
             RequestResponseOpenError::VersionMismatch => iox2_request_response_open_or_create_error_e::O_VERSION_MISMATCH,
-            RequestResponseOpenError::UnableToAcquireTypeDefinition => iox2_request_response_open_or_create_error_e::O_UNABLE_TO_ACQUIRE_TYPE_DEFINITION
+            RequestResponseOpenError::UnableToAcquireTypeDefinition => iox2_request_response_open_or_create_error_e::O_UNABLE_TO_ACQUIRE_TYPE_DEFINITION,
+            RequestResponseOpenError::IncompatibleSecurityMode => iox2_request_response_open_or_create_error_e::O_INCOMPATIBLE_SECURITY_MODE,
+            RequestResponseOpenError::IamConnectionFailed => iox2_request_response_open_or_create_error_e::O_IAM_CONNECTION_FAILED,
+            RequestResponseOpenError::IamHandshakeFailed => iox2_request_response_open_or_create_error_e::O_IAM_HANDSHAKE_FAILED,
+            RequestResponseOpenError::DevPermissionsIncompatibleWithSecuredMode => iox2_request_response_open_or_create_error_e::O_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
         }) as c_int
     }
 }
@@ -189,6 +205,12 @@ impl IntoCInt for RequestResponseCreateError {
             }
             RequestResponseCreateError::UnableToAcquireTypeDefinition => {
                 iox2_request_response_open_or_create_error_e::C_UNABLE_TO_ACQUIRE_TYPE_DEFINITION
+            }
+            RequestResponseCreateError::IamServerCreationFailed => {
+                iox2_request_response_open_or_create_error_e::C_IAM_SERVER_CREATION_FAILED
+            }
+            RequestResponseCreateError::DevPermissionsIncompatibleWithSecuredMode => {
+                iox2_request_response_open_or_create_error_e::C_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE
             }
         }) as c_int
     }

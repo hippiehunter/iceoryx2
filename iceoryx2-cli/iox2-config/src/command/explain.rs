@@ -151,6 +151,42 @@ pub(crate) fn describe_schema(config: &Config) -> Vec<Section> {
                         .to_string(),
                     description: "Defines if there shall be a scan for dead nodes with a following stale resource cleanup whenever a node is going out-of-scope.",
                 },
+                Field {
+                    key: "global.node.security.mode",
+                    value_type: "`public`|`secured`",
+                    default_value: format!("{:?}", config.global.node.security.mode),
+                    description: "Security mode for services created by this node. 'public' requires no authentication; 'secured' enables IAM authentication.",
+                },
+                Field {
+                    key: "global.node.security.iam.endpoint-base",
+                    value_type: "string",
+                    default_value: format!("\"{}\"", config.global.node.security.iam.endpoint_base),
+                    description: "Base path for IAM control channel endpoints (Unix sockets on Linux, named pipes on Windows).",
+                },
+                Field {
+                    key: "global.node.security.iam.connect-timeout.secs",
+                    value_type: "integer",
+                    default_value: config.global.node.security.iam.connect_timeout.as_secs().to_string(),
+                    description: "Seconds component of the IAM client connection timeout.",
+                },
+                Field {
+                    key: "global.node.security.iam.connect-timeout.nanos",
+                    value_type: "integer",
+                    default_value: config.global.node.security.iam.connect_timeout.subsec_nanos().to_string(),
+                    description: "Nanoseconds component of the IAM client connection timeout.",
+                },
+                Field {
+                    key: "global.node.security.iam.policy-dir",
+                    value_type: "string",
+                    default_value: format!("\"{}\"", config.global.node.security.iam.policy_dir),
+                    description: "Directory containing TOML policy files for per-service IAM authorization.",
+                },
+                Field {
+                    key: "global.node.security.iam.audit-log-path",
+                    value_type: "string",
+                    default_value: format!("\"{}\"", config.global.node.security.iam.audit_log_path),
+                    description: "Path to the audit log file for IAM authorization decisions (JSON Lines format).",
+                },
             ],
         },
         Section {

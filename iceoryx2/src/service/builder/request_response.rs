@@ -14,6 +14,7 @@ use core::fmt::Debug;
 use core::marker::PhantomData;
 
 use alloc::format;
+use alloc::sync::Arc;
 
 use iceoryx2_bb_elementary::alignment::Alignment;
 use iceoryx2_bb_elementary_traits::zero_copy_send::ZeroCopySend;
@@ -26,12 +27,26 @@ use crate::service::builder::{
 use crate::service::dynamic_config::MessagingPatternSettings;
 use crate::service::dynamic_config::request_response::DynamicConfigSettings;
 use crate::service::port_factory::request_response;
-use crate::service::resource::NoResource;
 use crate::service::static_config::StaticConfig;
 use crate::service::static_config::message_type_details::TypeDetail;
 use crate::service::static_config::messaging_pattern::MessagingPattern;
-use crate::service::{Service, builder, dynamic_config};
+use crate::service::resource::{NoResource, Secured};
 use crate::service::{header, static_config};
+use crate::service::{Service, builder, dynamic_config};
+
+use iceoryx2_cal::control_channel::{
+    ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder,
+};
+use iceoryx2_cal::named_concept::NamedConceptBuilder;
+
+use iceoryx2_bb_container::semantic_string::SemanticString;
+
+use crate::iam::DefaultPolicy;
+use crate::iam::audit::FileAuditLogger;
+use crate::iam::client::IamClient;
+use crate::iam::configured_policy::{PolicyDispatch, PolicyLoadError, PolicyLoader};
+use crate::iam::server::{IamServer, TypeErasedIamServer};
+use crate::service::secured_context::{SecuredServiceContext, TypeErasedSecuredContext};
 
 use super::message_type_details::{MessageTypeDetails, TypeVariant};
 use crate::service::marker::{CustomHeaderMarker, CustomPayloadMarker};
@@ -95,6 +110,19 @@ pub enum RequestResponseOpenError {
     /// the config. If no type definition file was specified in the service builder
     /// and no file could be found, this error is returned.
     UnableToAcquireTypeDefinition,
+    /// The [`Service`] was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
+    /// Failed to connect to the IAM server when opening a secured service.
+    /// This can happen if the service creator has crashed or the control channel is unavailable.
+    IamConnectionFailed,
+    /// The IAM handshake failed when opening a secured service.
+    /// This can happen if the protocol version is incompatible or the server rejected the connection.
+    IamHandshakeFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for RequestResponseOpenError {
@@ -122,6 +150,9 @@ impl From<ServiceState> for RequestResponseOpenError {
             ServiceState::Corrupted => RequestResponseOpenError::ServiceInCorruptedState,
             ServiceState::InternalFailure => RequestResponseOpenError::InternalFailure,
             ServiceState::VersionMismatch => RequestResponseOpenError::VersionMismatch,
+            ServiceState::IncompatibleSecurityMode => {
+                RequestResponseOpenError::IncompatibleSecurityMode
+            }
         }
     }
 }
@@ -157,6 +188,9 @@ impl From<ServiceOpenError> for RequestResponseOpenError {
             ServiceOpenError::Interrupt => RequestResponseOpenError::Interrupt,
             ServiceOpenError::UnableToAcquireTypeDefinition => {
                 RequestResponseOpenError::UnableToAcquireTypeDefinition
+            }
+            ServiceOpenError::IncompatibleSecurityMode => {
+                RequestResponseOpenError::IncompatibleSecurityMode
             }
         }
     }
@@ -202,7 +236,13 @@ impl From<RequestResponseOpenError> for ServiceOpenError {
             | RequestResponseOpenError::IncompatibleAttributes
             | RequestResponseOpenError::IncompatibleBehaviorForFireAndForgetRequests
             | RequestResponseOpenError::IncompatibleOverflowBehaviorForRequests
-            | RequestResponseOpenError::IncompatibleOverflowBehaviorForResponses => ServiceOpenError::InternalFailure,
+            | RequestResponseOpenError::IncompatibleOverflowBehaviorForResponses
+            | RequestResponseOpenError::IamConnectionFailed
+            | RequestResponseOpenError::IamHandshakeFailed
+            | RequestResponseOpenError::DevPermissionsIncompatibleWithSecuredMode => ServiceOpenError::InternalFailure,
+            RequestResponseOpenError::IncompatibleSecurityMode => {
+                ServiceOpenError::IncompatibleSecurityMode
+            }
             RequestResponseOpenError::UnableToAcquireTypeDefinition => ServiceOpenError::UnableToAcquireTypeDefinition
         }
     }
@@ -235,6 +275,13 @@ pub enum RequestResponseCreateError {
     /// the config. If no type definition file was specified in the service builder
     /// and no file could be found, this error is returned.
     UnableToAcquireTypeDefinition,
+    /// Failed to create the IAM server for a secured service.
+    /// This can happen if the control channel listener cannot be created.
+    IamServerCreationFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for RequestResponseCreateError {
@@ -251,7 +298,8 @@ impl From<ServiceState> for RequestResponseCreateError {
             ServiceState::Interrupt => RequestResponseCreateError::Interrupt,
             ServiceState::IncompatiblePayload
             | ServiceState::IncompatibleMessagingPattern
-            | ServiceState::VersionMismatch => RequestResponseCreateError::AlreadyExists,
+            | ServiceState::VersionMismatch
+            | ServiceState::IncompatibleSecurityMode => RequestResponseCreateError::AlreadyExists,
             ServiceState::InsufficientPermissions => {
                 RequestResponseCreateError::InsufficientPermissions
             }
@@ -808,6 +856,11 @@ impl<
     > {
         let msg = "Unable to create request response service";
 
+        if self.base.dev_permissions_conflicts_with_secured() {
+            fail!(from self, with RequestResponseCreateError::DevPermissionsIncompatibleWithSecuredMode,
+                "{} since the dev_permissions feature is incompatible with secured services.", msg);
+        }
+
         let generate_dynamic_config = |service_config: &StaticConfig| {
             let reqres_config = service_config.request_response();
             let dynamic_config_setting = DynamicConfigSettings {
@@ -832,7 +885,13 @@ impl<
             || self.is_service_available(msg),
             |_| Ok(()),
             generate_dynamic_config,
-            |_| Ok(NoResource),
+            |service_config| {
+                let security = super::secured::create_secured_resource::<ServiceType>(
+                    &self.base.shared_node,
+                    service_config,
+                )?;
+                Ok(Secured::new(NoResource, security))
+            },
             |_| {},
         )?;
 
@@ -854,13 +913,24 @@ impl<
     > {
         let msg = "Unable to open request response service";
 
+        if self.base.dev_permissions_conflicts_with_secured() {
+            fail!(from self, with RequestResponseOpenError::DevPermissionsIncompatibleWithSecuredMode,
+                "{} since the dev_permissions feature is incompatible with secured services.", msg);
+        }
+
         let service_state = self.base.open(
             msg,
             || self.is_service_available(msg),
             |existing_service_config| -> Result<(), RequestResponseOpenError> {
                 self.verify_service_configuration(msg, existing_service_config, required_attributes)
             },
-            |_| Ok(NoResource),
+            |service_config| {
+                let security = super::secured::open_secured_resource::<ServiceType>(
+                    &self.base.shared_node,
+                    service_config,
+                )?;
+                Ok(Secured::new(NoResource, security))
+            },
         )?;
 
         Ok(request_response::PortFactory::new(service_state))

@@ -73,6 +73,7 @@
 //! # }
 //! ```
 
+use crate::iam::error::IamClientError;
 use crate::port::port_name::PortName;
 use crate::port::update_connections::UpdateConnections;
 use crate::prelude::BackpressureStrategy;
@@ -80,7 +81,7 @@ use crate::service::SharedServiceState;
 use crate::service::marker::CustomPayloadMarker;
 use crate::service::naming_scheme::data_segment_name;
 use crate::service::port_factory::server::LocalServerConfig;
-use crate::service::resource::NoResource;
+use crate::service::resource::{NoResource, Secured, ServiceResource};
 use crate::{
     active_request::ActiveRequest,
     prelude::PortFactory,
@@ -132,11 +133,11 @@ pub(crate) const INVALID_CONNECTION_ID: usize = usize::MAX;
 #[derive(Debug)]
 pub(crate) struct SharedServerState<Service: service::Service> {
     pub(crate) config: LocalServerConfig,
-    pub(crate) response_sender: Sender<Service, NoResource>,
+    pub(crate) response_sender: Sender<Service, Secured<NoResource>>,
     server_handle: UnsafeCell<Option<ContainerHandle>>,
-    pub(crate) request_receiver: Receiver<Service, NoResource>,
+    pub(crate) request_receiver: Receiver<Service, Secured<NoResource>>,
     client_list_state: UnsafeCell<ContainerState<ClientDetails>>,
-    service_state: SharedServiceState<Service, NoResource>,
+    service_state: SharedServiceState<Service, Secured<NoResource>>,
     // IMPORTANT!
     // Fields of a rust struct are dropped in declaration order. Since this tag is our marker that the
     // port exists and might require cleanup after a crash, the tag must be defined as last member of
@@ -175,7 +176,7 @@ impl<Service: service::Service> Drop for SharedServerState<Service> {
 
 impl<Service: service::Service> SharedServerState<Service> {
     pub(crate) fn update_connections(&self) -> Result<(), ConnectionFailure> {
-        if unsafe {
+        let connections_changed = unsafe {
             self.request_receiver
                 .service_state
                 .dynamic_storage()
@@ -183,7 +184,19 @@ impl<Service: service::Service> SharedServerState<Service> {
                 .request_response()
                 .clients
                 .update_state(&mut *self.client_list_state.get())
-        } {
+        };
+        // In secured mode the request connection channel is created by the client (producer) and
+        // brokered by handle; a server that discovered the client before it registered the channel
+        // gets no handle on the first attempt. The peer-list change counter is edge-triggered and
+        // will not fire again for an already-known client, so re-attempt every cycle in secured
+        // mode. The public (non-secured) path keeps the edge-gated behaviour byte-for-byte.
+        let force_secured = self
+            .request_receiver
+            .service_state
+            .additional_resource()
+            .as_client()
+            .is_some();
+        if connections_changed || force_secured {
             fail!(from self,
                   when self.force_update_connections(),
                   "Connections were updated only partially since at least one connection to a client failed.");
@@ -332,8 +345,8 @@ impl<
     ) -> Result<Self, ServerCreateError> {
         let msg = "Failed to create Server port";
         let origin = "Server::new()";
-        let server_id = UniqueServerId::new();
         let service = &server_factory.factory.service;
+        let server_id = UniqueServerId::new();
         // !MUST! be the first thing that is created when a new port is instantiated otherwise the
         // port resources might leak if this process is killed in between.
         let port_tag = match service
@@ -348,6 +361,26 @@ impl<
         };
 
         let static_config = server_factory.factory.static_config();
+
+        // For secured services, request authorization from the IAM server before creating the port.
+        // The IAM server verifies the process credentials and policy before allowing attachment.
+        let secured_ctx = service.additional_resource().as_client();
+        if let Some(ctx) = secured_ctx {
+            match ctx.attach_server(static_config.max_active_requests_per_client) {
+                Ok((_port_id, _segments, _handles)) => {
+                    // IAM authorization successful.
+                }
+                Err(IamClientError::RequestDenied) => {
+                    fail!(from origin, with ServerCreateError::IamAuthorizationDenied,
+                        "{} since the IAM server denied the attach request.", msg);
+                }
+                Err(e) => {
+                    fail!(from origin, with ServerCreateError::IamConnectionFailed,
+                        "{} since communication with the IAM server failed: {:?}.", msg, e);
+                }
+            }
+        }
+
         let number_of_requests_per_client =
             unsafe { service.static_config().messaging_pattern.request_response() }
                 .required_amount_of_chunks_per_client_data_segment(
@@ -417,26 +450,90 @@ impl<
         let sample_layout = static_config
             .response_message_type_details
             .sample_layout(server_factory.config.initial_max_slice_len);
-        let data_segment = match data_segment_type {
-            DataSegmentType::Static => DataSegment::<Service>::create_static_segment(
-                &segment_name,
-                sample_layout,
-                global_config,
-                number_of_responses,
-            ),
-            DataSegmentType::Dynamic => DataSegment::<Service>::create_dynamic_segment(
-                &segment_name,
-                sample_layout,
-                global_config,
-                number_of_responses,
-                server_factory.config.allocation_strategy,
-            ),
-        };
 
-        let data_segment = fail!(from origin,
-            when data_segment,
-            with ServerCreateError::UnableToCreateDataSegment,
-            "{} since the server data segment could not be created.", msg);
+        // In secured mode with static segments, create anonymous segments and register
+        // the handle with IAM for brokering to clients.
+        let is_secured = service.additional_resource().as_client().is_some();
+        let data_segment = if is_secured && data_segment_type == DataSegmentType::Static {
+            let (segment, handle) = fail!(from origin,
+                when DataSegment::<Service>::create_anonymous_static_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_responses,
+                ),
+                with ServerCreateError::UnableToCreateDataSegment,
+                "{} since the anonymous server data segment could not be created.", msg);
+
+            if let Some(ctx) = service.additional_resource().as_client() {
+                let segment_size =
+                    sample_layout.size() * number_of_responses + sample_layout.align() - 1;
+                if let Err(e) = ctx.register_segment(server_id.value(), segment_size, &handle) {
+                    warn!(from origin,
+                        "Failed to register server segment handle with IAM server: {:?}. \
+                         Clients will not be able to open this segment via IAM.", e);
+                }
+            }
+            segment
+        } else if is_secured && data_segment_type == DataSegmentType::Dynamic {
+            // IAM-managed resizable segments for server responses: create the management segment
+            // and the initial data segment (segment id 0) anonymously and broker their handles via
+            // IAM, mirroring the static path. Runtime growth segments flow through the
+            // NeedSegment -> ctx.add_segment(...) path. Registration MUST happen before the port
+            // announces itself (add_server_id below) so a client that discovers this server always
+            // finds the handles registered.
+            let (segment, handles) = fail!(from origin,
+                when DataSegment::<Service>::create_dynamic_segment_iam_managed(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_responses,
+                ),
+                with ServerCreateError::UnableToCreateDataSegment,
+                "{} since the IAM-managed dynamic server data segment could not be created.", msg);
+
+            if let Some(ctx) = service.additional_resource().as_client() {
+                let port = server_id.value();
+                if let Err(e) =
+                    ctx.register_mgmt_segment(port, handles.mgmt_size, &handles.mgmt_handle)
+                {
+                    warn!(from origin,
+                        "Failed to register server management segment handle with IAM server: {:?}. \
+                         Clients will not be able to open this segment via IAM.", e);
+                }
+                if let Err(e) = ctx.register_dynamic_segment(
+                    port,
+                    handles.initial_segment_id.value(),
+                    handles.initial_segment_size,
+                    &handles.initial_segment_handle,
+                ) {
+                    warn!(from origin,
+                        "Failed to register initial server dynamic segment handle with IAM server: {:?}. \
+                         Clients will not be able to open this segment via IAM.", e);
+                }
+            }
+            segment
+        } else {
+            let result = match data_segment_type {
+                DataSegmentType::Static => DataSegment::<Service>::create_static_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_responses,
+                ),
+                DataSegmentType::Dynamic => DataSegment::<Service>::create_dynamic_segment(
+                    &segment_name,
+                    sample_layout,
+                    global_config,
+                    number_of_responses,
+                    server_factory.config.allocation_strategy,
+                ),
+            };
+            fail!(from origin,
+                when result,
+                with ServerCreateError::UnableToCreateDataSegment,
+                "{} since the server data segment could not be created.", msg)
+        };
 
         let response_sender = Sender {
             segment_states: {

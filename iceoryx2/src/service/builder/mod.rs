@@ -26,6 +26,8 @@ pub mod request_response;
 /// Builder for [`MessagingPattern::Blackboard`](crate::service::messaging_pattern::MessagingPattern::Blackboard)
 pub mod blackboard;
 
+mod secured;
+
 use core::fmt::Debug;
 use core::hash::Hash;
 use core::marker::PhantomData;
@@ -90,6 +92,9 @@ enum ServiceState {
     Corrupted,
     IncompatiblePayload,
     VersionMismatch,
+    /// The service was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
 }
 
 enum_gen! {
@@ -142,7 +147,8 @@ impl From<ServiceState> for ServiceCreateError {
             ServiceState::IncompatibleMessagingPattern
             | ServiceState::HangsInCreation
             | ServiceState::IncompatiblePayload
-            | ServiceState::VersionMismatch => ServiceCreateError::AlreadyExists,
+            | ServiceState::VersionMismatch
+            | ServiceState::IncompatibleSecurityMode => ServiceCreateError::AlreadyExists,
             ServiceState::InsufficientPermissions => ServiceCreateError::InsufficientPermissions,
             ServiceState::Corrupted => ServiceCreateError::ServiceInCorruptedState,
             ServiceState::InternalFailure => ServiceCreateError::InternalFailure,
@@ -167,6 +173,7 @@ pub enum ServiceOpenError {
     InsufficientPermissions,
     VersionMismatch,
     UnableToAcquireTypeDefinition,
+    IncompatibleSecurityMode,
 }
 
 impl From<ServiceState> for ServiceOpenError {
@@ -182,6 +189,9 @@ impl From<ServiceState> for ServiceOpenError {
             ServiceState::InternalFailure => ServiceOpenError::InternalFailure,
             ServiceState::Interrupt => ServiceOpenError::Interrupt,
             ServiceState::VersionMismatch => ServiceOpenError::VersionMismatch,
+            ServiceState::IncompatibleSecurityMode => {
+                ServiceOpenError::IncompatibleSecurityMode
+            }
         }
     }
 }
@@ -296,6 +306,22 @@ impl<ServiceType: service::Service> BuilderWithServiceType<ServiceType> {
         }
     }
 
+    /// Returns `true` when the `dev_permissions` feature is active while the node is in
+    /// [`SecurityMode::Secured`]. The two are incompatible: `dev_permissions` grants
+    /// world-readable permissions on shared memory, which defeats the isolation guarantees of
+    /// secured mode. Callers reject service create/open early in this case.
+    pub(crate) fn dev_permissions_conflicts_with_secured(&self) -> bool {
+        cfg!(feature = "dev_permissions")
+            && self
+                .shared_node
+                .config()
+                .global
+                .node
+                .security
+                .mode
+                .is_secured()
+    }
+
     fn request_response<
         RequestPayload: Debug + ZeroCopySend + ?Sized,
         ResponsePayload: Debug + ZeroCopySend + ?Sized,
@@ -397,7 +423,8 @@ impl<ServiceType: service::Service> BuilderWithServiceType<ServiceType> {
                         | ServiceOpenError::UnableToCreateServiceTag
                         | ServiceOpenError::Interrupt
                         | ServiceOpenError::VersionMismatch
-                        | ServiceOpenError::UnableToAcquireTypeDefinition => {
+                        | ServiceOpenError::UnableToAcquireTypeDefinition
+                        | ServiceOpenError::IncompatibleSecurityMode => {
                             return Err(Into::<ErrorTypeOpenOrCreate>::into(e));
                         }
                     }
@@ -851,6 +878,18 @@ impl<ServiceType: service::Service> BuilderWithServiceType<ServiceType> {
                     fail!(from self, with ServiceState::IncompatibleMessagingPattern,
                         "{} since the messaging pattern \"{:?}\" does not fit the requested pattern \"{:?}\".",
                         msg, service_config.messaging_pattern(), service_config.messaging_pattern());
+                }
+
+                // Validate security mode compatibility:
+                // - A secured node cannot open a public service
+                // - A public node cannot open a secured service
+                let node_mode = self.shared_node.config().global.node.security.mode;
+                let service_mode = service_config.security_mode();
+                if node_mode != service_mode {
+                    fail!(from self, with ServiceState::IncompatibleSecurityMode,
+                        "{} since the service was created with security mode {:?} but the node is configured for {:?}. \
+                         A secured node cannot open a public service and vice versa.",
+                        msg, service_mode, node_mode);
                 }
 
                 Ok(Some((service_config, storage)))

@@ -83,6 +83,8 @@ pub enum iox2_pub_sub_open_or_create_error_e {
     O_INTERRUPT,
     #[CStr = "unable to acquire type definition"]
     O_UNABLE_TO_ACQUIRE_TYPE_DEFINITION,
+    #[CStr = "incompatible security mode"]
+    O_INCOMPATIBLE_SECURITY_MODE,
     #[CStr = "service in corrupted state"]
     C_SERVICE_IN_CORRUPTED_STATE,
     #[CStr = "subscriber buffer must be larger than history size"]
@@ -105,6 +107,16 @@ pub enum iox2_pub_sub_open_or_create_error_e {
     C_INTERRUPT,
     #[CStr = "unable to acquire type definition"]
     C_UNABLE_TO_ACQUIRE_TYPE_DEFINITION,
+    #[CStr = "IAM server creation failed"]
+    C_IAM_SERVER_CREATION_FAILED,
+    #[CStr = "IAM connection failed"]
+    O_IAM_CONNECTION_FAILED,
+    #[CStr = "IAM handshake failed"]
+    O_IAM_HANDSHAKE_FAILED,
+    #[CStr = "dev_permissions feature is incompatible with secured mode"]
+    O_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
+    #[CStr = "dev_permissions feature is incompatible with secured mode"]
+    C_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE,
     #[CStr = "same service is created and removed repeatedly"]
     SYSTEM_IN_FLUX,
 }
@@ -168,7 +180,21 @@ impl IntoCInt for PublishSubscribeOpenError {
          PublishSubscribeOpenError::VersionMismatch => {
              iox2_pub_sub_open_or_create_error_e::O_VERSION_MISMATCH
          }
-         PublishSubscribeOpenError::UnableToAcquireTypeDefinition => iox2_pub_sub_open_or_create_error_e::O_UNABLE_TO_ACQUIRE_TYPE_DEFINITION
+         PublishSubscribeOpenError::UnableToAcquireTypeDefinition => {
+             iox2_pub_sub_open_or_create_error_e::O_UNABLE_TO_ACQUIRE_TYPE_DEFINITION
+         }
+         PublishSubscribeOpenError::IncompatibleSecurityMode => {
+             iox2_pub_sub_open_or_create_error_e::O_INCOMPATIBLE_SECURITY_MODE
+         }
+         PublishSubscribeOpenError::IamConnectionFailed => {
+             iox2_pub_sub_open_or_create_error_e::O_IAM_CONNECTION_FAILED
+         }
+         PublishSubscribeOpenError::IamHandshakeFailed => {
+             iox2_pub_sub_open_or_create_error_e::O_IAM_HANDSHAKE_FAILED
+         }
+         PublishSubscribeOpenError::DevPermissionsIncompatibleWithSecuredMode => {
+             iox2_pub_sub_open_or_create_error_e::O_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE
+         }
         }) as c_int
     }
 }
@@ -202,7 +228,15 @@ impl IntoCInt for PublishSubscribeCreateError {
          PublishSubscribeCreateError::ServiceConfigCouldNotBeCreated => {
              iox2_pub_sub_open_or_create_error_e::C_SERVICE_CONFIG_COULD_NOT_BE_CREATED
          }
-         PublishSubscribeCreateError::UnableToAcquireTypeDefinition => iox2_pub_sub_open_or_create_error_e::C_UNABLE_TO_ACQUIRE_TYPE_DEFINITION
+         PublishSubscribeCreateError::UnableToAcquireTypeDefinition => {
+             iox2_pub_sub_open_or_create_error_e::C_UNABLE_TO_ACQUIRE_TYPE_DEFINITION
+         }
+         PublishSubscribeCreateError::IamServerCreationFailed => {
+             iox2_pub_sub_open_or_create_error_e::C_IAM_SERVER_CREATION_FAILED
+         }
+         PublishSubscribeCreateError::DevPermissionsIncompatibleWithSecuredMode => {
+             iox2_pub_sub_open_or_create_error_e::C_DEV_PERMISSIONS_INCOMPATIBLE_WITH_SECURED_MODE
+         }
         }) as c_int
     }
 }

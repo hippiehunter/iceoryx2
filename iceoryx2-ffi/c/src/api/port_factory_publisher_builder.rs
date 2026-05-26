@@ -100,6 +100,10 @@ pub enum iox2_publisher_create_error_e {
     UNABLE_TO_CREATE_DATA_SEGMENT,
     FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY,
     UNABLE_TO_CREATE_PORT_TAG,
+    #[CStr = "iam authorization denied"]
+    IAM_AUTHORIZATION_DENIED,
+    #[CStr = "iam connection failed"]
+    IAM_CONNECTION_FAILED,
 }
 
 impl IntoCInt for PublisherCreateError {
@@ -116,6 +120,12 @@ impl IntoCInt for PublisherCreateError {
             }
             PublisherCreateError::UnableToCreatePortTag => {
                 iox2_publisher_create_error_e::UNABLE_TO_CREATE_PORT_TAG
+            }
+            PublisherCreateError::IamAuthorizationDenied => {
+                iox2_publisher_create_error_e::IAM_AUTHORIZATION_DENIED
+            }
+            PublisherCreateError::IamConnectionFailed => {
+                iox2_publisher_create_error_e::IAM_CONNECTION_FAILED
             }
         }) as c_int
     }

@@ -24,7 +24,7 @@ use iceoryx2_bb_elementary::cyclic_tagger::*;
 use iceoryx2_bb_elementary_traits::non_null::NonNullCompat;
 use iceoryx2_bb_elementary_traits::testing::abandonable::Abandonable;
 use iceoryx2_cal::named_concept::NamedConceptBuilder;
-use iceoryx2_cal::shm_allocator::{AllocationError, PointerOffset, ShmAllocationError};
+use iceoryx2_cal::shm_allocator::{AllocationError, PointerOffset};
 use iceoryx2_cal::zero_copy_connection::{
     BackpressureToReceiverAction, ChannelId, ChannelState, ZeroCopyConnection,
     ZeroCopyConnectionBuilder, ZeroCopyCreationError, ZeroCopyPortDetails, ZeroCopySendError,
@@ -45,7 +45,7 @@ use crate::service::static_config::message_type_details::{MessageTypeDetails, Ty
 use crate::{service, service::naming_scheme::connection_name};
 
 use super::chunk::ChunkMut;
-use super::data_segment::DataSegment;
+use super::data_segment::{DataSegment, DataSegmentAllocationError};
 use super::segment_state::SegmentState;
 
 #[derive(Clone, Copy)]
@@ -102,19 +102,44 @@ impl<Service: service::Service, Resource: ServiceResource> Connection<Service, R
                 msg, buffer_size, this.receiver_max_buffer_size);
         }
 
-        let sender = fail!(from this, when <Service::Connection as ZeroCopyConnection>::
-                        Builder::new( &connection_name(this.sender_port_id, receiver_port_id))
-                                .config(&connection_config::<Service>(this.shared_node.config()))
-                                .buffer_size(buffer_size)
-                                .receiver_max_borrowed_samples_per_channel(this.receiver_max_borrowed_samples)
-                                .enable_safe_overflow(this.enable_safe_overflow)
-                                .number_of_samples_per_segment(number_of_samples)
-                                .max_supported_shared_memory_segments(this.max_number_of_segments)
-                                .initial_channel_state(initial_channel_state)
-                                .number_of_channels(this.number_of_channels)
-                                .timeout(this.shared_node.config().global.creation_timeout)
-                                .create_sender(),
-                        "{}.", msg);
+        // The connection name is process-local bookkeeping only. In secured mode the channel is
+        // memfd-backed (anonymous) and never registered on the filesystem, so no name-based
+        // rendezvous exists; in public mode it remains the cross-process rendezvous name.
+        let builder = <Service::Connection as ZeroCopyConnection>::Builder::new(
+            &connection_name(this.sender_port_id, receiver_port_id),
+        )
+        .config(&connection_config::<Service>(this.shared_node.config()))
+        .buffer_size(buffer_size)
+        .receiver_max_borrowed_samples_per_channel(this.receiver_max_borrowed_samples)
+        .enable_safe_overflow(this.enable_safe_overflow)
+        .number_of_samples_per_segment(number_of_samples)
+        .max_supported_shared_memory_segments(this.max_number_of_segments)
+        .initial_channel_state(initial_channel_state)
+        .number_of_channels(this.number_of_channels)
+        .timeout(this.shared_node.config().global.creation_timeout);
+
+        let sender = if let Some(ctx) = this.service_state.additional_resource().as_client() {
+            // Secured mode: create an anonymous (memfd-backed) connection channel and broker its
+            // handle to the receiver via IAM, instead of the name-based create_or_open rendezvous.
+            // This runs during force_update_connections(), strictly before add_publisher_id /
+            // add_client_id / add_server_id, so a consumer that discovers this producer always
+            // finds the channel already registered.
+            let (sender, handle) = fail!(from this, when builder.create_sender_anonymous(),
+                "{} since the anonymous connection channel could not be created.", msg);
+            // channel_size is advisory only: the consumer derives the true size from the fd header
+            // via total_size_from_handle, so pass 0 (the server stores size.max(1)).
+            if let Err(e) =
+                ctx.register_channel(this.sender_port_id, receiver_port_id, 0, &handle)
+            {
+                fail!(from this, with ZeroCopyCreationError::InternalError,
+                    "{} since the connection channel handle could not be registered with IAM ({:?}).",
+                    msg, e);
+            }
+            sender
+        } else {
+            // Public mode: keep the name-based create_or_open rendezvous unchanged.
+            fail!(from this, when builder.create_sender(), "{}.", msg)
+        };
 
         Ok(Self {
             sender,
@@ -459,19 +484,68 @@ impl<Service: service::Service, Resource: ServiceResource> Sender<Service, Resou
                 msg, layout, self.loan_counter.load(Ordering::Relaxed), self.sender_max_borrowed_samples);
         }
 
-        let shm_pointer = match self.data_segment.allocate(layout) {
-            Ok(chunk) => chunk,
-            Err(ShmAllocationError::AllocationError(AllocationError::OutOfMemory)) => {
-                fail!(from self, with LoanError::OutOfMemory,
-                    "{} {:?} since the underlying shared memory is out of memory.", msg, layout);
-            }
-            Err(ShmAllocationError::AllocationError(AllocationError::SizeTooLarge))
-            | Err(ShmAllocationError::AllocationError(AllocationError::AlignmentFailure)) => {
-                fatal_panic!(from self, "{} {:?} since the system seems to be corrupted.", msg, layout);
-            }
-            Err(v) => {
-                fail!(from self, with LoanError::InternalFailure,
-                    "{} {:?} since an internal failure occurred ({:?}).", msg, layout, v);
+        // Allocation loop - handles IAM-managed segment creation
+        let shm_pointer = loop {
+            match self.data_segment.allocate(layout) {
+                Ok(chunk) => break chunk,
+                Err(DataSegmentAllocationError::AllocationError(AllocationError::OutOfMemory)) => {
+                    fail!(from self, with LoanError::OutOfMemory,
+                        "{} {:?} since the underlying shared memory is out of memory.", msg, layout);
+                }
+                Err(DataSegmentAllocationError::AllocationError(AllocationError::SizeTooLarge))
+                | Err(DataSegmentAllocationError::AllocationError(
+                    AllocationError::AlignmentFailure,
+                )) => {
+                    fatal_panic!(from self, "{} {:?} since the system seems to be corrupted.", msg, layout);
+                }
+                Err(DataSegmentAllocationError::NeedSegment { requested_size }) => {
+                    // IAM-managed allocation: request a segment from the IAM server
+                    if let Some(ctx) = self.service_state.additional_resource().as_client() {
+                        match ctx.add_segment(
+                            self.sender_port_id,
+                            requested_size,
+                            layout.size(),
+                            layout.align(),
+                        ) {
+                            Ok((segment_id, _actual_size, handles)) => {
+                                // Use the first handle (IAM sends one handle per segment)
+                                if let Some(handle) = handles.into_iter().next() {
+                                    // Add the segment and retry allocation
+                                    let config =
+                                        iceoryx2_cal::shm_allocator::pool_allocator::Config {
+                                            bucket_layout: layout,
+                                        };
+                                    if let Err(e) =
+                                        self.data_segment.add_segment(segment_id, handle, &config)
+                                    {
+                                        fail!(from self, with LoanError::InternalFailure,
+                                            "{} {:?} since adding IAM-provided segment failed: {:?}.",
+                                            msg, layout, e);
+                                    }
+                                    // Loop continues to retry allocation
+                                } else {
+                                    fail!(from self, with LoanError::InternalFailure,
+                                        "{} {:?} since IAM returned no handles for the new segment.",
+                                        msg, layout);
+                                }
+                            }
+                            Err(e) => {
+                                fail!(from self, with LoanError::InternalFailure,
+                                    "{} {:?} since IAM segment request failed: {:?}.",
+                                    msg, layout, e);
+                            }
+                        }
+                    } else {
+                        // No IAM context available - this shouldn't happen with IamManaged strategy
+                        fail!(from self, with LoanError::InternalFailure,
+                            "{} {:?} since IAM-managed segment creation is required \
+                             but no IAM context is available.", msg, layout);
+                    }
+                }
+                Err(v) => {
+                    fail!(from self, with LoanError::InternalFailure,
+                        "{} {:?} since an internal failure occurred ({:?}).", msg, layout, v);
+                }
             }
         };
 

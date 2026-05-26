@@ -68,7 +68,7 @@ use iceoryx2_bb_elementary_traits::non_null::NonNullCompat;
 use iceoryx2_bb_posix::adaptive_wait::{AdaptiveWaitBuilder, AdaptiveWaitStrategy};
 use iceoryx2_bb_posix::directory::*;
 use iceoryx2_bb_posix::file_descriptor::FileDescriptorManagement;
-use iceoryx2_bb_posix::memory_mapping::MemoryMappingCreationError;
+use iceoryx2_bb_posix::memory_mapping::{MemoryMapping, MemoryMappingCreationError};
 use iceoryx2_bb_posix::shared_memory::*;
 use iceoryx2_bb_system_types::path::Path;
 use iceoryx2_log::fail;
@@ -123,6 +123,18 @@ impl<T: Send + Sync + Debug + ZeroCopySend> Clone for Configuration<T> {
 struct Data<T: Send + Sync + Debug + ZeroCopySend> {
     version: AtomicU64,
     data: MaybeUninit<T>,
+}
+
+pub(crate) fn header_size<T: Send + Sync + Debug + ZeroCopySend>() -> usize {
+    core::mem::size_of::<Data<T>>()
+}
+
+pub(crate) unsafe fn header_data_from_mapping<T: Send + Sync + Debug + ZeroCopySend>(
+    mapping: &MemoryMapping,
+) -> &T {
+    (*(mapping.base_address() as *const Data<T>))
+        .data
+        .assume_init_ref()
 }
 
 impl<T: Send + Sync + Debug + ZeroCopySend> Default for Configuration<T> {
@@ -256,6 +268,19 @@ impl<T: Send + Sync + Debug + ZeroCopySend> Builder<'_, T> {
                                     "{} since the adaptive wait call failed.", msg);
         };
 
+        self.open_with_shm(shm)
+    }
+
+    pub(crate) fn open_with_shm(
+        &self,
+        shm: SharedMemory,
+    ) -> Result<Storage<T>, DynamicStorageOpenError> {
+        let msg = "Failed to open posix_shared_memory::DynamicStorage";
+        let mut wait_for_read_write_access = fail!(from self, when AdaptiveWaitBuilder::new().create(),
+                                    with DynamicStorageOpenError::InternalError,
+                                    "{} since the AdaptiveWait could not be initialized.", msg);
+        let mut elapsed_time = Duration::ZERO;
+
         let init_state = shm.base_address().as_ptr() as *const Data<T>;
 
         loop {
@@ -329,7 +354,7 @@ impl<T: Send + Sync + Debug + ZeroCopySend> Builder<'_, T> {
         Ok(shm)
     }
 
-    fn init_impl(
+    pub(crate) fn init_impl(
         &mut self,
         mut shm: SharedMemory,
     ) -> Result<Storage<T>, DynamicStorageCreateError> {
@@ -416,6 +441,13 @@ impl<'builder, T: Send + Sync + Debug + ZeroCopySend> DynamicStorageBuilder<'bui
         self.init_impl(shm)
     }
 
+    fn init_from_shared_memory(
+        mut self,
+        shm: iceoryx2_bb_posix::shared_memory::SharedMemory,
+    ) -> Result<Storage<T>, DynamicStorageCreateError> {
+        self.init_impl(shm)
+    }
+
     fn open(self, access_mode: AccessMode) -> Result<Storage<T>, DynamicStorageOpenError> {
         self.open_impl(access_mode)
     }
@@ -434,6 +466,135 @@ impl<'builder, T: Send + Sync + Debug + ZeroCopySend> DynamicStorageBuilder<'bui
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    fn open_from_handle(
+        self,
+        handle: crate::security::PlatformHandle,
+        access: crate::security::AccessRights,
+        total_size: usize,
+    ) -> Result<Storage<T>, crate::security::HandleBasedOpenError> {
+        use crate::security::{platform_handle_into_fd, HandleBasedOpenError};
+
+        let msg = "Failed to open posix_shared_memory::DynamicStorage from handle";
+        if total_size == 0 {
+            fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                "{} since the total size is zero.", msg);
+        }
+
+        if !access.can_read() {
+            fail!(from self, with HandleBasedOpenError::InsufficientPermissions,
+                "{} due to insufficient permissions.", msg);
+        }
+
+        let full_name = self.config.path_for(&self.storage_name).file_name();
+        let fd = platform_handle_into_fd(handle)?;
+        let access_mode = if access.can_write() {
+            AccessMode::ReadWrite
+        } else {
+            AccessMode::Read
+        };
+
+        let shm = match SharedMemory::from_file_descriptor(
+            &full_name,
+            fd,
+            total_size,
+            access_mode,
+            false,
+        ) {
+            Ok(shm) => shm,
+            Err(SharedMemoryCreationError::InsufficientPermissions) => {
+                fail!(from self, with HandleBasedOpenError::InsufficientPermissions,
+                    "{} due to insufficient permissions.", msg);
+            }
+            Err(SharedMemoryCreationError::UnsupportedSizeOfZero)
+            | Err(SharedMemoryCreationError::SizeDoesNotFit) => {
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} due to a size mismatch.", msg);
+            }
+            Err(_) => {
+                fail!(from self, with HandleBasedOpenError::MappingFailed,
+                    "{} since the memory mapping failed.", msg);
+            }
+        };
+
+        match self.open_with_shm(shm) {
+            Ok(storage) => Ok(storage),
+            Err(DynamicStorageOpenError::InitializationNotYetFinalized)
+            | Err(DynamicStorageOpenError::VersionMismatch)
+            | Err(DynamicStorageOpenError::InternalError) => {
+                fail!(from self, with HandleBasedOpenError::InternalError,
+                    "{} due to an internal error while validating the storage.", msg);
+            }
+            Err(DynamicStorageOpenError::DoesNotExist) => {
+                fail!(from self, with HandleBasedOpenError::InvalidHandle,
+                    "{} since the underlying shared memory does not exist.", msg);
+            }
+        }
+    }
+
+    fn create_and_extract_handle(
+        mut self,
+    ) -> Result<(Storage<T>, crate::security::PlatformHandle), DynamicStorageCreateError> {
+        let msg = "Failed to create anonymous posix_shared_memory::DynamicStorage";
+        let total_size = core::mem::size_of::<Data<T>>() + self.supplementary_size;
+        let full_name = self.config.path_for(&self.storage_name).file_name();
+
+        #[cfg(unix)]
+        let (fd, handle) = {
+            use iceoryx2_bb_posix::anonymous_memory::{
+                AccessMode as AnonAccessMode, AnonymousMemoryBuilder,
+            };
+            let anon = AnonymousMemoryBuilder::new()
+                .name(core::str::from_utf8(full_name.as_bytes()).unwrap_or("iox2_shm"))
+                .size(total_size)
+                .access_mode(AnonAccessMode::ReadWrite)
+                .create()
+                .map_err(|_| DynamicStorageCreateError::InternalError)?;
+
+            let fd = anon.into_file_descriptor();
+            let raw_fd = unsafe { iceoryx2_pal_posix::posix::dup(fd.native_handle()) };
+            if raw_fd < 0 {
+                fail!(from self, with DynamicStorageCreateError::InternalError,
+                    "{} since the handle could not be duplicated.", msg);
+            }
+
+            let handle = unsafe { crate::security::PlatformHandle::from_raw_fd(raw_fd) };
+            (fd, handle)
+        };
+
+        #[cfg(windows)]
+        let (fd, handle) = {
+            use crate::security::platform_handle_into_fd;
+            use iceoryx2_pal_posix::windows::mman::create_anonymous_mapping;
+
+            let raw_handle = match create_anonymous_mapping(total_size, true, None) {
+                Ok(raw_handle) => raw_handle as *mut _,
+                Err(_) => {
+                    fail!(from self, with DynamicStorageCreateError::InternalError,
+                        "{} since the anonymous mapping could not be created.", msg);
+                }
+            };
+            let handle = unsafe { crate::security::PlatformHandle::from_raw_handle(raw_handle) };
+            let mapping_handle = handle
+                .try_clone()
+                .map_err(|_| DynamicStorageCreateError::InternalError)?;
+            let fd = platform_handle_into_fd(mapping_handle)
+                .map_err(|_| DynamicStorageCreateError::InternalError)?;
+            (fd, handle)
+        };
+
+        let shm = iceoryx2_bb_posix::shared_memory::SharedMemory::from_file_descriptor(
+            &full_name,
+            fd,
+            total_size,
+            iceoryx2_bb_posix::shared_memory::AccessMode::ReadWrite,
+            self.has_ownership,
+        )
+        .map_err(|_| DynamicStorageCreateError::InternalError)?;
+
+        let storage = self.init_impl(shm)?;
+        Ok((storage, handle))
     }
 }
 

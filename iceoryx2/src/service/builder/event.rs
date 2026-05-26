@@ -15,7 +15,7 @@
 //! See [`crate::service`]
 //!
 pub use crate::port::event_id::EventId;
-use crate::service::resource::NoResource;
+use crate::service::resource::{NoResource, Secured};
 
 use alloc::format;
 
@@ -26,9 +26,24 @@ use iceoryx2_log::{fail, fatal_panic};
 use crate::service::builder::{DynamicConfigCreationArgs, ServiceCreateError, ServiceOpenError};
 use crate::service::dynamic_config::MessagingPatternSettings;
 use crate::service::port_factory::event;
+use crate::service::secured_context::iam_endpoint_name;
 use crate::service::static_config::messaging_pattern::MessagingPattern;
 use crate::service::*;
 use crate::service::{self, dynamic_config::event::DynamicConfigSettings};
+
+use iceoryx2_cal::control_channel::{
+    ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder,
+};
+use iceoryx2_cal::named_concept::NamedConceptBuilder;
+
+use iceoryx2_bb_container::semantic_string::SemanticString;
+
+use crate::iam::audit::FileAuditLogger;
+use crate::iam::client::IamClient;
+use crate::iam::configured_policy::{PolicyDispatch, PolicyLoadError, PolicyLoader};
+use crate::iam::server::{IamServer, TypeErasedIamServer};
+use crate::iam::DefaultPolicy;
+use crate::service::secured_context::{SecuredServiceContext, TypeErasedSecuredContext};
 
 use self::attribute::{AttributeSpecifier, AttributeVerifier};
 use static_config::event::Deadline;
@@ -86,6 +101,19 @@ pub enum EventOpenError {
     UnableToCreateServiceTag,
     /// The iceoryx2 service version does not match the one of the [`Service`].
     VersionMismatch,
+    /// The [`Service`] was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
+    /// Failed to connect to the IAM server when opening a secured service.
+    /// This can happen if the service creator has crashed or the control channel is unavailable.
+    IamConnectionFailed,
+    /// The IAM handshake failed when opening a secured service.
+    /// This can happen if the protocol version is incompatible or the server rejected the connection.
+    IamHandshakeFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for EventOpenError {
@@ -108,6 +136,7 @@ impl From<ServiceState> for EventOpenError {
             ServiceState::Corrupted => EventOpenError::ServiceInCorruptedState,
             ServiceState::InternalFailure => EventOpenError::InternalFailure,
             ServiceState::VersionMismatch => EventOpenError::VersionMismatch,
+            ServiceState::IncompatibleSecurityMode => EventOpenError::IncompatibleSecurityMode,
         }
     }
 }
@@ -131,6 +160,9 @@ impl From<ServiceOpenError> for EventOpenError {
             ServiceOpenError::ServiceInCorruptedState => EventOpenError::ServiceInCorruptedState,
             ServiceOpenError::UnableToCreateServiceTag => EventOpenError::UnableToCreateServiceTag,
             ServiceOpenError::VersionMismatch => EventOpenError::VersionMismatch,
+            ServiceOpenError::IncompatibleSecurityMode => {
+                EventOpenError::IncompatibleSecurityMode
+            }
         }
     }
 }
@@ -150,6 +182,7 @@ impl From<EventOpenError> for ServiceOpenError {
             EventOpenError::UnableToCreateServiceTag => ServiceOpenError::UnableToCreateServiceTag,
             EventOpenError::VersionMismatch => ServiceOpenError::VersionMismatch,
             EventOpenError::Interrupt => ServiceOpenError::Interrupt,
+            EventOpenError::IncompatibleSecurityMode => ServiceOpenError::IncompatibleSecurityMode,
             EventOpenError::DoesNotSupportRequestedAmountOfListeners
             | EventOpenError::InternalFailure
             | EventOpenError::DoesNotSupportRequestedAmountOfNodes
@@ -159,7 +192,12 @@ impl From<EventOpenError> for ServiceOpenError {
             | EventOpenError::IncompatibleDeadline
             | EventOpenError::IncompatibleNotifierCreatedEvent
             | EventOpenError::IncompatibleNotifierDeadEvent
-            | EventOpenError::IncompatibleNotifierDroppedEvent => ServiceOpenError::InternalFailure,
+            | EventOpenError::IncompatibleNotifierDroppedEvent
+            | EventOpenError::IamConnectionFailed
+            | EventOpenError::IamHandshakeFailed
+            | EventOpenError::DevPermissionsIncompatibleWithSecuredMode => {
+                ServiceOpenError::InternalFailure
+            }
         }
     }
 }
@@ -183,6 +221,13 @@ pub enum EventCreateError {
     UnableToCreateServiceTag,
     /// The [`Service`]s config could not be created and written to the static service configuration.
     ServiceConfigCouldNotBeCreated,
+    /// Failed to create the IAM server for a secured service.
+    /// This can happen if the control channel listener cannot be created.
+    IamServerCreationFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl From<ServiceCreateError> for EventCreateError {
@@ -233,7 +278,11 @@ impl From<EventCreateError> for ServiceCreateError {
                 ServiceCreateError::ServiceConfigCouldNotBeCreated
             }
             EventCreateError::Interrupt => ServiceCreateError::Interrupt,
-            EventCreateError::InternalFailure => ServiceCreateError::InternalFailure,
+            EventCreateError::InternalFailure
+            | EventCreateError::IamServerCreationFailed
+            | EventCreateError::DevPermissionsIncompatibleWithSecuredMode => {
+                ServiceCreateError::InternalFailure
+            }
         }
     }
 }
@@ -479,13 +528,24 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
     ) -> Result<event::PortFactory<ServiceType>, EventOpenError> {
         let msg = "Unable to open event service";
 
+        if self.base.dev_permissions_conflicts_with_secured() {
+            fail!(from self, with EventOpenError::DevPermissionsIncompatibleWithSecuredMode,
+                "{} since the dev_permissions feature is incompatible with secured services.", msg);
+        }
+
         let service_state = self.base.open(
             msg,
             || self.base.is_service_available(msg),
             |existing_service_config| -> Result<(), EventOpenError> {
                 self.verify_service_configuration(msg, existing_service_config, required_attributes)
             },
-            |_| Ok(NoResource),
+            |service_config| {
+                let security = super::secured::open_secured_resource::<ServiceType>(
+                    &self.base.shared_node,
+                    service_config,
+                )?;
+                Ok(Secured::new(NoResource, security))
+            },
         )?;
 
         Ok(event::PortFactory::new(service_state))
@@ -511,6 +571,11 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
     ) -> Result<event::PortFactory<ServiceType>, EventCreateError> {
         let origin = format!("{self:?}");
         let msg = "Unable to create event service";
+
+        if self.base.dev_permissions_conflicts_with_secured() {
+            fail!(from self, with EventCreateError::DevPermissionsIncompatibleWithSecuredMode,
+                "{} since the dev_permissions feature is incompatible with secured services.", msg);
+        }
 
         let prepare_static_config = |service_config: &mut StaticConfig| {
             if let RelocatableOption::Some(ref mut deadline) = service_config.event_mut().deadline {
@@ -546,7 +611,13 @@ impl<ServiceType: service::Service> Builder<ServiceType> {
             || self.base.is_service_available(msg),
             prepare_static_config,
             generate_dynamic_config,
-            |_| Ok(NoResource),
+            |service_config| {
+                let security = super::secured::create_secured_resource::<ServiceType>(
+                    &self.base.shared_node,
+                    service_config,
+                )?;
+                Ok(Secured::new(NoResource, security))
+            },
             |_| {},
         )?;
 

@@ -34,15 +34,22 @@ pub mod details {
     use iceoryx2_bb_posix::adaptive_wait::AdaptiveWaitBuilder;
     use iceoryx2_bb_posix::clock::Time;
     use iceoryx2_bb_posix::file::AccessMode;
+    use iceoryx2_bb_posix::memory_mapping::{
+        MappingBehavior, MappingPermission, MemoryMappingBuilder, MemoryMappingCreationError,
+    };
     use iceoryx2_log::{fail, fatal_panic};
 
     pub use crate::zero_copy_connection::*;
 
+    use crate::dynamic_storage::posix_shared_memory::{header_data_from_mapping, header_size};
     use crate::dynamic_storage::{
         DynamicStorage, DynamicStorageBuilder, DynamicStorageCreateError, DynamicStorageOpenError,
         DynamicStorageOpenOrCreateError,
     };
     use crate::named_concept::*;
+    use crate::security::{
+        platform_handle_into_fd, AccessRights, HandleBasedOpenError, PlatformHandle,
+    };
     use crate::shared_memory::SegmentId;
 
     use self::used_chunk_list::RelocatableUsedChunkList;
@@ -135,6 +142,22 @@ pub mod details {
         let mgmt_data = storage.get();
         if mgmt_data.remove_state(state_to_remove) == State::MarkedForDestruction.value() {
             storage.acquire_ownership()
+        }
+    }
+
+    fn map_mapping_error(error: MemoryMappingCreationError, msg: &str) -> HandleBasedOpenError {
+        use iceoryx2_bb_posix::memory_mapping::MemoryMappingCreationError::*;
+
+        match error {
+            InsufficientPermissions => HandleBasedOpenError::InsufficientPermissions,
+            MappingLargerThanCorrespondingFile | MappingSizeIsZero => {
+                HandleBasedOpenError::SizeMismatch
+            }
+            FileDescriptorDoesNotSupportMemoryMappings => HandleBasedOpenError::InvalidHandle,
+            _ => {
+                let _ = msg;
+                HandleBasedOpenError::MappingFailed
+            }
         }
     }
 
@@ -389,6 +412,210 @@ pub mod details {
             self.buffer_size + self.max_borrowed_samples_per_channel + 1
         }
 
+        fn total_size_from_handle(
+            &self,
+            handle: &PlatformHandle,
+            access: AccessRights,
+        ) -> Result<usize, HandleBasedOpenError> {
+            let msg = "Failed to read zero copy connection layout from handle";
+            if !access.can_read() {
+                fail!(from self, with HandleBasedOpenError::InsufficientPermissions,
+                    "{} due to insufficient permissions.", msg);
+            }
+
+            let header_handle = handle.try_clone().map_err(HandleBasedOpenError::from)?;
+            let header_fd = platform_handle_into_fd(header_handle)?;
+            let header_size = header_size::<SharedManagementData>();
+
+            // Map only what we need to derive the full layout from the shared header metadata.
+            let header_mapping = MemoryMappingBuilder::from_file_descriptor(header_fd.clone())
+                .mapping_behavior(MappingBehavior::Shared)
+                .initial_mapping_permission(MappingPermission::Read)
+                .size(header_size)
+                .create()
+                .map_err(|e| map_mapping_error(e, msg))?;
+
+            let header_base = header_mapping.base_address() as usize;
+            let data = unsafe { header_data_from_mapping::<SharedManagementData>(&header_mapping) };
+            let channels_ptr = data.channels.as_ptr();
+            if channels_ptr.is_null() {
+                fail!(from self, with HandleBasedOpenError::InvalidHandle,
+                    "{} since the channels pointer is invalid.", msg);
+            }
+
+            let channels_offset = match (channels_ptr as usize).checked_sub(header_base) {
+                Some(offset) => offset,
+                None => {
+                    fail!(from self, with HandleBasedOpenError::InvalidHandle,
+                        "{} since the channels pointer is outside the mapped region.", msg);
+                }
+            };
+
+            if channels_offset < header_size {
+                fail!(from self, with HandleBasedOpenError::InvalidHandle,
+                    "{} since the channels pointer overlaps the header.", msg);
+            }
+
+            drop(header_mapping);
+
+            let channel_mapping_size =
+                match channels_offset.checked_add(core::mem::size_of::<Channel>()) {
+                    Some(size) => size,
+                    None => {
+                        fail!(from self, with HandleBasedOpenError::InternalError,
+                        "{} since the channel mapping size overflowed.", msg);
+                    }
+                };
+
+            let channel_mapping = MemoryMappingBuilder::from_file_descriptor(header_fd.clone())
+                .mapping_behavior(MappingBehavior::Shared)
+                .initial_mapping_permission(MappingPermission::Read)
+                .size(channel_mapping_size)
+                .create()
+                .map_err(|e| map_mapping_error(e, msg))?;
+
+            let mapping_base = channel_mapping.base_address() as usize;
+            let data =
+                unsafe { header_data_from_mapping::<SharedManagementData>(&channel_mapping) };
+
+            let number_of_channels = data.channels.capacity();
+            if number_of_channels == 0 {
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the number of channels is zero.", msg);
+            }
+
+            let number_of_segments = data.number_of_segments;
+            if number_of_segments == 0 {
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the number of segments is zero.", msg);
+            }
+
+            let number_of_samples = data.number_of_samples_per_segment;
+            if number_of_samples == 0 {
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the number of samples per segment is zero.", msg);
+            }
+
+            let segment_details_capacity = data.segment_details.capacity();
+            let expected_segment_details_capacity =
+                number_of_channels * number_of_segments as usize;
+            if segment_details_capacity != expected_segment_details_capacity {
+                fail!(from self, with HandleBasedOpenError::InvalidHandle,
+                    "{} since the segment details capacity is inconsistent.", msg);
+            }
+
+            let channel_ptr = (mapping_base + channels_offset) as *const Channel;
+            let submission_queue_capacity = unsafe { (*channel_ptr).submission_queue.capacity() };
+            let completion_queue_capacity = unsafe { (*channel_ptr).completion_queue.capacity() };
+
+            if submission_queue_capacity == 0 || completion_queue_capacity == 0 {
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the channel queues are not initialized.", msg);
+            }
+
+            let supplementary_size = SharedManagementData::const_memory_size(
+                submission_queue_capacity,
+                completion_queue_capacity,
+                number_of_samples,
+                number_of_segments,
+                number_of_channels,
+            );
+
+            let total_size = match header_size.checked_add(supplementary_size) {
+                Some(size) => size,
+                None => {
+                    fail!(from self, with HandleBasedOpenError::InternalError,
+                        "{} since the total size overflowed.", msg);
+                }
+            };
+
+            Ok(total_size)
+        }
+
+        fn open_shm_from_handle(
+            &self,
+            handle: PlatformHandle,
+            access: AccessRights,
+            port_to_register: State,
+        ) -> Result<Storage, HandleBasedOpenError> {
+            let msg = "Failed to open zero copy connection from handle";
+            if !access.can_read() || !access.can_write() {
+                fail!(from self, with HandleBasedOpenError::InsufficientPermissions,
+                    "{} due to insufficient permissions.", msg);
+            }
+
+            let total_size = self.total_size_from_handle(&handle, access)?;
+
+            let storage = <<Storage as DynamicStorage<SharedManagementData>>::Builder<'_> as NamedConceptBuilder<
+                Storage,
+            >>::new(&self.name)
+            .config(&self.config.dynamic_storage_config)
+            .timeout(self.timeout)
+            .open_from_handle(handle, access, total_size)?;
+
+            match storage.get().reserve_port(port_to_register.value(), msg) {
+                Ok(()) => (),
+                Err(ZeroCopyCreationError::AnotherInstanceIsAlreadyConnected) => {
+                    fail!(from self, with HandleBasedOpenError::InternalError,
+                        "{} since another instance is already connected.", msg);
+                }
+                Err(ZeroCopyCreationError::IsBeingCleanedUp) => {
+                    fail!(from self, with HandleBasedOpenError::InternalError,
+                        "{} since the connection is currently being cleaned up.", msg);
+                }
+                Err(_) => {
+                    fail!(from self, with HandleBasedOpenError::InternalError,
+                        "{} due to an internal error.", msg);
+                }
+            }
+
+            if storage.get().channels[0].submission_queue.capacity() != self.submission_queue_size()
+            {
+                cleanup_shared_memory(&storage, port_to_register);
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the connection has a buffer size of {} but a buffer size of {} is required.",
+                    msg, storage.get().channels[0].submission_queue.capacity(), self.submission_queue_size());
+            }
+
+            if storage.get().channels[0].completion_queue.capacity() != self.completion_queue_size()
+            {
+                cleanup_shared_memory(&storage, port_to_register);
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the max borrowed sample per channel setting is set to {} but a value of {} is required.",
+                    msg, storage.get().channels[0].completion_queue.capacity() - storage.get().channels[0].submission_queue.capacity(), self.max_borrowed_samples_per_channel);
+            }
+
+            if storage.get().enable_safe_overflow != self.enable_safe_overflow {
+                cleanup_shared_memory(&storage, port_to_register);
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the safe overflow is set to {} but should be set to {}.",
+                    msg, storage.get().enable_safe_overflow, self.enable_safe_overflow);
+            }
+
+            if storage.get().number_of_samples_per_segment != self.number_of_samples_per_segment {
+                cleanup_shared_memory(&storage, port_to_register);
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the requested number of samples is set to {} but should be set to {}.",
+                    msg, self.number_of_samples_per_segment, storage.get().number_of_samples_per_segment);
+            }
+
+            if storage.get().number_of_segments != self.number_of_segments {
+                cleanup_shared_memory(&storage, port_to_register);
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the requested number of segments is set to {} but should be set to {}.",
+                    msg, self.number_of_segments, storage.get().number_of_segments);
+            }
+
+            if storage.get().channels.capacity() != self.number_of_channels {
+                cleanup_shared_memory(&storage, port_to_register);
+                fail!(from self, with HandleBasedOpenError::SizeMismatch,
+                    "{} since the requested number of channels is set to {} but should be set to {}.",
+                    msg, self.number_of_channels, storage.get().channels.capacity());
+            }
+
+            Ok(storage)
+        }
+
         fn create_or_open_shm(
             &self,
             port_to_register: State,
@@ -511,6 +738,56 @@ pub mod details {
 
             Ok(storage)
         }
+
+        fn create_shm_and_extract_handle(
+            &self,
+            port_to_register: State,
+        ) -> Result<(Storage, PlatformHandle), ZeroCopyCreationError> {
+            let supplementary_size = SharedManagementData::const_memory_size(
+                self.submission_queue_size(),
+                self.completion_queue_size(),
+                self.number_of_samples_per_segment,
+                self.number_of_segments,
+                self.number_of_channels,
+            );
+
+            let msg = "Failed to create anonymous connection shared memory";
+            let builder = <<Storage as DynamicStorage<SharedManagementData>>::Builder<'_> as NamedConceptBuilder<
+                Storage,
+            >>::new(&self.name)
+            .config(&self.config.dynamic_storage_config)
+            .supplementary_size(supplementary_size)
+            .initializer(|data, allocator| {
+                data.write(
+                    SharedManagementData::new(
+                        self.enable_safe_overflow,
+                        self.max_borrowed_samples_per_channel,
+                        self.number_of_samples_per_segment,
+                        self.number_of_segments,
+                        self.number_of_channels,
+                    )
+                );
+                let data = unsafe { data.assume_init_mut() };
+                unsafe { data.init(allocator, self.submission_queue_size(), self.completion_queue_size()) };
+                for channel in data.channels.iter() {
+                    channel.state.store(self.initial_channel_state.0, Ordering::Relaxed);
+                }
+
+                true
+            });
+
+            let (storage, handle) = fail!(from self, when builder.create_and_extract_handle(),
+                with ZeroCopyCreationError::InternalError,
+                "{} since the underlying anonymous dynamic storage could not be created.", msg);
+
+            storage.get().reserve_port(port_to_register.value(), msg)?;
+
+            if storage.has_ownership() {
+                storage.release_ownership();
+            }
+
+            Ok((storage, handle))
+        }
     }
 
     impl<Storage: DynamicStorage<SharedManagementData>> NamedConceptBuilder<Connection<Storage>>
@@ -613,6 +890,58 @@ pub mod details {
                 },
                 name: self.name,
             })
+        }
+
+        fn open_sender_from_handle(
+            self,
+            handle: PlatformHandle,
+            access: AccessRights,
+        ) -> Result<<Connection<Storage> as ZeroCopyConnection>::Sender, HandleBasedOpenError>
+        {
+            let storage = self.open_shm_from_handle(handle, access, State::Sender)?;
+
+            Ok(Sender {
+                storage,
+                name: self.name,
+            })
+        }
+
+        fn open_receiver_from_handle(
+            self,
+            handle: PlatformHandle,
+            access: AccessRights,
+        ) -> Result<<Connection<Storage> as ZeroCopyConnection>::Receiver, HandleBasedOpenError>
+        {
+            let storage = self.open_shm_from_handle(handle, access, State::Receiver)?;
+
+            Ok(Receiver {
+                storage,
+                borrow_counter: {
+                    let mut borrow_counter = vec![];
+                    for _ in 0..self.number_of_channels {
+                        borrow_counter.push(UnsafeCell::new(0));
+                    }
+                    borrow_counter
+                },
+                name: self.name,
+            })
+        }
+
+        fn create_sender_anonymous(
+            self,
+        ) -> Result<(<Connection<Storage> as ZeroCopyConnection>::Sender, PlatformHandle), ZeroCopyCreationError>
+        {
+            let msg = "Unable to create anonymous sender";
+            let (storage, handle) = fail!(from self, when self.create_shm_and_extract_handle(State::Sender),
+                "{} since the anonymous connection could not be created", msg);
+
+            Ok((
+                Sender {
+                    storage,
+                    name: self.name,
+                },
+                handle,
+            ))
         }
     }
 

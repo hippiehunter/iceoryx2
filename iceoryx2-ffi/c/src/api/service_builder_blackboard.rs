@@ -78,6 +78,8 @@ pub enum iox2_blackboard_open_error_e {
     O_VERSION_MISMATCH,
     #[CStr = "interrupt"]
     O_INTERRUPT,
+    #[CStr = "incompatible security mode"]
+    O_INCOMPATIBLE_SECURITY_MODE,
 }
 
 #[repr(C)]
@@ -148,6 +150,9 @@ impl IntoCInt for BlackboardOpenError {
             }
             BlackboardOpenError::VersionMismatch => {
                 iox2_blackboard_open_error_e::O_VERSION_MISMATCH
+            }
+            BlackboardOpenError::IncompatibleSecurityMode => {
+                iox2_blackboard_open_error_e::O_INCOMPATIBLE_SECURITY_MODE
             }
         }) as c_int
     }

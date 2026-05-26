@@ -64,6 +64,7 @@ pub mod recommended;
 
 use core::{fmt::Debug, time::Duration};
 
+use crate::security::{AccessRights, HandleBasedOpenError, PlatformHandle};
 pub use crate::shm_allocator::*;
 use crate::static_storage::file::{NamedConcept, NamedConceptBuilder, NamedConceptMgmt};
 use iceoryx2_bb_elementary_traits::testing::abandonable::Abandonable;
@@ -108,6 +109,9 @@ impl core::fmt::Display for SharedMemoryOpenError {
 }
 
 impl core::error::Error for SharedMemoryOpenError {}
+
+/// Failure returned by [`SharedMemoryBuilder::open_from_handle()`]
+pub type SharedMemoryOpenFromHandleError = HandleBasedOpenError;
 
 /// Represents a pointer pointing to some [`SharedMemory`]. Consists of the actual data pointer and
 /// an [`PointerOffset`] which can be used in combination with a
@@ -155,6 +159,21 @@ pub trait SharedMemoryBuilder<Allocator: ShmAllocator, Shm: SharedMemory<Allocat
     /// Opens already existing [`SharedMemory`]. If it does not exist or the initialization is not
     /// yet finished the method will fail.
     fn open(self, access_mode: AccessMode) -> Result<Shm, SharedMemoryOpenError>;
+
+    /// Opens [`SharedMemory`] from a platform handle received via IAM with the provided access
+    /// rights.
+    fn open_from_handle(
+        self,
+        handle: PlatformHandle,
+        access: AccessRights,
+        config: &Shm::Configuration,
+    ) -> Result<Shm, SharedMemoryOpenFromHandleError>;
+
+    /// Creates an anonymous shared memory segment and returns it with a handle for sharing.
+    fn create_anonymous(
+        self,
+        allocator_config: &Allocator::Configuration,
+    ) -> Result<(Shm, PlatformHandle), SharedMemoryCreateError>;
 }
 
 /// Abstract concept of a memory shared between multiple processes. Can be created with the

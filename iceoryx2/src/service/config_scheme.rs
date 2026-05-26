@@ -50,6 +50,14 @@ pub(crate) fn connection_config<Service: crate::service::Service>(
         .path_hint(global_config.global.root_path())
 }
 
+pub(crate) fn control_channel_config<Service: crate::service::Service>(
+    global_config: &config::Config,
+) -> <Service::ControlChannel as NamedConceptMgmt>::Configuration {
+    <<Service::ControlChannel as NamedConceptMgmt>::Configuration>::default()
+        .prefix(&global_config.global.prefix)
+        .path_hint(global_config.global.root_path())
+}
+
 pub(crate) fn event_config<Service: crate::service::Service>(
     global_config: &config::Config,
 ) -> <Service::Event as NamedConceptMgmt>::Configuration {

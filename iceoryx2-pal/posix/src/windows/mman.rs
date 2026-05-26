@@ -42,6 +42,9 @@ use windows_sys::Win32::{
     System::{IO::OVERLAPPED, Memory::*},
 };
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use super::win32_handle_translator::{FdHandleEntry, FileHandle, HandleTranslator, ShmHandle};
 
 struct FileMappingsSet {
@@ -389,9 +392,11 @@ pub(crate) unsafe fn shm_set_size(fd_handle: HANDLE, shm_size: u64) {
     }
 
     if shm_size > MAX_SUPPORTED_SHM_SIZE {
-        eprintln!(
-            "Trying to allocate {shm_size} which is larger than the maximum supported shared memory size of {MAX_SUPPORTED_SHM_SIZE}"
-        );
+        #[cfg(feature = "std")]
+        {
+            extern crate std;
+            std::eprintln!("Trying to allocate {shm_size} which is larger than the maximum supported shared memory size of {MAX_SUPPORTED_SHM_SIZE}");
+        }
     }
 
     let mut bytes_written = 0;
@@ -555,5 +560,326 @@ pub unsafe fn mprotect(addr: *mut void, len: size_t, prot: int) -> int {
         0
     } else {
         -1
+    }
+}
+
+// ============================================================================
+// Anonymous Memory Mapping for Control Channel
+// ============================================================================
+
+use super::security_descriptor::SecurityDescriptor;
+use core::fmt::{self, Display, Formatter};
+use core::hash::Hash;
+
+/// Errors that can occur when creating an anonymous memory mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AnonymousMappingError {
+    /// The requested size is invalid (zero or too large).
+    InvalidSize,
+    /// Insufficient system resources (handles, kernel objects).
+    InsufficientResources,
+    /// Insufficient memory to create the mapping.
+    InsufficientMemory,
+    /// Access was denied (security descriptor rejected access).
+    AccessDenied,
+    /// An internal Windows error occurred.
+    InternalError(u32),
+}
+
+impl AnonymousMappingError {
+    /// Converts a Win32 error code to an [`AnonymousMappingError`].
+    pub fn from_win32(error_code: u32) -> Self {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_COMMITMENT_LIMIT, ERROR_NOT_ENOUGH_MEMORY,
+            ERROR_NO_SYSTEM_RESOURCES, ERROR_OUTOFMEMORY,
+        };
+
+        match error_code {
+            ERROR_ACCESS_DENIED => AnonymousMappingError::AccessDenied,
+            ERROR_NOT_ENOUGH_MEMORY | ERROR_OUTOFMEMORY | ERROR_COMMITMENT_LIMIT => {
+                AnonymousMappingError::InsufficientMemory
+            }
+            ERROR_NO_SYSTEM_RESOURCES => AnonymousMappingError::InsufficientResources,
+            _ => AnonymousMappingError::InternalError(error_code),
+        }
+    }
+}
+
+impl Display for AnonymousMappingError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            AnonymousMappingError::InvalidSize => {
+                write!(f, "Invalid mapping size")
+            }
+            AnonymousMappingError::InsufficientResources => {
+                write!(f, "Insufficient system resources")
+            }
+            AnonymousMappingError::InsufficientMemory => {
+                write!(f, "Insufficient memory")
+            }
+            AnonymousMappingError::AccessDenied => {
+                write!(f, "Access denied")
+            }
+            AnonymousMappingError::InternalError(code) => {
+                write!(f, "Internal error (code: {})", code)
+            }
+        }
+    }
+}
+
+impl core::error::Error for AnonymousMappingError {}
+
+/// Creates an anonymous (unnamed) memory mapping.
+///
+/// This function creates a file mapping object backed by the system paging file,
+/// not associated with any file on disk. This is equivalent to POSIX `shm_open`
+/// with `O_CREAT` but without a name.
+///
+/// Anonymous mappings are useful for control channels where:
+/// - The memory doesn't need to be discoverable by name
+/// - The handle will be passed directly to clients via handle duplication
+/// - Stronger security is desired (no race conditions with named objects)
+///
+/// # Arguments
+///
+/// * `size` - The size of the mapping in bytes (must be > 0)
+/// * `read_write` - If true, the mapping is read-write; otherwise read-only
+/// * `security` - Optional security descriptor; if None, uses default security
+///
+/// # Returns
+///
+/// * `Ok(HANDLE)` - The handle to the file mapping object
+/// * `Err(AnonymousMappingError)` - If creation failed
+///
+/// # Example
+///
+/// ```ignore
+/// use iceoryx2_pal_posix::windows::mman::create_anonymous_mapping;
+/// use iceoryx2_pal_posix::windows::security_descriptor::SecurityDescriptor;
+///
+/// // Create with default security
+/// let handle = create_anonymous_mapping(4096, true, None)?;
+///
+/// // Create with custom security
+/// let sd = SecurityDescriptor::owner_only()?;
+/// let handle = create_anonymous_mapping(4096, true, Some(&sd))?;
+/// ```
+///
+/// # Safety
+///
+/// The caller is responsible for:
+/// - Closing the returned handle with `CloseHandle` when done
+/// - Ensuring the handle is not used after being closed
+pub fn create_anonymous_mapping(
+    size: usize,
+    read_write: bool,
+    security: Option<&SecurityDescriptor>,
+) -> Result<HANDLE, AnonymousMappingError> {
+    if size == 0 {
+        return Err(AnonymousMappingError::InvalidSize);
+    }
+
+    // Calculate high and low parts of size for 64-bit support
+    let size_low: u32 = (size & 0xFFFFFFFF) as u32;
+    let size_high: u32 = (size.overflowing_shr(32).0 & 0xFFFFFFFF) as u32;
+
+    // Determine protection flags
+    let protect = if read_write {
+        PAGE_READWRITE
+    } else {
+        PAGE_READONLY
+    };
+
+    // Get security attributes pointer
+    let security_attrs = security.map(|sd| sd.as_security_attributes());
+    let security_ptr = match &security_attrs {
+        Some(attrs) => attrs as *const SECURITY_ATTRIBUTES,
+        None => core::ptr::null(),
+    };
+
+    // SAFETY: CreateFileMappingW is called with:
+    // - INVALID_HANDLE_VALUE to create a mapping backed by the system paging file
+    // - Valid (or null) security attributes pointer
+    // - Valid protection flags
+    // - Valid size parameters
+    // - NULL for the name (anonymous mapping)
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            security_ptr,
+            protect,
+            size_high,
+            size_low,
+            core::ptr::null(), // Anonymous - no name
+        )
+    };
+
+    if handle == 0 {
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        return Err(AnonymousMappingError::from_win32(error));
+    }
+
+    Ok(handle)
+}
+
+#[cfg(test)]
+mod anonymous_mapping_tests {
+    extern crate std;
+    use super::*;
+    use alloc::format;
+
+    #[test]
+    fn test_anonymous_mapping_error_display() {
+        assert_eq!(
+            format!("{}", AnonymousMappingError::InvalidSize),
+            "Invalid mapping size"
+        );
+        assert_eq!(
+            format!("{}", AnonymousMappingError::InsufficientResources),
+            "Insufficient system resources"
+        );
+        assert_eq!(
+            format!("{}", AnonymousMappingError::InsufficientMemory),
+            "Insufficient memory"
+        );
+        assert_eq!(
+            format!("{}", AnonymousMappingError::AccessDenied),
+            "Access denied"
+        );
+        assert_eq!(
+            format!("{}", AnonymousMappingError::InternalError(42)),
+            "Internal error (code: 42)"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::clone_on_copy)]
+    fn test_anonymous_mapping_error_traits() {
+        // Test Clone
+        let error = AnonymousMappingError::InvalidSize;
+        let cloned = error.clone();
+        assert_eq!(error, cloned);
+
+        // Test Copy
+        let copied = error;
+        assert_eq!(error, copied);
+
+        // Test Hash
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(AnonymousMappingError::InvalidSize);
+        set.insert(AnonymousMappingError::AccessDenied);
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_create_anonymous_mapping_zero_size() {
+        let result = create_anonymous_mapping(0, true, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), AnonymousMappingError::InvalidSize);
+    }
+
+    #[test]
+    fn test_create_anonymous_mapping_basic() {
+        let result = create_anonymous_mapping(4096, true, None);
+        assert!(result.is_ok(), "Failed to create anonymous mapping");
+
+        let handle = result.unwrap();
+        assert!(handle != 0);
+
+        // Clean up
+        unsafe { CloseHandle(handle) };
+    }
+
+    #[test]
+    fn test_create_anonymous_mapping_read_only() {
+        let result = create_anonymous_mapping(4096, false, None);
+        assert!(
+            result.is_ok(),
+            "Failed to create read-only anonymous mapping"
+        );
+
+        let handle = result.unwrap();
+        assert!(handle != 0);
+
+        // Clean up
+        unsafe { CloseHandle(handle) };
+    }
+
+    #[test]
+    fn test_create_anonymous_mapping_with_security() {
+        let sd = SecurityDescriptor::everyone_full_access()
+            .expect("Failed to create security descriptor");
+        let result = create_anonymous_mapping(4096, true, Some(&sd));
+        assert!(
+            result.is_ok(),
+            "Failed to create anonymous mapping with security"
+        );
+
+        let handle = result.unwrap();
+        assert!(handle != 0);
+
+        // Clean up
+        unsafe { CloseHandle(handle) };
+    }
+
+    #[test]
+    fn test_create_anonymous_mapping_large_size() {
+        // 1 GB mapping - should succeed as it's just reserving address space
+        let result = create_anonymous_mapping(1024 * 1024 * 1024, true, None);
+
+        // This might fail on systems with low resources, so we just check it doesn't panic
+        if let Ok(handle) = result {
+            unsafe { CloseHandle(handle) };
+        }
+    }
+
+    #[test]
+    fn test_create_anonymous_mapping_can_map_view() {
+        let result = create_anonymous_mapping(4096, true, None);
+        assert!(result.is_ok());
+
+        let handle = result.unwrap();
+
+        // Map a view of the file mapping
+        let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, 4096) };
+        assert!(view != 0, "Failed to map view of anonymous mapping");
+
+        // Write to the mapping to verify it works
+        unsafe {
+            let ptr = view as *mut u8;
+            *ptr = 42;
+            assert_eq!(*ptr, 42);
+        }
+
+        // Clean up
+        unsafe {
+            UnmapViewOfFile(view);
+            CloseHandle(handle);
+        }
+    }
+
+    #[test]
+    fn test_error_from_win32() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_NOT_ENOUGH_MEMORY, ERROR_NO_SYSTEM_RESOURCES,
+        };
+
+        assert_eq!(
+            AnonymousMappingError::from_win32(ERROR_ACCESS_DENIED),
+            AnonymousMappingError::AccessDenied
+        );
+        assert_eq!(
+            AnonymousMappingError::from_win32(ERROR_NOT_ENOUGH_MEMORY),
+            AnonymousMappingError::InsufficientMemory
+        );
+        assert_eq!(
+            AnonymousMappingError::from_win32(ERROR_NO_SYSTEM_RESOURCES),
+            AnonymousMappingError::InsufficientResources
+        );
+        assert!(matches!(
+            AnonymousMappingError::from_win32(9999),
+            AnonymousMappingError::InternalError(9999)
+        ));
     }
 }

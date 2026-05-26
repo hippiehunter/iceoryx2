@@ -43,6 +43,7 @@ iceoryx2-bb-elementary = { workspace = true }
 iceoryx2-bb-elementary-traits = { workspace = true }
 iceoryx2-bb-memory = { workspace = true }
 iceoryx2-bb-lock-free = { workspace = true }
+iceoryx2-pal-posix = { workspace = true }
 
 postcard = { workspace = true }
 serde = { workspace = true }
@@ -54,6 +55,12 @@ tiny-fn = { workspace = true }
 iceoryx2-cal-tests-common = { workspace = true, features = ["std"] }
 iceoryx2-bb-loggers = { workspace = true, features = ["std"] }
 iceoryx2-bb-testing = { workspace = true, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
 
 [[test]]
 name = "iceoryx2-cal-tests"

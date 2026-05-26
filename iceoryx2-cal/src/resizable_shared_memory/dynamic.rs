@@ -35,6 +35,7 @@ use iceoryx2_bb_system_types::path::Path;
 use iceoryx2_log::fatal_panic;
 use iceoryx2_log::{fail, warn};
 
+use crate::security::{AccessRights, HandleBasedOpenError, PlatformHandle};
 use crate::shared_memory::{
     AllocationStrategy, SegmentId, SharedMemoryForPoolAllocator, ShmPointer,
 };
@@ -48,8 +49,8 @@ use crate::shm_allocator::pool_allocator::PoolAllocator;
 use super::{
     NamedConcept, NamedConceptBuilder, NamedConceptDoesExistError, NamedConceptListError,
     NamedConceptMgmt, NamedConceptRemoveError, ResizableSharedMemory, ResizableSharedMemoryBuilder,
-    ResizableSharedMemoryForPoolAllocator, ResizableSharedMemoryView,
-    ResizableSharedMemoryViewBuilder, ResizableShmAllocationError,
+    ResizableSharedMemoryError, ResizableSharedMemoryForPoolAllocator, ResizableSharedMemoryHandles,
+    ResizableSharedMemoryView, ResizableSharedMemoryViewBuilder, ResizableShmAllocationError,
 };
 
 const MAX_NUMBER_OF_REALLOCATIONS: usize = SegmentId::max_segment_id() as usize + 1;
@@ -78,6 +79,12 @@ struct ViewConfig<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> {
     base_name: FileName,
     shm: Shm::Configuration,
     shm_builder_timeout: Duration,
+    /// When `true` the view was opened from IAM-brokered handles (secured mode) and MUST NOT
+    /// perform any name-based `open` for unmapped segments. The segment name is fixed and
+    /// guessable, so a name-based rendezvous would let a different-uid attacker pre-plant the
+    /// shm and be mapped in place of the authentic segment. When `false` (the default for the
+    /// name-based `open` path used in public mode) the current name-based behavior is retained.
+    handle_brokered: bool,
     _data: PhantomData<Allocator>,
 }
 
@@ -102,6 +109,7 @@ impl<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> Abandonable
 struct ShmEntry<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> {
     shm: Shm,
     chunk_count: AtomicU64,
+    pinned: bool,
     _data: PhantomData<Allocator>,
 }
 
@@ -125,8 +133,22 @@ impl<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> ShmEntry<Allocator, 
         Self {
             shm,
             chunk_count: AtomicU64::new(0),
+            pinned: false,
             _data: PhantomData,
         }
+    }
+
+    fn new_pinned(shm: Shm) -> Self {
+        Self {
+            shm,
+            chunk_count: AtomicU64::new(0),
+            pinned: true,
+            _data: PhantomData,
+        }
+    }
+
+    fn is_pinned(&self) -> bool {
+        self.pinned
     }
 
     fn register_offset(&self) {
@@ -157,6 +179,9 @@ where
                 base_name: *name,
                 shm: Shm::Configuration::default(),
                 shm_builder_timeout: Duration::ZERO,
+                // Default: name-based fallback allowed (public mode). Only the handle-brokered
+                // `open_from_handle` constructor flips this to `true`.
+                handle_brokered: false,
                 _data: PhantomData,
             },
         }
@@ -208,6 +233,53 @@ where
             access_mode,
             _data: PhantomData,
         })
+    }
+
+    fn open_from_handle(
+        mut self,
+        mgmt_handle: PlatformHandle,
+        initial_segment_id: SegmentId,
+        initial_segment_handle: PlatformHandle,
+        access: AccessRights,
+    ) -> Result<DynamicView<Allocator, Shm>, HandleBasedOpenError> {
+        // This is the IAM-brokered (secured) view constructor: every segment is obtained through
+        // an authenticated handle, never by name. Mark the view so that `register_and_translate_offset`
+        // refuses name-based opens for unmapped segments (defense-in-depth against segment spoofing).
+        self.config.handle_brokered = true;
+
+        // Reconstruct the management segment from its brokered handle. It is a never-read
+        // keep-alive token (see `DynamicView::mgmt_segment`), so a byte-equivalent mapping is
+        // sufficient - no name-based rendezvous is performed.
+        let mgmt_name =
+            DynamicMemory::<Allocator, Shm>::managment_segment_name(&self.config.base_name);
+        let mgmt_segment = Shm::Builder::new(&mgmt_name)
+            .config(&self.config.shm)
+            .has_ownership(false)
+            .open_from_handle(mgmt_handle, access, &self.config.shm)?;
+
+        let access_mode = if access.can_write() {
+            AccessMode::ReadWrite
+        } else {
+            AccessMode::Read
+        };
+
+        let view = DynamicView {
+            view_config: self.config,
+            mgmt_segment,
+            shared_memory_map: UnsafeCell::new(SlotMap::new(MAX_NUMBER_OF_REALLOCATIONS)),
+            current_idx: AtomicUsize::new(INVALID_KEY),
+            access_mode,
+            _data: PhantomData,
+        };
+
+        // Register the initial data segment (segment id 0) via the existing pinned handle path.
+        // This maps the segment from its handle, inserts it pinned (never auto-released) and sets
+        // `current_idx = 0`, matching the state a name-based `open` would reach after the first
+        // `register_and_translate_offset`.
+        view.add_segment_from_handle(initial_segment_id, initial_segment_handle, access)
+            .map_err(|_| HandleBasedOpenError::InvalidHandle)?;
+
+        Ok(view)
     }
 }
 
@@ -324,6 +396,77 @@ where
             _data: PhantomData,
         })
     }
+
+    fn create_and_extract_handles(
+        mut self,
+    ) -> Result<
+        (DynamicMemory<Allocator, Shm>, ResizableSharedMemoryHandles),
+        SharedMemoryCreateError,
+    > {
+        let msg = "Unable to create anonymous ResizableSharedMemory";
+        let origin = format!("{self:?}");
+
+        // --- management segment (anonymous / memfd-backed) ---
+        // Mirrors the named `create` path but terminates in `create_anonymous`, capturing the
+        // extractable handle instead of relying on a filesystem-visible name.
+        let mgmt_hint = Allocator::initial_setup_hint(Layout::new::<u8>(), 1);
+        let mgmt_name =
+            DynamicMemory::<Allocator, Shm>::managment_segment_name(&self.config.base_name);
+        let (mgmt_segment, mgmt_handle) = fail!(from origin, when Shm::Builder::new(&mgmt_name)
+                                                    .size(mgmt_hint.payload_size)
+                                                    .config(&self.config.shm)
+                                                    .has_ownership(true)
+                                                    .create_anonymous(&mgmt_hint.config),
+                            "{msg} since the anonymous management segment could not be created.");
+        let mgmt_size = mgmt_hint.payload_size;
+
+        // --- initial data segment 0 (anonymous / memfd-backed) ---
+        let hint = Allocator::initial_setup_hint(
+            unsafe {
+                Layout::from_size_align_unchecked(
+                    self.shared_state
+                        .max_chunk_size_hint
+                        .load(Ordering::Relaxed) as usize,
+                    self.shared_state
+                        .max_chunk_alignment_hint
+                        .load(Ordering::Relaxed) as usize,
+                )
+            },
+            self.shared_state
+                .max_number_of_chunks_hint
+                .load(Ordering::Relaxed) as usize,
+        );
+        self.config.allocator_config_hint = hint.config;
+
+        let (shm, initial_segment_handle) = fail!(from origin,
+            when DynamicMemory::create_segment_anonymous(&self.config, SegmentId::new(0), hint.payload_size),
+            "{msg} since the anonymous initial data segment could not be created.");
+        let initial_segment_size = hint.payload_size;
+
+        let mut shared_memory_map = SlotMap::new(MAX_NUMBER_OF_REALLOCATIONS);
+        let current_idx = fatal_panic!(from origin, when shared_memory_map.insert(ShmEntry::new(shm)).ok_or(""),
+                "This should never happen! {msg} since the newly constructed SlotMap does not have space for one insert.");
+
+        Ok((
+            DynamicMemory {
+                state: UnsafeCell::new(InternalState {
+                    builder_config: self.config,
+                    shared_memory_map,
+                    current_idx,
+                    shared_state: self.shared_state,
+                }),
+                mgmt_segment,
+                _data: PhantomData,
+            },
+            ResizableSharedMemoryHandles {
+                mgmt_handle,
+                mgmt_size,
+                initial_segment_id: SegmentId::new(0),
+                initial_segment_handle,
+                initial_segment_size,
+            },
+        ))
+    }
 }
 
 #[derive(Debug)]
@@ -361,7 +504,7 @@ where
 
         let old_key = SlotMapKey::new(old_idx);
         if let Some(shm) = shared_memory_map.get(old_key) {
-            if shm.chunk_count.load(Ordering::Relaxed) == 0 {
+            if shm.chunk_count.load(Ordering::Relaxed) == 0 && !shm.is_pinned() {
                 shared_memory_map.remove(old_key);
             }
         }
@@ -385,6 +528,18 @@ where
 
         let payload_start_address = match shared_memory_map.get(key) {
             None => {
+                // Handle-brokered (secured) views MUST NOT fall back to a name-based open here:
+                // the segment name is fixed and guessable, so a different-uid attacker could
+                // pre-plant `<prefix>iam_handle_dynamic_segment_<n><suffix>` and be mapped in place
+                // of the authentic producer segment. Return the same `DoesNotExist` error that a
+                // failed name-open would produce so the receiver's existing IAM handle-request
+                // fallback (see `receiver::receive_from_connection`) brokers the segment
+                // authentically, then retries this translate with the segment now in the map.
+                if self.view_config.handle_brokered {
+                    fail!(from self, with SharedMemoryOpenError::DoesNotExist,
+                        "{msg} {:?} since the segment is not mapped and handle-brokered (secured) views never perform a name-based open.", offset);
+                }
+
                 let shm = fail!(from self,
                                 when DynamicMemory::open_segment(&self.view_config, segment_id, self.access_mode),
                                 "{msg} {:?} since the corresponding shared memory segment could not be opened.", offset);
@@ -418,6 +573,7 @@ where
                 let state = entry.unregister_offset();
                 if state == ShmEntryState::Empty
                     && self.current_idx.load(Ordering::Relaxed) != key.value()
+                    && !entry.is_pinned()
                 {
                     shared_memory_map.remove(key);
                 }
@@ -432,6 +588,76 @@ where
     fn number_of_active_segments(&self) -> usize {
         let shared_memory_map = unsafe { &mut *self.shared_memory_map.get() };
         shared_memory_map.len()
+    }
+
+    fn add_segment_from_handle(
+        &self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        access: AccessRights,
+    ) -> Result<(), ResizableSharedMemoryError> {
+        let msg = "Unable to add shared memory segment from handle";
+        let key = SlotMapKey::new(segment_id.value() as usize);
+        let shared_memory_map = unsafe { &mut *self.shared_memory_map.get() };
+
+        if shared_memory_map.contains(key) {
+            fail!(from self, with ResizableSharedMemoryError::SegmentAlreadyExists,
+                "{} since the segment id {:?} is already mapped.", msg, segment_id);
+        }
+
+        let shm = DynamicMemory::<Allocator, Shm>::segment_builder(
+            &self.view_config.base_name,
+            &self.view_config.shm,
+            segment_id,
+        )
+        .has_ownership(false)
+        .timeout(self.view_config.shm_builder_timeout)
+        .open_from_handle(handle, access, &self.view_config.shm)
+        .map_err(ResizableSharedMemoryError::from)?;
+
+        if !shared_memory_map.insert_at(key, ShmEntry::new_pinned(shm)) {
+            fail!(from self, with ResizableSharedMemoryError::InvalidSegmentId,
+                "{} since the segment id {:?} is out of range.", msg, segment_id);
+        }
+
+        Self::release_old_unused_segments(
+            shared_memory_map,
+            self.current_idx.swap(key.value(), Ordering::Relaxed),
+        );
+
+        Ok(())
+    }
+
+    fn retire_segment(&self, segment_id: SegmentId) -> Result<(), ResizableSharedMemoryError> {
+        let msg = "Unable to retire shared memory segment";
+        let key = SlotMapKey::new(segment_id.value() as usize);
+        let shared_memory_map = unsafe { &mut *self.shared_memory_map.get() };
+
+        if key.value() >= shared_memory_map.capacity() {
+            fail!(from self, with ResizableSharedMemoryError::InvalidSegmentId,
+                "{} since the segment id {:?} is out of range.", msg, segment_id);
+        }
+
+        let entry = match shared_memory_map.get(key) {
+            Some(entry) => entry,
+            None => {
+                fail!(from self, with ResizableSharedMemoryError::SegmentDoesNotExist,
+                    "{} since the segment id {:?} is not mapped.", msg, segment_id);
+            }
+        };
+
+        if entry.chunk_count.load(Ordering::Relaxed) != 0 {
+            fail!(from self, with ResizableSharedMemoryError::SegmentInUse,
+                "{} since the segment id {:?} is still in use.", msg, segment_id);
+        }
+
+        shared_memory_map.remove(key);
+
+        if self.current_idx.load(Ordering::Relaxed) == key.value() {
+            self.current_idx.store(INVALID_KEY, Ordering::Relaxed);
+        }
+
+        Ok(())
     }
 }
 
@@ -627,6 +853,17 @@ where
             .create(&config.allocator_config_hint)
     }
 
+    fn create_segment_anonymous(
+        config: &MemoryConfig<Allocator, Shm>,
+        segment_id: SegmentId,
+        payload_size: usize,
+    ) -> Result<(Shm, PlatformHandle), SharedMemoryCreateError> {
+        Self::segment_builder(&config.base_name, &config.shm, segment_id)
+            .has_ownership(true)
+            .size(payload_size)
+            .create_anonymous(&config.allocator_config_hint)
+    }
+
     fn open_segment(
         config: &ViewConfig<Allocator, Shm>,
         segment_id: SegmentId,
@@ -709,13 +946,28 @@ where
             || e == ShmAllocationError::ExceedsMaxSupportedAlignment
             || e == ShmAllocationError::AllocationError(AllocationError::SizeTooLarge)
         {
-            if state.shared_state.allocation_strategy == AllocationStrategy::Static {
-                fail!(from self, with e.into(),
-                                    "{msg} since there is not enough memory left ({:?}) and the allocation strategy {:?} forbids reallocation.",
-                                    e, state.shared_state.allocation_strategy);
-            } else {
-                self.create_resized_segment(shm, layout)?;
-                Ok(())
+            match state.shared_state.allocation_strategy {
+                AllocationStrategy::Static => {
+                    fail!(from self, with e.into(),
+                        "{msg} since there is not enough memory left ({:?}) and the allocation strategy {:?} forbids reallocation.",
+                        e, state.shared_state.allocation_strategy);
+                }
+                AllocationStrategy::IamManaged => {
+                    // Calculate the recommended segment size based on allocator hints
+                    let adjusted_segment_setup = shm
+                        .allocator()
+                        .resize_hint(layout, state.shared_state.allocation_strategy);
+                    fail!(from self, with ResizableShmAllocationError::NeedSegment {
+                        requested_size: adjusted_segment_setup.payload_size,
+                    },
+                    "{msg} since the allocation strategy {:?} requires external segment creation. \
+                     Request a segment of at least {} bytes from the IAM server.",
+                    state.shared_state.allocation_strategy, adjusted_segment_setup.payload_size);
+                }
+                _ => {
+                    self.create_resized_segment(shm, layout)?;
+                    Ok(())
+                }
             }
         } else {
             fail!(from self, with e.into(), "{msg} due to {:?}.", e);
@@ -808,5 +1060,57 @@ where
         unsafe {
             self.perform_deallocation(offset, |entry| entry.shm.deallocate(offset, layout));
         }
+    }
+
+    fn add_segment(
+        &self,
+        segment_id: SegmentId,
+        handle: PlatformHandle,
+        _config: &Allocator::Configuration,
+    ) -> Result<(), ResizableSharedMemoryError> {
+        let msg = "Unable to add shared memory segment from handle";
+        let key = SlotMapKey::new(segment_id.value() as usize);
+        let state = self.state_mut();
+
+        if state.shared_memory_map.contains(key) {
+            fail!(from self, with ResizableSharedMemoryError::SegmentAlreadyExists,
+                "{} since the segment id {:?} is already mapped.", msg, segment_id);
+        }
+
+        // Open the segment from the handle. The segment was created by IAM with write access,
+        // so we open with read-write access as the owner.
+        let shm = Self::segment_builder(
+            &state.builder_config.base_name,
+            &state.builder_config.shm,
+            segment_id,
+        )
+        .has_ownership(true) // Owner takes ownership for cleanup
+        .timeout(Duration::ZERO)
+        .open_from_handle(
+            handle,
+            AccessRights::read_write(),
+            &state.builder_config.shm,
+        )
+        .map_err(ResizableSharedMemoryError::from)?;
+
+        // Clean up old segment if it's empty
+        match state.shared_memory_map.get(state.current_idx) {
+            Some(segment) => {
+                if segment.chunk_count.load(Ordering::Relaxed) == 0 {
+                    state.shared_memory_map.remove(state.current_idx);
+                }
+            }
+            None => {
+                // No current segment - this is fine, we're adding the first one
+            }
+        }
+
+        if !state.shared_memory_map.insert_at(key, ShmEntry::new(shm)) {
+            fail!(from self, with ResizableSharedMemoryError::InvalidSegmentId,
+                "{} since the segment id {:?} is out of range.", msg, segment_id);
+        }
+        state.current_idx = key;
+
+        Ok(())
     }
 }

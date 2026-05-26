@@ -29,6 +29,7 @@ use crate::service::dynamic_config::publish_subscribe::DynamicConfigSettings;
 use crate::service::header::publish_subscribe::Header;
 use crate::service::marker::{CustomHeaderMarker, CustomPayloadMarker, Flatbuffer};
 use crate::service::port_factory::publish_subscribe;
+use crate::service::resource::Secured;
 use crate::service::resource::publish_subscribe::{
     PublishSubscribeResourceConfig, PublishSubscribeResources,
 };
@@ -92,6 +93,19 @@ pub enum PublishSubscribeOpenError {
     /// the config. If no type definition file was specified in the service builder
     /// and no file could be found, this error is returned.
     UnableToAcquireTypeDefinition,
+    /// The [`Service`] was created with a different security mode than the node is configured for.
+    /// A secured node cannot open a public service, and a public node cannot open a secured service.
+    IncompatibleSecurityMode,
+    /// Failed to connect to the IAM server when opening a secured service.
+    /// This can happen if the service creator has crashed or the control channel is unavailable.
+    IamConnectionFailed,
+    /// The IAM handshake failed when opening a secured service.
+    /// This can happen if the protocol version is incompatible or the server rejected the connection.
+    IamHandshakeFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for PublishSubscribeOpenError {
@@ -117,6 +131,9 @@ impl From<ServiceState> for PublishSubscribeOpenError {
             ServiceState::Corrupted => PublishSubscribeOpenError::ServiceInCorruptedState,
             ServiceState::InternalFailure => PublishSubscribeOpenError::InternalFailure,
             ServiceState::VersionMismatch => PublishSubscribeOpenError::VersionMismatch,
+            ServiceState::IncompatibleSecurityMode => {
+                PublishSubscribeOpenError::IncompatibleSecurityMode
+            }
         }
     }
 }
@@ -150,6 +167,9 @@ impl From<ServiceOpenError> for PublishSubscribeOpenError {
             ServiceOpenError::Interrupt => PublishSubscribeOpenError::Interrupt,
             ServiceOpenError::UnableToAcquireTypeDefinition => {
                 PublishSubscribeOpenError::UnableToAcquireTypeDefinition
+            }
+            ServiceOpenError::IncompatibleSecurityMode => {
+                PublishSubscribeOpenError::IncompatibleSecurityMode
             }
         }
     }
@@ -189,11 +209,17 @@ impl From<PublishSubscribeOpenError> for ServiceOpenError {
             | PublishSubscribeOpenError::DoesNotSupportRequestedMinHistorySize
             | PublishSubscribeOpenError::DoesNotSupportRequestedMinSubscriberBorrowedSamples
             | PublishSubscribeOpenError::IncompatibleAttributes
-            | PublishSubscribeOpenError::IncompatibleOverflowBehavior => {
+            | PublishSubscribeOpenError::IncompatibleOverflowBehavior
+            | PublishSubscribeOpenError::IamConnectionFailed
+            | PublishSubscribeOpenError::IamHandshakeFailed
+            | PublishSubscribeOpenError::DevPermissionsIncompatibleWithSecuredMode => {
                 ServiceOpenError::InternalFailure
             }
             PublishSubscribeOpenError::UnableToAcquireTypeDefinition => {
                 ServiceOpenError::UnableToAcquireTypeDefinition
+            }
+            PublishSubscribeOpenError::IncompatibleSecurityMode => {
+                ServiceOpenError::IncompatibleSecurityMode
             }
         }
     }
@@ -230,6 +256,13 @@ pub enum PublishSubscribeCreateError {
     /// the config. If no type definition file was specified in the service builder
     /// and no file could be found, this error is returned.
     UnableToAcquireTypeDefinition,
+    /// Failed to create the IAM server for a secured service.
+    /// This can happen if the control channel listener cannot be created.
+    IamServerCreationFailed,
+    /// The `dev_permissions` feature is enabled but the node is configured for `SecurityMode::Secured`.
+    /// These are incompatible because `dev_permissions` sets world-readable permissions on shared
+    /// memory, which defeats the isolation guarantees of secured mode.
+    DevPermissionsIncompatibleWithSecuredMode,
 }
 
 impl core::fmt::Display for PublishSubscribeCreateError {
@@ -290,7 +323,9 @@ impl From<PublishSubscribeCreateError> for ServiceCreateError {
             PublishSubscribeCreateError::Interrupt => ServiceCreateError::Interrupt,
             PublishSubscribeCreateError::InternalFailure
             | PublishSubscribeCreateError::HangsInCreation
-            | PublishSubscribeCreateError::SubscriberBufferMustBeLargerThanHistorySize => {
+            | PublishSubscribeCreateError::SubscriberBufferMustBeLargerThanHistorySize
+            | PublishSubscribeCreateError::IamServerCreationFailed
+            | PublishSubscribeCreateError::DevPermissionsIncompatibleWithSecuredMode => {
                 ServiceCreateError::InternalFailure
             }
             PublishSubscribeCreateError::UnableToAcquireTypeDefinition => {
@@ -305,7 +340,10 @@ impl From<ServiceState> for PublishSubscribeCreateError {
         match value {
             ServiceState::IncompatiblePayload
             | ServiceState::IncompatibleMessagingPattern
-            | ServiceState::VersionMismatch => PublishSubscribeCreateError::AlreadyExists,
+            | ServiceState::VersionMismatch
+            | ServiceState::IncompatibleSecurityMode => {
+                PublishSubscribeCreateError::AlreadyExists
+            }
             ServiceState::InsufficientPermissions => {
                 PublishSubscribeCreateError::InsufficientPermissions
             }
@@ -682,6 +720,12 @@ impl<
         PublishSubscribeCreateError,
     > {
         let msg = "Unable to create publish subscribe service";
+
+        if self.base.dev_permissions_conflicts_with_secured() {
+            fail!(from self, with PublishSubscribeCreateError::DevPermissionsIncompatibleWithSecuredMode,
+                "{} since the dev_permissions feature is incompatible with secured services.", msg);
+        }
+
         if !self.config_details().enable_safe_overflow
             && (self.config_details().subscriber_max_buffer_size
                 < self.config_details().history_size)
@@ -715,7 +759,7 @@ impl<
             |_| Ok(()),
             generate_dynamic_config,
             |service_config| {
-                PublishSubscribeResources::create(
+                let inner = PublishSubscribeResources::create(
                     service_config,
                     &PublishSubscribeResourceConfig::<ServiceType> {
                         use_type_definition: Self::has_flatbuffer_payload(),
@@ -723,7 +767,12 @@ impl<
                         shared_node: self.base.shared_node.clone(),
                         type_name: TypeName::new::<Payload>(),
                     },
-                )
+                )?;
+                let security = super::secured::create_secured_resource::<ServiceType>(
+                    &self.base.shared_node,
+                    service_config,
+                )?;
+                Ok(Secured::new(inner, security))
             },
             |_| {},
         )?;
@@ -740,6 +789,11 @@ impl<
     > {
         let msg = "Unable to open publish subscribe service";
 
+        if self.base.dev_permissions_conflicts_with_secured() {
+            fail!(from self, with PublishSubscribeOpenError::DevPermissionsIncompatibleWithSecuredMode,
+                "{} since the dev_permissions feature is incompatible with secured services.", msg);
+        }
+
         let service_state = self.base.open(
             msg,
             || self.is_service_available(msg),
@@ -747,7 +801,7 @@ impl<
                 self.verify_service_configuration(msg, existing_service_config, required_attributes)
             },
             |service_config| {
-                PublishSubscribeResources::open(
+                let inner = PublishSubscribeResources::open(
                     service_config,
                     &PublishSubscribeResourceConfig::<ServiceType> {
                         use_type_definition: Self::has_flatbuffer_payload(),
@@ -755,7 +809,12 @@ impl<
                         shared_node: self.base.shared_node.clone(),
                         type_name: TypeName::new::<Payload>(),
                     },
-                )
+                )?;
+                let security = super::secured::open_secured_resource::<ServiceType>(
+                    &self.base.shared_node,
+                    service_config,
+                )?;
+                Ok(Secured::new(inner, security))
             },
         )?;
 

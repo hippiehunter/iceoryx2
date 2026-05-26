@@ -49,7 +49,7 @@ use crate::posix::{
     constants::*,
     shm_set_size,
     types::*,
-    win32_handle_translator::{FdHandleEntry, FileHandle},
+    win32_handle_translator::{FdHandleEntry, FileHandle, ShmHandle},
 };
 
 use super::{
@@ -177,6 +177,23 @@ impl MemZeroedStruct for WSAPROTOCOL_INFOA {}
 
 pub unsafe fn dup(fildes: int) -> int {
     match HandleTranslator::get_instance().get(fildes) {
+        Some(FdHandleEntry::SharedMemory(handle)) => {
+            let mut duplicate: HANDLE = 0;
+            win32call! { DuplicateHandle(GetCurrentProcess(), handle.handle.handle, GetCurrentProcess(), &mut duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)};
+
+            let mut duplicate_state: HANDLE = INVALID_HANDLE_VALUE;
+            if handle.state_handle != INVALID_HANDLE_VALUE {
+                win32call! { DuplicateHandle(GetCurrentProcess(), handle.state_handle, GetCurrentProcess(), &mut duplicate_state, 0, FALSE, DUPLICATE_SAME_ACCESS)};
+            }
+
+            HandleTranslator::get_instance().add(FdHandleEntry::SharedMemory(ShmHandle {
+                handle: FileHandle {
+                    handle: duplicate,
+                    lock_state: handle.handle.lock_state,
+                },
+                state_handle: duplicate_state,
+            }))
+        }
         Some(FdHandleEntry::Socket(handle)) => {
             let mut protocol_info = WSAPROTOCOL_INFOA::new_zeroed();
             let (result, _) = unsafe {
@@ -220,36 +237,25 @@ pub unsafe fn close(fd: int) -> int {
         match HandleTranslator::get_instance().get(fd) {
             Some(FdHandleEntry::SharedMemory(handle)) => {
                 HandleTranslator::get_instance().remove(fd);
-                let result_handle = win32call! { CloseHandle(handle.handle.handle)};
-                let result_state = win32call! { CloseHandle(handle.state_handle)};
-                if result_handle.0 == 0 || result_state.0 == 0 {
-                    -1
-                } else {
-                    0
+                win32call! { CloseHandle(handle.handle.handle)};
+                if handle.state_handle != INVALID_HANDLE_VALUE {
+                    win32call! { CloseHandle(handle.state_handle)};
                 }
+                0
             }
             Some(FdHandleEntry::File(handle)) => {
                 HandleTranslator::get_instance().remove(fd);
-                if win32call! { CloseHandle(handle.handle)}.0 == 0 {
-                    -1
-                } else {
-                    0
-                }
+                win32call! { CloseHandle(handle.handle)};
+                0
             }
             Some(FdHandleEntry::Socket(handle)) => {
                 HandleTranslator::get_instance().remove(fd);
-                if win32call! { winsock closesocket(handle.fd) }.0 != 0 {
-                    -1
-                } else {
-                    0
-                }
+                win32call! { winsock closesocket(handle.fd) };
+                0
             }
             Some(FdHandleEntry::UdsDatagramSocket(handle)) => {
-                if win32call! { winsock closesocket(handle.fd)}.0 != 0 {
-                    -1
-                } else {
-                    0
-                }
+                win32call! { winsock closesocket(handle.fd)};
+                0
             }
             _ => {
                 Errno::set(Errno::EBADF);
@@ -425,6 +431,16 @@ pub unsafe fn ftruncate(fd: int, length: off_t) -> int {
 
 pub unsafe fn fchown(fd: int, owner: uid_t, group: gid_t) -> int {
     0
+}
+
+pub unsafe fn memfd_create(name: *const c_char, flags: uint) -> int {
+    Errno::set(Errno::ENOSYS);
+    -1
+}
+
+pub unsafe fn pidfd_open(pid: pid_t, flags: uint) -> int {
+    Errno::set(Errno::ENOSYS);
+    -1
 }
 
 pub unsafe fn fsync(fd: int) -> int {

@@ -22,6 +22,10 @@ pub enum ConnectionFailure {
     FailedToEstablishConnection(ZeroCopyCreationError),
     /// Failures when mapping the corresponding data segment
     UnableToMapSendersDataSegment(SharedMemoryOpenError),
+    /// The sender's segment handle is not yet available from the IAM server.
+    /// This is a transient failure — the sender may not have registered its
+    /// segment yet. The receiver should retry on the next update cycle.
+    SegmentHandleNotAvailable,
 }
 
 impl From<ZeroCopyCreationError> for ConnectionFailure {

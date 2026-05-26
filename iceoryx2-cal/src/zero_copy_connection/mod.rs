@@ -20,6 +20,7 @@ pub mod used_chunk_list;
 use core::fmt::Debug;
 use core::time::Duration;
 
+use crate::security::{AccessRights, HandleBasedOpenError, PlatformHandle};
 pub use crate::shared_memory::PointerOffset;
 use iceoryx2_bb_elementary_traits::testing::abandonable::Abandonable;
 pub use iceoryx2_bb_system_types::file_name::*;
@@ -73,6 +74,9 @@ impl core::fmt::Display for ZeroCopyCreationError {
 }
 
 impl core::error::Error for ZeroCopyCreationError {}
+
+/// Failure returned by handle-based open methods.
+pub type ZeroCopyConnectionOpenFromHandleError = HandleBasedOpenError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZeroCopySendError {
@@ -229,6 +233,36 @@ pub trait ZeroCopyConnectionBuilder<C: ZeroCopyConnection>: NamedConceptBuilder<
 
     fn create_sender(self) -> Result<C::Sender, ZeroCopyCreationError>;
     fn create_receiver(self) -> Result<C::Receiver, ZeroCopyCreationError>;
+
+    /// Opens a sender from a platform handle received via IAM with the provided access rights.
+    fn open_sender_from_handle(
+        self,
+        handle: PlatformHandle,
+        access: AccessRights,
+    ) -> Result<C::Sender, ZeroCopyConnectionOpenFromHandleError>;
+
+    /// Opens a receiver from a platform handle received via IAM with the provided access rights.
+    fn open_receiver_from_handle(
+        self,
+        handle: PlatformHandle,
+        access: AccessRights,
+    ) -> Result<C::Receiver, ZeroCopyConnectionOpenFromHandleError>;
+
+    /// Creates a [`ZeroCopySender`] on a freshly created **anonymous** connection and returns it
+    /// together with a [`PlatformHandle`] to broker to the receiver via IAM. The sender port is
+    /// reserved. The receiver reconstructs its end via
+    /// [`ZeroCopyConnectionBuilder::open_receiver_from_handle()`].
+    ///
+    /// Implementations that do not support handle extraction should return
+    /// [`ZeroCopyCreationError::InternalError`].
+    fn create_sender_anonymous(
+        self,
+    ) -> Result<(C::Sender, PlatformHandle), ZeroCopyCreationError>
+    where
+        Self: Sized,
+    {
+        Err(ZeroCopyCreationError::InternalError)
+    }
 }
 
 pub trait ZeroCopyPortDetails {

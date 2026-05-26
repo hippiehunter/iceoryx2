@@ -55,7 +55,6 @@ use iceoryx2_cal::{event::Event, named_concept::NamedConceptBuilder};
 use iceoryx2_log::{debug, fail, warn};
 
 use crate::service::SharedServiceState;
-use crate::service::resource::NoResource;
 use crate::{
     identifiers::{UniqueListenerId, UniqueNodeId, UniqueNotifierId},
     port::port_name::PortName,
@@ -63,6 +62,7 @@ use crate::{
     service::{
         self,
         config_scheme::event_config,
+        resource::{NoResource, Secured},
         dynamic_config::event::{ListenerDetails, NotifierDetails},
         naming_scheme::event_concept_name,
         port_factory::notifier::NotifierConfig,
@@ -130,7 +130,7 @@ struct Connection<Service: service::Service> {
 struct ListenerConnections<Service: service::Service> {
     #[allow(clippy::type_complexity)]
     connections: Vec<UnsafeCell<Option<Connection<Service>>>>,
-    service_state: SharedServiceState<Service, NoResource>,
+    service_state: SharedServiceState<Service, Secured<NoResource>>,
     list_state: UnsafeCell<ContainerState<ListenerDetails>>,
 }
 
@@ -146,7 +146,7 @@ impl<Service: service::Service> Abandonable for ListenerConnections<Service> {
 impl<Service: service::Service> ListenerConnections<Service> {
     fn new(
         size: usize,
-        service_state: SharedServiceState<Service, NoResource>,
+        service_state: SharedServiceState<Service, Secured<NoResource>>,
         list_state: UnsafeCell<ContainerState<ListenerDetails>>,
     ) -> Self {
         let mut new_self = Self {
@@ -336,7 +336,7 @@ impl<Service: service::Service> UpdateConnections for Notifier<Service> {
 
 impl<Service: service::Service> Notifier<Service> {
     pub(crate) fn new(
-        service: SharedServiceState<Service, NoResource>,
+        service: SharedServiceState<Service, Secured<NoResource>>,
         config: NotifierConfig,
     ) -> Result<Self, NotifierCreateError> {
         let mut new_self = Self::new_without_auto_event_emission(service.clone(), config)?;
@@ -366,7 +366,7 @@ impl<Service: service::Service> Notifier<Service> {
     }
 
     pub(crate) fn new_without_auto_event_emission(
-        service: SharedServiceState<Service, NoResource>,
+        service: SharedServiceState<Service, Secured<NoResource>>,
         config: NotifierConfig,
     ) -> Result<Self, NotifierCreateError> {
         let msg = "Unable to create Notifier port";

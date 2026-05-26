@@ -14,6 +14,9 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(unused_variables)]
 
+extern crate std;
+
+use alloc::format;
 use core::hint::spin_loop;
 use core::time::Duration;
 use std::time::Instant;

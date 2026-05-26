@@ -45,8 +45,8 @@ use super::notifier::PortFactoryNotifier;
 use crate::identifiers::UniqueServiceId;
 use crate::node::NodeListFailure;
 use crate::service::attribute::AttributeSet;
-use crate::service::resource::NoResource;
 use crate::service::service_hash::ServiceHash;
+use crate::service::resource::{NoResource, Secured};
 use crate::service::{self, ServiceState, SharedServiceState, static_config};
 use crate::service::{ServiceName, dynamic_config};
 use iceoryx2_bb_elementary::CallbackProgression;
@@ -60,7 +60,7 @@ use iceoryx2_cal::dynamic_storage::DynamicStorage;
 /// or [`crate::port::listener::Listener`] ports.
 #[derive(Debug)]
 pub struct PortFactory<Service: service::Service> {
-    pub(crate) service: SharedServiceState<Service, NoResource>,
+    pub(crate) service: SharedServiceState<Service, Secured<NoResource>>,
 }
 
 unsafe impl<Service: service::Service> Send for PortFactory<Service> {}
@@ -115,7 +115,7 @@ impl<Service: service::Service> crate::service::port_factory::PortFactory for Po
 }
 
 impl<Service: service::Service> PortFactory<Service> {
-    pub(crate) fn new(service: ServiceState<Service, NoResource>) -> Self {
+    pub(crate) fn new(service: ServiceState<Service, Secured<NoResource>>) -> Self {
         Self {
             service: SharedServiceState {
                 state: Arc::new(service),

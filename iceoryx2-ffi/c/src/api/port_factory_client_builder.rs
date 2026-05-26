@@ -38,6 +38,10 @@ pub enum iox2_client_create_error_e {
     FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY,
     UNABLE_TO_CREATE_PORT_TAG,
     MAX_ACTIVE_REQUESTS_EXCEEDS_MAX_SUPPORTED_ACTIVE_REQUESTS_OF_SERVICE,
+    #[CStr = "iam authorization denied"]
+    IAM_AUTHORIZATION_DENIED,
+    #[CStr = "iam connection failed"]
+    IAM_CONNECTION_FAILED,
 }
 
 impl IntoCInt for ClientCreateError {
@@ -57,6 +61,12 @@ impl IntoCInt for ClientCreateError {
             }
             ClientCreateError::MaxActiveRequestsExceedsMaxSupportedActiveRequestsOfService => {
                 iox2_client_create_error_e::MAX_ACTIVE_REQUESTS_EXCEEDS_MAX_SUPPORTED_ACTIVE_REQUESTS_OF_SERVICE
+            }
+            ClientCreateError::IamAuthorizationDenied => {
+                iox2_client_create_error_e::IAM_AUTHORIZATION_DENIED
+            }
+            ClientCreateError::IamConnectionFailed => {
+                iox2_client_create_error_e::IAM_CONNECTION_FAILED
             }
         }) as c_int
     }
