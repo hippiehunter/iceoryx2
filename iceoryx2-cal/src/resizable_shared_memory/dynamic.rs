@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use iceoryx2_bb_concurrency::atomic::{AtomicU64, AtomicUsize};
 use iceoryx2_bb_concurrency::cell::UnsafeCell;
 use iceoryx2_bb_container::semantic_string::SemanticString;
-use iceoryx2_bb_container::slotmap::{SlotMap, SlotMapKey};
+use iceoryx2_bb_container::slotmap::SlotMapKey;
 use iceoryx2_bb_container::string::String;
 use iceoryx2_bb_elementary::allocation_strategy::AllocationStrategy;
 use iceoryx2_bb_elementary_traits::allocator::{
@@ -57,6 +57,99 @@ const MAX_NUMBER_OF_REALLOCATIONS: usize = SegmentId::max_segment_id() as usize;
 const SEGMENT_ID_SEPARATOR: &[u8] = b"__";
 const MANAGEMENT_SUFFIX: &[u8] = b"mgmt";
 const INVALID_KEY: usize = usize::MAX;
+
+/// Segment map of a resizable shared memory, addressed by [`SlotMapKey`] (the segment id).
+///
+/// A [`iceoryx2_bb_container::slotmap::SlotMap`] of `MAX_NUMBER_OF_REALLOCATIONS` entries
+/// allocated and initialized all of them up front: about 300 KB per view, i.e. per connected
+/// publisher in a subscriber (3 GB in a broker with 10,000 writers) although a publisher rarely
+/// has more than a few segments. This map grows with the highest segment id in use and boxes
+/// the entries (8 bytes per unused slot).
+#[derive(Debug)]
+struct SegmentMap<T> {
+    slots: Vec<Option<alloc::boxed::Box<T>>>,
+    capacity: usize,
+    len: usize,
+}
+
+impl<T: Abandonable> Abandonable for SegmentMap<T> {
+    unsafe fn abandon_in_place(mut this: NonNull<Self>) {
+        let this = unsafe { this.as_mut() };
+        for slot in this.slots.iter_mut() {
+            if let Some(entry) = slot.take() {
+                let entry = alloc::boxed::Box::leak(entry);
+                unsafe { T::abandon_in_place(NonNull::from_mut(entry)) };
+            }
+        }
+    }
+}
+
+impl<T> SegmentMap<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: Vec::new(),
+            capacity,
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn contains(&self, key: SlotMapKey) -> bool {
+        self.get(key).is_some()
+    }
+
+    fn get(&self, key: SlotMapKey) -> Option<&T> {
+        self.slots.get(key.value()).and_then(|slot| slot.as_deref())
+    }
+
+    fn remove(&mut self, key: SlotMapKey) -> Option<T> {
+        let entry = self.slots.get_mut(key.value()).and_then(|slot| slot.take());
+        if entry.is_some() {
+            self.len -= 1;
+        }
+        entry.map(|entry| *entry)
+    }
+
+    /// Stores `value` at `key`, replacing an existing value. `false` if `key` is out of range.
+    fn insert_at(&mut self, key: SlotMapKey, value: T) -> bool {
+        let index = key.value();
+        if index >= self.capacity {
+            return false;
+        }
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
+        }
+        if self.slots[index]
+            .replace(alloc::boxed::Box::new(value))
+            .is_none()
+        {
+            self.len += 1;
+        }
+        true
+    }
+
+    /// Stores `value` at the lowest free key.
+    fn insert(&mut self, value: T) -> Option<SlotMapKey> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.is_none())
+            .unwrap_or(self.slots.len());
+        let key = SlotMapKey::new(index);
+        if self.insert_at(key, value) {
+            Some(key)
+        } else {
+            None
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Debug)]
@@ -92,7 +185,7 @@ struct ViewConfig<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> {
 struct InternalState<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> {
     builder_config: MemoryConfig<Allocator, Shm>,
     shared_state: SharedState,
-    shared_memory_map: SlotMap<ShmEntry<Allocator, Shm>>,
+    shared_memory_map: SegmentMap<ShmEntry<Allocator, Shm>>,
     current_idx: SlotMapKey,
 }
 
@@ -101,7 +194,7 @@ impl<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> Abandonable
 {
     unsafe fn abandon_in_place(mut this: NonNull<Self>) {
         let this = unsafe { this.as_mut() };
-        unsafe { SlotMap::abandon_in_place(NonNull::from_mut(&mut this.shared_memory_map)) };
+        unsafe { SegmentMap::abandon_in_place(NonNull::from_mut(&mut this.shared_memory_map)) };
     }
 }
 
@@ -223,7 +316,7 @@ where
                                                         .open(access_mode),
                                     "{msg} since the management segment could not be opened.");
 
-        let shared_memory_map = SlotMap::new(MAX_NUMBER_OF_REALLOCATIONS);
+        let shared_memory_map = SegmentMap::new(MAX_NUMBER_OF_REALLOCATIONS);
 
         Ok(DynamicView {
             view_config: self.config,
@@ -266,7 +359,7 @@ where
         let view = DynamicView {
             view_config: self.config,
             mgmt_segment,
-            shared_memory_map: UnsafeCell::new(SlotMap::new(MAX_NUMBER_OF_REALLOCATIONS)),
+            shared_memory_map: UnsafeCell::new(SegmentMap::new(MAX_NUMBER_OF_REALLOCATIONS)),
             current_idx: AtomicUsize::new(INVALID_KEY),
             access_mode,
             _data: PhantomData,
@@ -381,7 +474,7 @@ where
 
         let shm = fail!(from origin, when DynamicMemory::create_segment(&self.config, SegmentId::new(0), hint.payload_size),
             "Unable to create ResizableSharedMemory since the underlying shared memory could not be created.");
-        let mut shared_memory_map = SlotMap::new(MAX_NUMBER_OF_REALLOCATIONS);
+        let mut shared_memory_map = SegmentMap::new(MAX_NUMBER_OF_REALLOCATIONS);
         let current_idx = fatal_panic!(from origin, when shared_memory_map.insert(ShmEntry::new(shm)).ok_or(""),
                 "This should never happen! {msg} since the newly constructed SlotMap does not have space for one insert.");
 
@@ -443,7 +536,7 @@ where
             "{msg} since the anonymous initial data segment could not be created.");
         let initial_segment_size = hint.payload_size;
 
-        let mut shared_memory_map = SlotMap::new(MAX_NUMBER_OF_REALLOCATIONS);
+        let mut shared_memory_map = SegmentMap::new(MAX_NUMBER_OF_REALLOCATIONS);
         let current_idx = fatal_panic!(from origin, when shared_memory_map.insert(ShmEntry::new(shm)).ok_or(""),
                 "This should never happen! {msg} since the newly constructed SlotMap does not have space for one insert.");
 
@@ -473,7 +566,7 @@ where
 pub struct DynamicView<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> {
     view_config: ViewConfig<Allocator, Shm>,
     mgmt_segment: Shm,
-    shared_memory_map: UnsafeCell<SlotMap<ShmEntry<Allocator, Shm>>>,
+    shared_memory_map: UnsafeCell<SegmentMap<ShmEntry<Allocator, Shm>>>,
     current_idx: AtomicUsize,
     access_mode: AccessMode,
     _data: PhantomData<Allocator>,
@@ -484,7 +577,9 @@ impl<Allocator: ShmAllocator, Shm: SharedMemory<Allocator>> Abandonable
     unsafe fn abandon_in_place(mut this: NonNull<Self>) {
         let this = unsafe { this.as_mut() };
         unsafe { Shm::abandon_in_place(NonNull::from_mut(&mut this.mgmt_segment)) };
-        unsafe { SlotMap::abandon_in_place(NonNull::from_mut(this.shared_memory_map.get_mut())) };
+        unsafe {
+            SegmentMap::abandon_in_place(NonNull::from_mut(this.shared_memory_map.get_mut()))
+        };
     }
 }
 
@@ -493,7 +588,7 @@ where
     Shm::Builder: Debug,
 {
     fn release_old_unused_segments(
-        shared_memory_map: &mut SlotMap<ShmEntry<Allocator, Shm>>,
+        shared_memory_map: &mut SegmentMap<ShmEntry<Allocator, Shm>>,
         old_idx: usize,
     ) {
         if old_idx == INVALID_KEY {
@@ -1228,5 +1323,57 @@ where
         unsafe {
             self.perform_deallocation(ptr.offset, |entry| entry.shm.deallocate(ptr, layout));
         }
+    }
+}
+
+#[cfg(test)]
+mod segment_map_tests {
+    use super::SegmentMap;
+    use iceoryx2_bb_container::slotmap::SlotMapKey;
+
+    #[test]
+    fn grows_only_to_the_highest_key_in_use() {
+        let mut map = SegmentMap::<u64>::new(255);
+        assert_eq!(map.capacity(), 255);
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.slots.len(), 0);
+
+        assert_eq!(map.insert(10), Some(SlotMapKey::new(0)));
+        assert_eq!(map.slots.len(), 1);
+        assert!(map.insert_at(SlotMapKey::new(3), 13));
+        assert_eq!(map.slots.len(), 4);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(SlotMapKey::new(3)), Some(&13));
+        assert!(map.get(SlotMapKey::new(2)).is_none());
+        assert!(map.get(SlotMapKey::new(200)).is_none());
+        // lowest free key
+        assert_eq!(map.insert(11), Some(SlotMapKey::new(1)));
+    }
+
+    #[test]
+    fn insert_at_replaces_and_respects_the_capacity() {
+        let mut map = SegmentMap::<u64>::new(4);
+        assert!(map.insert_at(SlotMapKey::new(2), 1));
+        assert!(map.insert_at(SlotMapKey::new(2), 2));
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(SlotMapKey::new(2)), Some(&2));
+        assert!(!map.insert_at(SlotMapKey::new(4), 3));
+        for v in 0..3 {
+            assert!(map.insert(v).is_some());
+        }
+        assert_eq!(map.insert(9), None);
+        assert_eq!(map.len(), 4);
+    }
+
+    #[test]
+    fn remove_frees_the_key() {
+        let mut map = SegmentMap::<u64>::new(8);
+        let key = map.insert(5).unwrap();
+        assert!(map.contains(key));
+        assert_eq!(map.remove(key), Some(5));
+        assert!(!map.contains(key));
+        assert_eq!(map.remove(key), None);
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.insert(6), Some(key));
     }
 }
