@@ -89,6 +89,8 @@ use core::mem::MaybeUninit;
 use core::{mem::size_of, time::Duration};
 
 use alloc::format;
+#[cfg(target_os = "linux")]
+use alloc::{vec, vec::Vec};
 
 use iceoryx2_bb_concurrency::atomic::AtomicBool;
 use iceoryx2_bb_concurrency::atomic::Ordering;
@@ -224,6 +226,7 @@ enum_gen! {
     UnixStreamReceiveError
   entry:
     ConnectionReset,
+    ConnectionClosed,
     Interrupt,
     NotConnected,
     IOerror,
@@ -945,11 +948,18 @@ impl UnixStreamConnection {
             )
         };
 
+        let msg = "Unable to receive data";
+        if bytes_received == 0 && !buffer.is_empty() {
+            // an orderly shutdown of the peer (or its death) - distinguishable from "no data
+            // available", which is reported as EAGAIN by a non-blocking socket
+            fail!(from self, with UnixStreamReceiveError::ConnectionClosed,
+                "{} since the peer closed the connection.", msg);
+        }
+
         if bytes_received >= 0 {
             return Ok(bytes_received as u64);
         }
 
-        let msg = "Unable to receive data";
         handle_errno!(UnixStreamReceiveError, from self,
             success Errno::ETIMEDOUT => 0;
             success Errno::EAGAIN => 0,
@@ -1162,6 +1172,45 @@ impl UnixStreamConnection {
         }
 
         Ok(SocketCred::from_ucred(cred))
+    }
+
+    /// Returns the supplementary group ids of the connected peer via `SO_PEERGROUPS`
+    /// (Linux 4.13+). Like `SO_PEERCRED` the groups are captured by the kernel when the peer
+    /// connected and cannot be spoofed by the peer.
+    #[cfg(target_os = "linux")]
+    pub fn peer_groups(&self) -> Result<Vec<u32>, UnixStreamGetPeerCredentialsError> {
+        let mut groups: Vec<posix::gid_t> = vec![0; 64];
+        loop {
+            let mut len = (groups.len() * core::mem::size_of::<posix::gid_t>()) as posix::socklen_t;
+            if unsafe {
+                posix::getsockopt(
+                    self.socket.file_descriptor.native_handle(),
+                    CMSG_SOCKET_LEVEL,
+                    posix::SO_PEERGROUPS,
+                    groups.as_mut_ptr() as *mut posix::void,
+                    &mut len,
+                )
+            } == 0
+            {
+                groups.truncate(len as usize / core::mem::size_of::<posix::gid_t>());
+                return Ok(groups.into_iter().map(|g| g as u32).collect());
+            }
+
+            let msg = "Unable to get peer groups";
+            let required = len as usize / core::mem::size_of::<posix::gid_t>();
+            if Errno::get() == Errno::ERANGE && required > groups.len() && required <= 65536 {
+                groups.resize(required, 0);
+                continue;
+            }
+
+            handle_errno!(UnixStreamGetPeerCredentialsError, from self,
+                Errno::EACCES => (InsufficientPermissions, "{} due to insufficient permissions.", msg),
+                Errno::ENOBUFS => (InsufficientResources, "{} due to insufficient resources.", msg),
+                Errno::EINVAL => (SocketHasBeenShutDown, "{} since the socket has been shut down.", msg),
+                Errno::ENOTCONN => (NotConnected, "{} since the socket is not connected.", msg),
+                v => (UnknownError(v as i32), "{} caused by an unknown error ({}).", msg, v)
+            );
+        }
     }
 }
 

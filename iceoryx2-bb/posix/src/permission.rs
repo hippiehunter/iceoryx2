@@ -157,6 +157,12 @@ impl PermissionExt for posix::mode_t {
 }
 
 impl Permission {
+    /// Creates a [`Permission`] from raw mode bits like `0o2770`. Only the permission, set-uid,
+    /// set-gid and sticky bits are taken over.
+    pub fn from_bits(bits: u32) -> Self {
+        (bits as ModeType).as_permission()
+    }
+
     /// Returns true when self contains the permissions of the rhs, otherwise false.
     pub fn has(&self, rhs: Permission) -> bool {
         (self.0 & rhs.0) != 0

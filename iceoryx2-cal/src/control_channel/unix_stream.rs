@@ -57,6 +57,7 @@ use iceoryx2_log::{fail, trace};
 
 use crate::named_concept::{
     NamedConcept, NamedConceptBuilder, NamedConceptMgmt, NamedConceptPathHintRemoveError,
+    SharedAccess,
 };
 use crate::security::{PlatformHandle, ProcessCredentials};
 use crate::static_storage::file::{
@@ -89,6 +90,7 @@ pub struct Configuration {
     suffix: FileName,
     prefix: FileName,
     path_hint: Path,
+    shared_access: SharedAccess,
 }
 
 impl Default for Configuration {
@@ -97,6 +99,7 @@ impl Default for Configuration {
             suffix: Channel::default_suffix(),
             prefix: Channel::default_prefix(),
             path_hint: Channel::default_path_hint(),
+            shared_access: SharedAccess::owner_only(),
         }
     }
 }
@@ -127,6 +130,18 @@ impl NamedConceptConfiguration for Configuration {
 
     fn get_path_hint(&self) -> &Path {
         &self.path_hint
+    }
+
+    /// Lets other users connect to the listener socket. The socket is not the security boundary
+    /// of a control channel - the peer credentials verified by the kernel are - so widening the
+    /// socket permission is safe as long as the server authorizes every peer.
+    fn shared_access(mut self, value: &SharedAccess) -> Self {
+        self.shared_access = *value;
+        self
+    }
+
+    fn get_shared_access(&self) -> SharedAccess {
+        self.shared_access
     }
 }
 
@@ -243,7 +258,7 @@ impl ControlChannelListenerBuilder<Channel> for ListenerBuilder {
 
         let listener = UnixStreamListenerBuilder::new(&full_path)
             .creation_mode(CreationMode::CreateExclusive)
-            .permission(SOCKET_PERMISSIONS)
+            .permission(self.config.shared_access.file_permission(SOCKET_PERMISSIONS))
             .create();
 
         let inner = match listener {
@@ -361,7 +376,17 @@ pub struct Connection {
 impl ControlChannelConnection for Connection {
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
         match self.inner.peer_credentials() {
-            Ok(cred) => Ok(socket_cred_to_process_credentials(&cred)),
+            Ok(cred) => {
+                let credentials = socket_cred_to_process_credentials(&cred);
+                // Supplementary groups are captured by the kernel at connect time as well; a
+                // failure leaves them empty so that only the primary gid matches group rules.
+                #[cfg(target_os = "linux")]
+                let credentials = match self.inner.peer_groups() {
+                    Ok(groups) => credentials.with_supplementary_gids(groups),
+                    Err(_) => credentials,
+                };
+                Ok(credentials)
+            }
             Err(e) => map_credentials_error(e),
         }
     }
@@ -565,7 +590,17 @@ impl NamedConcept for Client {
 impl ControlChannelClient for Client {
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
         match self.inner.peer_credentials() {
-            Ok(cred) => Ok(socket_cred_to_process_credentials(&cred)),
+            Ok(cred) => {
+                let credentials = socket_cred_to_process_credentials(&cred);
+                // Supplementary groups are captured by the kernel at connect time as well; a
+                // failure leaves them empty so that only the primary gid matches group rules.
+                #[cfg(target_os = "linux")]
+                let credentials = match self.inner.peer_groups() {
+                    Ok(groups) => credentials.with_supplementary_gids(groups),
+                    Err(_) => credentials,
+                };
+                Ok(credentials)
+            }
             Err(e) => map_credentials_error(e),
         }
     }
@@ -706,7 +741,9 @@ fn map_send_msg_error<T>(e: UnixStreamSendMsgError) -> Result<T, ControlChannelS
 
 fn map_receive_error<T>(e: UnixStreamReceiveError) -> Result<T, ControlChannelReceiveError> {
     match e {
-        UnixStreamReceiveError::ConnectionReset => Err(ControlChannelReceiveError::ConnectionReset),
+        UnixStreamReceiveError::ConnectionReset | UnixStreamReceiveError::ConnectionClosed => {
+            Err(ControlChannelReceiveError::ConnectionReset)
+        }
         UnixStreamReceiveError::Interrupt => Err(ControlChannelReceiveError::Interrupt),
         UnixStreamReceiveError::IOerror => Err(ControlChannelReceiveError::IoError),
         UnixStreamReceiveError::InsufficientResources => {
@@ -895,4 +932,61 @@ fn extract_handles_from_ancillary(ancillary: SocketAncillary) -> Vec<PlatformHan
     }
 
     handles
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::control_channel::{
+        ControlChannelClientBuilder, ControlChannelConnection, ControlChannelListener,
+        ControlChannelListenerBuilder,
+    };
+    use iceoryx2_bb_container::semantic_string::SemanticString;
+
+    fn connected_pair(tag: &str) -> (Listener, Client, Connection) {
+        let name = FileName::new(
+            format!("iox2_cc_test_{}_{}", tag, std::process::id()).as_bytes(),
+        )
+        .unwrap();
+        let config = Configuration::default().path_hint(&Path::new(b"/tmp").unwrap());
+        let listener = ListenerBuilder::new(&name).config(&config).create().unwrap();
+        let client = ClientBuilder::new(&name).config(&config).connect().unwrap();
+        let connection = listener
+            .timed_accept(Duration::from_secs(5))
+            .unwrap()
+            .expect("connection");
+        (listener, client, connection)
+    }
+
+    #[test]
+    fn peer_credentials_carry_kernel_verified_supplementary_groups() {
+        let (_listener, _client, connection) = connected_pair("groups");
+        let credentials = connection.peer_credentials().unwrap();
+
+        let mut own_groups = vec![0 as libc::gid_t; 1024];
+        let n = unsafe { libc::getgroups(own_groups.len() as _, own_groups.as_mut_ptr()) };
+        assert!(n >= 0);
+        own_groups.truncate(n as usize);
+        let mut own_groups: Vec<u32> = own_groups.into_iter().map(|g| g as u32).collect();
+        own_groups.sort_unstable();
+        let mut peer_groups = credentials.supplementary_gids().to_vec();
+        peer_groups.sort_unstable();
+
+        assert_eq!(credentials.uid(), unsafe { libc::geteuid() });
+        assert_eq!(credentials.gid(), unsafe { libc::getegid() });
+        assert_eq!(peer_groups, own_groups);
+        for gid in &own_groups {
+            assert!(credentials.is_in_group(*gid));
+        }
+    }
+
+    #[test]
+    fn closed_peer_is_reported_instead_of_no_data() {
+        let (_listener, client, connection) = connected_pair("eof");
+        let mut buffer = [0u8; 8];
+        // nothing sent yet: no data, no error
+        assert_eq!(connection.try_receive(&mut buffer).unwrap(), 0);
+        drop(client);
+        assert!(connection.try_receive(&mut buffer).is_err());
+    }
 }

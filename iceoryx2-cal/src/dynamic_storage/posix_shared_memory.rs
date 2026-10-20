@@ -72,6 +72,7 @@ use iceoryx2_bb_posix::shared_memory::*;
 use iceoryx2_bb_system_types::path::Path;
 use iceoryx2_log::fail;
 
+use crate::named_concept::SharedAccess;
 use crate::static_storage::file::NamedConceptConfiguration;
 use crate::static_storage::file::NamedConceptRemoveError;
 
@@ -109,6 +110,7 @@ pub struct Configuration<T: Send + Sync + Debug + ZeroCopySend> {
     path: Path,
     _data: PhantomData<T>,
     type_name: String,
+    shared_access: SharedAccess,
 }
 
 impl<T: Send + Sync + Debug + ZeroCopySend> Clone for Configuration<T> {
@@ -119,6 +121,7 @@ impl<T: Send + Sync + Debug + ZeroCopySend> Clone for Configuration<T> {
             path: self.path,
             _data: PhantomData,
             type_name: self.type_name.clone(),
+            shared_access: self.shared_access,
         }
     }
 }
@@ -151,6 +154,7 @@ impl<T: Send + Sync + Debug + ZeroCopySend> Default for Configuration<T> {
             prefix: Storage::<()>::default_prefix(),
             _data: PhantomData,
             type_name: core::any::type_name::<T>().to_string(),
+            shared_access: SharedAccess::owner_only(),
         }
     }
 }
@@ -191,6 +195,15 @@ impl<T: Send + Sync + Debug + ZeroCopySend> NamedConceptConfiguration for Config
 
     fn path_for(&self, value: &FileName) -> iceoryx2_bb_system_types::file_path::FilePath {
         self.path_for_with_type(value)
+    }
+
+    fn shared_access(mut self, value: &SharedAccess) -> Self {
+        self.shared_access = *value;
+        self
+    }
+
+    fn get_shared_access(&self) -> SharedAccess {
+        self.shared_access
     }
 
     fn extract_name_from_file(&self, value: &FileName) -> Option<FileName> {
@@ -404,8 +417,23 @@ impl<T: Send + Sync + Debug + ZeroCopySend> Builder<'_, T> {
         let final_permission = if self.enable_global_access {
             FINAL_PERMISSIONS_GLOBAL_ACCESS
         } else {
-            FINAL_PERMISSIONS
+            self.config.shared_access.file_permission(FINAL_PERMISSIONS)
         };
+
+        // POSIX shared memory does not live in a set-group-id directory, so hand it to the shared
+        // group explicitly. Failure is not fatal: the creator may not be a member of the group.
+        if let Some(gid) = self.config.shared_access.group() {
+            // (uid_t)-1 leaves the owner unchanged
+            let uid = iceoryx2_bb_posix::user::Uid::new_from_native(u32::MAX as _);
+            let ownership = iceoryx2_bb_posix::ownership::OwnershipBuilder::new()
+                .uid(uid)
+                .gid(iceoryx2_bb_posix::group::Gid::new_from_native(gid))
+                .create();
+            if let Err(e) = shm.set_ownership(ownership) {
+                iceoryx2_log::warn!(from origin,
+                    "Unable to hand the dynamic storage to the shared group {gid} ({e:?}); other users of that group may be unable to open it.");
+            }
+        }
 
         if let Err(e) = shm.set_permission(final_permission) {
             unsafe { core::ptr::drop_in_place(value) };

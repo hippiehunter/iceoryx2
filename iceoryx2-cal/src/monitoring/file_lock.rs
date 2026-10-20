@@ -35,7 +35,7 @@ use crate::{
     monitoring::{MonitoringCreateCleanerError, MonitoringCreateMonitorError, State},
     named_concept::{
         NamedConcept, NamedConceptBuilder, NamedConceptConfiguration, NamedConceptDoesExistError,
-        NamedConceptListError, NamedConceptMgmt, NamedConceptRemoveError,
+        NamedConceptListError, NamedConceptMgmt, NamedConceptRemoveError, SharedAccess,
     },
 };
 
@@ -262,9 +262,14 @@ impl MonitoringBuilder<FileLockMonitoring> for Builder {
     {
         let msg = "Unable to create FileLockMonitoring token";
         let process_state_path = self.config.path_for(&self.name);
+        // Shared access only ever mirrors *read* access to the guard files: other users may
+        // observe the state of the monitored instance but never take over its locks.
+        let shared_access = self.config.shared_access;
         match ProcessGuardBuilder::new()
-            .guard_permissions(GUARD_PERMISSIONS)
-            .directory_permissions(DIR_PERMISSIONS)
+            .guard_permissions(
+                GUARD_PERMISSIONS | shared_access.file_permission(Permission::OWNER_READ),
+            )
+            .directory_permissions(shared_access.directory_permission(DIR_PERMISSIONS))
             .create(&process_state_path)
         {
             Ok(guard) => Ok(Token {
@@ -361,6 +366,7 @@ pub struct Configuration {
     suffix: FileName,
     prefix: FileName,
     path_hint: Path,
+    shared_access: SharedAccess,
 }
 
 impl Default for Configuration {
@@ -369,6 +375,7 @@ impl Default for Configuration {
             suffix: FileLockMonitoring::default_suffix(),
             prefix: FileLockMonitoring::default_prefix(),
             path_hint: FileLockMonitoring::default_path_hint(),
+            shared_access: SharedAccess::owner_only(),
         }
     }
 }
@@ -399,5 +406,14 @@ impl NamedConceptConfiguration for Configuration {
 
     fn get_path_hint(&self) -> &Path {
         &self.path_hint
+    }
+
+    fn shared_access(mut self, value: &SharedAccess) -> Self {
+        self.shared_access = *value;
+        self
+    }
+
+    fn get_shared_access(&self) -> SharedAccess {
+        self.shared_access
     }
 }

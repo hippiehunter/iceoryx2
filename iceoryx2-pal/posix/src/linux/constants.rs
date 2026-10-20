@@ -69,6 +69,7 @@ pub const MAX_SIGNAL_VALUE: usize = 32;
 
 pub const SO_PASSCRED: int = libc::SO_PASSCRED as _;
 pub const SO_PEERCRED: int = libc::SO_PEERCRED as _;
+pub const SO_PEERGROUPS: int = libc::SO_PEERGROUPS as _;
 pub const SCM_CREDENTIALS: int = libc::SCM_CREDENTIALS as _;
 
 pub const PTHREAD_MUTEX_NORMAL: int = libc::PTHREAD_MUTEX_NORMAL as _;

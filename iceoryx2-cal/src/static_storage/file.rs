@@ -85,6 +85,7 @@ pub struct Configuration {
     path: Path,
     suffix: FileName,
     prefix: FileName,
+    shared_access: SharedAccess,
 }
 
 impl Default for Configuration {
@@ -93,6 +94,7 @@ impl Default for Configuration {
             path: Storage::default_path_hint(),
             suffix: Storage::default_suffix(),
             prefix: Storage::default_prefix(),
+            shared_access: SharedAccess::owner_only(),
         }
     }
 }
@@ -123,6 +125,15 @@ impl crate::named_concept::NamedConceptConfiguration for Configuration {
 
     fn get_path_hint(&self) -> &Path {
         &self.path
+    }
+
+    fn shared_access(mut self, value: &SharedAccess) -> Self {
+        self.shared_access = *value;
+        self
+    }
+
+    fn get_shared_access(&self) -> SharedAccess {
+        self.shared_access
     }
 }
 
@@ -190,7 +201,12 @@ impl StaticStorageLocked<Storage> for Locked {
             }
         }
 
-        match self.file.set_permission(FINAL_PERMISSIONS) {
+        let final_permissions = self
+            .static_storage
+            .config
+            .shared_access
+            .file_permission(FINAL_PERMISSIONS);
+        match self.file.set_permission(final_permissions) {
             Ok(_) => (),
             Err(FileSetPermissionError::InsufficientPermissions) => {
                 fail!(from self, with StaticStorageUnlockError::InsufficientPermissions,
@@ -501,7 +517,10 @@ impl crate::static_storage::StaticStorageBuilder<Storage> for Builder {
         };
 
         if !root_dir_exist {
-            match Directory::create(&self.config.path, DIR_PERMISSIONS) {
+            match Directory::create(
+                &self.config.path,
+                self.config.shared_access.directory_permission(DIR_PERMISSIONS),
+            ) {
                 Ok(_) | Err(DirectoryCreateError::DirectoryAlreadyExists) => (),
                 Err(e) => {
                     fail!(from self, with StaticStorageCreateError::RootDirectoryCreationFailure,

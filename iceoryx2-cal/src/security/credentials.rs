@@ -34,6 +34,9 @@ pub struct ProcessCredentials {
     gid: u32,
     #[cfg(unix)]
     start_time: Option<u64>,
+    /// Supplementary group ids (kernel-verified via `SO_PEERGROUPS` for peers).
+    #[cfg(unix)]
+    supplementary_gids: alloc::vec::Vec<u32>,
     #[cfg(windows)]
     user_sid: Option<alloc::vec::Vec<u8>>,
     #[cfg(windows)]
@@ -50,6 +53,7 @@ impl ProcessCredentials {
             uid,
             gid,
             start_time: None,
+            supplementary_gids: alloc::vec::Vec::new(),
         }
     }
 
@@ -82,7 +86,15 @@ impl ProcessCredentials {
             uid,
             gid,
             start_time: Some(start_time),
+            supplementary_gids: alloc::vec::Vec::new(),
         }
+    }
+
+    /// Attaches the supplementary group ids of the process.
+    #[cfg(unix)]
+    pub fn with_supplementary_gids(mut self, gids: alloc::vec::Vec<u32>) -> Self {
+        self.supplementary_gids = gids;
+        self
     }
 
     /// Creates new [`ProcessCredentials`] with Windows SIDs.
@@ -112,26 +124,58 @@ impl ProcessCredentials {
     #[inline]
     pub fn from_self() -> Self {
         use iceoryx2_bb_posix::process::Process;
-        use iceoryx2_bb_posix::user::User;
 
         let process = Process::from_self();
         let pid = process.id().value() as u32;
-
-        // Get uid and gid from user - fallback to 0 if unavailable
-        let (uid, gid) = match User::from_self() {
-            Ok(user) => {
-                let uid = user.uid().value();
-                let gid = user.details().map(|d| d.gid().value()).unwrap_or(0);
-                (uid, gid)
-            }
-            Err(_) => (0, 0),
-        };
+        let (uid, gid) = Self::self_ids();
 
         Self {
             pid,
             uid,
             gid,
             start_time: None,
+            supplementary_gids: Self::self_supplementary_gids(),
+        }
+    }
+
+    /// The uid/gid of the current process as the kernel reports them to peers (`SO_PEERCRED`
+    /// carries the *effective* ids). They are taken from the process itself and not from the
+    /// user database, which may not know the uid (containers, user namespaces).
+    #[cfg(unix)]
+    fn self_ids() -> (u32, u32) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            (
+                iceoryx2_pal_posix::posix::geteuid() as u32,
+                iceoryx2_pal_posix::posix::getegid() as u32,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        unsafe {
+            (
+                iceoryx2_pal_posix::posix::getuid() as u32,
+                iceoryx2_pal_posix::posix::getgid() as u32,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn self_supplementary_gids() -> alloc::vec::Vec<u32> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut groups = alloc::vec![0 as iceoryx2_pal_posix::posix::gid_t; 1024];
+            let n = unsafe {
+                iceoryx2_pal_posix::posix::getgroups(groups.len() as _, groups.as_mut_ptr())
+            };
+            if n < 0 {
+                return alloc::vec::Vec::new();
+            }
+            groups.truncate(n as usize);
+            groups.into_iter().map(|g| g as u32).collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            alloc::vec::Vec::new()
         }
     }
 
@@ -188,20 +232,10 @@ impl ProcessCredentials {
     #[cfg(unix)]
     pub fn from_self_with_start_time() -> Option<Self> {
         use iceoryx2_bb_posix::process::Process;
-        use iceoryx2_bb_posix::user::User;
 
         let process = Process::from_self();
         let pid = process.id().value() as u32;
-
-        // Get uid and gid from user - fallback to 0 if unavailable
-        let (uid, gid) = match User::from_self() {
-            Ok(user) => {
-                let uid = user.uid().value();
-                let gid = user.details().map(|d| d.gid().value()).unwrap_or(0);
-                (uid, gid)
-            }
-            Err(_) => (0, 0),
-        };
+        let (uid, gid) = Self::self_ids();
 
         let start_time = Self::read_start_time_for_pid(pid)?;
 
@@ -210,6 +244,7 @@ impl ProcessCredentials {
             uid,
             gid,
             start_time: Some(start_time),
+            supplementary_gids: Self::self_supplementary_gids(),
         })
     }
 
@@ -264,6 +299,26 @@ impl ProcessCredentials {
     #[inline]
     pub const fn gid(&self) -> u32 {
         self.gid
+    }
+
+    /// Returns the supplementary group ids (empty when unknown or unsupported).
+    #[cfg(unix)]
+    #[inline]
+    pub fn supplementary_gids(&self) -> &[u32] {
+        &self.supplementary_gids
+    }
+
+    /// Returns an empty slice on non-Unix platforms.
+    #[cfg(not(unix))]
+    #[inline]
+    pub fn supplementary_gids(&self) -> &[u32] {
+        &[]
+    }
+
+    /// Returns `true` when `gid` is the primary or one of the supplementary groups.
+    #[inline]
+    pub fn is_in_group(&self, gid: u32) -> bool {
+        self.gid == gid || self.supplementary_gids().contains(&gid)
     }
 
     /// Returns the process start time if available.
@@ -369,6 +424,7 @@ impl Debug for ProcessCredentials {
         #[cfg(unix)]
         {
             debug_struct.field("start_time", &self.start_time);
+            debug_struct.field("supplementary_gids", &self.supplementary_gids);
         }
 
         #[cfg(windows)]

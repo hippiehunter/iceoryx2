@@ -104,6 +104,7 @@ impl<
             suffix: *self.get_suffix(),
             prefix: *self.get_prefix(),
             path_hint: *self.get_path_hint(),
+            shared_access: self.get_shared_access(),
         }
     }
 }
@@ -139,6 +140,15 @@ impl<
 
     fn get_path_hint(&self) -> &Path {
         self.value.get_path_hint()
+    }
+
+    fn shared_access(mut self, value: &crate::named_concept::SharedAccess) -> Self {
+        self.value = self.value.shared_access(value);
+        self
+    }
+
+    fn get_shared_access(&self) -> crate::named_concept::SharedAccess {
+        self.value.get_shared_access()
     }
 }
 

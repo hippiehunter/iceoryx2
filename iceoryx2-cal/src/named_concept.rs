@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 use iceoryx2_bb_container::semantic_string::SemanticString;
 use iceoryx2_bb_posix::config::TEMP_DIRECTORY;
 use iceoryx2_bb_posix::directory::{Directory, DirectoryRemoveError};
+use iceoryx2_bb_posix::permission::Permission;
 pub use iceoryx2_bb_system_types::file_name::FileName;
 pub use iceoryx2_bb_system_types::file_path::FilePath;
 pub use iceoryx2_bb_system_types::path::Path;
@@ -83,6 +84,94 @@ impl core::fmt::Display for NamedConceptPathHintRemoveError {
 
 impl core::error::Error for NamedConceptPathHintRemoveError {}
 
+/// Describes whether, and with whom, a [`NamedConcept`] shares the file-system resources it
+/// creates (files, directories, sockets, named shared memory) with users other than the creating
+/// one.
+///
+/// The default, [`SharedAccess::owner_only()`], keeps the historical single-user behavior: every
+/// resource is accessible only by the creating user. A shared access is derived from a mode such
+/// as `0o2770` or `0o1777` via [`SharedAccess::from_mode()`]: the group (respectively others) bits
+/// of that mode act as a *mask* that limits which of the owner bits of a resource are mirrored to
+/// the group (respectively others).
+///
+/// * [`SharedAccess::file_permission()`] mirrors the owner bits of a file-like resource, e.g. a
+///   read-only static config (`0o400`) becomes `0o440`/`0o444` and a read-write dynamic config
+///   (`0o600`) becomes `0o660`/`0o666`.
+/// * [`SharedAccess::directory_permission()`] only ever mirrors read + traverse (never write) so
+///   that per-owner directories stay owned and writable by their owner alone.
+///
+/// The optional [`SharedAccess::group()`] names the group that resources outside of a set-group-id
+/// directory (e.g. POSIX shared memory) are handed to when they are shared with the group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SharedAccess {
+    group_mask: u32,
+    others_mask: u32,
+    group: Option<u32>,
+}
+
+impl SharedAccess {
+    /// Resources are accessible only by the creating user (default, single-user behavior).
+    pub const fn owner_only() -> Self {
+        Self {
+            group_mask: 0,
+            others_mask: 0,
+            group: None,
+        }
+    }
+
+    /// Derives the shared access from a mode. The group bits (`0o070`) of `mode` limit what is
+    /// mirrored to the group, the others bits (`0o007`) what is mirrored to everyone else. The
+    /// owner and special bits of `mode` are ignored.
+    pub fn from_mode(mode: Permission, group: Option<u32>) -> Self {
+        let bits = mode.bits() as u32;
+        Self {
+            group_mask: (bits >> 3) & 0o7,
+            others_mask: bits & 0o7,
+            group,
+        }
+    }
+
+    /// Returns `true` when nothing is shared with other users.
+    pub fn is_owner_only(&self) -> bool {
+        self.group_mask == 0 && self.others_mask == 0
+    }
+
+    /// Returns `true` when resources are shared with the group.
+    pub fn shares_with_group(&self) -> bool {
+        self.group_mask != 0
+    }
+
+    /// Returns `true` when resources are shared with everyone.
+    pub fn shares_with_others(&self) -> bool {
+        self.others_mask != 0
+    }
+
+    /// The group that shared resources shall be handed to, if any.
+    pub fn group(&self) -> Option<u32> {
+        if self.shares_with_group() {
+            self.group
+        } else {
+            None
+        }
+    }
+
+    /// Mirrors the owner bits of `base` to the group/others as far as the masks allow.
+    pub fn file_permission(&self, base: Permission) -> Permission {
+        let bits = base.bits() as u32;
+        let owner = (bits >> 6) & 0o7;
+        let mirrored = ((owner & self.group_mask) << 3) | (owner & self.others_mask);
+        Permission::from_bits(bits | mirrored)
+    }
+
+    /// Adds read + traverse permissions for the group/others to the directory permission `base`
+    /// as far as the masks allow. Write access is never mirrored.
+    pub fn directory_permission(&self, base: Permission) -> Permission {
+        let bits = base.bits() as u32;
+        let mirrored = ((0o5 & self.group_mask) << 3) | (0o5 & self.others_mask);
+        Permission::from_bits(bits | mirrored)
+    }
+}
+
 /// Every [`NamedConcept`] must have a custom configuration that at least allows the user to define
 /// a custom [`NamedConceptConfiguration::suffix()`] for all file names that are transparent during
 /// usage as well as a [`NamedConceptConfiguration::path_hint()`] that can be ignored if the
@@ -107,6 +196,18 @@ pub trait NamedConceptConfiguration: Default + Clone + Debug + Send {
 
     /// Returns the configurations path hint.
     fn get_path_hint(&self) -> &Path;
+
+    /// Defines with whom the resources created under this configuration are shared. Concepts
+    /// that do not create shareable file-system resources ignore this setting.
+    fn shared_access(self, _value: &SharedAccess) -> Self {
+        self
+    }
+
+    /// Returns the [`SharedAccess`] of the configuration, [`SharedAccess::owner_only()`] for
+    /// concepts that do not support it.
+    fn get_shared_access(&self) -> SharedAccess {
+        SharedAccess::owner_only()
+    }
 
     /// Returns the full path for a given value under the given configuration.
     fn path_for(&self, value: &FileName) -> FilePath {
@@ -253,3 +354,46 @@ pub(crate) fn remove_path_hint(value: &Path) -> Result<(), NamedConceptPathHintR
         }
     }
 }
+
+#[cfg(test)]
+mod shared_access_tests {
+    use super::*;
+
+    fn bits(p: Permission) -> u32 {
+        p.bits() as u32
+    }
+
+    #[test]
+    fn owner_only_keeps_permissions() {
+        let a = SharedAccess::owner_only();
+        assert!(a.is_owner_only());
+        assert_eq!(bits(a.file_permission(Permission::OWNER_READ)), 0o400);
+        assert_eq!(bits(a.directory_permission(Permission::from_bits(0o750))), 0o750);
+        assert_eq!(a.group(), None);
+    }
+
+    #[test]
+    fn sticky_world_mode_mirrors_to_everyone() {
+        let a = SharedAccess::from_mode(Permission::from_bits(0o1777), None);
+        assert_eq!(bits(a.file_permission(Permission::OWNER_READ)), 0o444);
+        assert_eq!(bits(a.file_permission(Permission::OWNER_READ_WRITE)), 0o666);
+        // directories never become writable for others
+        assert_eq!(bits(a.directory_permission(Permission::from_bits(0o750))), 0o755);
+    }
+
+    #[test]
+    fn group_mode_mirrors_to_group_only() {
+        let a = SharedAccess::from_mode(Permission::from_bits(0o2770), Some(3000));
+        assert_eq!(bits(a.file_permission(Permission::OWNER_READ)), 0o440);
+        assert_eq!(bits(a.file_permission(Permission::OWNER_READ_WRITE)), 0o660);
+        assert_eq!(bits(a.directory_permission(Permission::OWNER_ALL)), 0o750);
+        assert_eq!(a.group(), Some(3000));
+    }
+
+    #[test]
+    fn endpoint_mode_limits_mirrored_bits() {
+        let a = SharedAccess::from_mode(Permission::from_bits(0o660), None);
+        assert_eq!(bits(a.file_permission(Permission::OWNER_ALL)), 0o760);
+    }
+}
+

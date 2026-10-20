@@ -254,7 +254,10 @@ impl<E: EventState, Storage: DynamicStorage<State<E, ()>>> WaiterInterface<E, ()
         };
 
         if !root_dir_exist {
-            match Directory::create(&config.path_hint, DIR_PERMISSIONS) {
+            match Directory::create(
+                &config.path_hint,
+                config.shared_access.directory_permission(DIR_PERMISSIONS),
+            ) {
                 Ok(_) | Err(DirectoryCreateError::DirectoryAlreadyExists) => (),
                 Err(e) => {
                     fail!(from origin, with ListenerCreateError::RootDirectoryCreationFailure,
@@ -268,7 +271,7 @@ impl<E: EventState, Storage: DynamicStorage<State<E, ()>>> WaiterInterface<E, ()
         let full_path = config.path_for(name);
         let receiver = match UnixDatagramReceiverBuilder::new(&full_path)
             .creation_mode(CreationMode::CreateExclusive)
-            .permission(SOCKET_PERMISSIONS)
+            .permission(config.shared_access.file_permission(SOCKET_PERMISSIONS))
             .create()
         {
             Ok(v) => v,

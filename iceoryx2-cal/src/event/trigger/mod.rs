@@ -38,6 +38,7 @@ pub struct Configuration {
     pub suffix: FileName,
     pub prefix: FileName,
     pub path_hint: Path,
+    pub shared_access: crate::named_concept::SharedAccess,
 }
 
 impl Configuration {

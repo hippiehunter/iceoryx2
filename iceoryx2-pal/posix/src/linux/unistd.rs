@@ -122,6 +122,18 @@ pub unsafe fn getgid() -> gid_t {
     unsafe { libc::getgid() }
 }
 
+pub unsafe fn geteuid() -> uid_t {
+    unsafe { libc::geteuid() }
+}
+
+pub unsafe fn getegid() -> gid_t {
+    unsafe { libc::getegid() }
+}
+
+pub unsafe fn getgroups(size: int, list: *mut gid_t) -> int {
+    unsafe { libc::getgroups(size, list) }
+}
+
 pub unsafe fn rmdir(pathname: *const c_char) -> int {
     unsafe { libc::rmdir(pathname) }
 }

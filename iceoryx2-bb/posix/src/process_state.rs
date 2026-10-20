@@ -1033,8 +1033,7 @@ impl ProcessMonitor {
             return Ok(ProcessState::DoesNotExist);
         };
 
-        if let Some(owner_lock_file) =
-            Self::open_file(self, &self.owner_lock_path, AccessMode::Write)?
+        if let Some(owner_lock_file) = Self::open_file_for_lock_query(self, &self.owner_lock_path)?
         {
             let lock_state = fail!(from self,
                                     when owner_lock_file.get_lock_state(),
@@ -1066,7 +1065,7 @@ impl ProcessMonitor {
         // state file is closed. This is a weird case in some OSes that release a file lock as soon as
         // any file descriptor is closed to that file, even when other file descriptors to that same file
         // are still open.
-        match Self::open_file(self, &self.state_path, AccessMode::Write)? {
+        match Self::open_file_for_lock_query(self, &self.state_path)? {
             Some(state_file) => {
                 let lock_state = fail!(from self, when state_file.get_lock_state(),
                                     "{} since the lock state of the state file could not be acquired.", msg);
@@ -1076,6 +1075,22 @@ impl ProcessMonitor {
                 }
             }
             None => Ok(ProcessState::CleaningUp),
+        }
+    }
+
+    /// Opens a guard file only to query its lock state. Write access is preferred (historical
+    /// behavior); when the file belongs to another user that granted only read access (multi-user
+    /// setups) the file is opened read-only instead, which suffices for `F_GETLK` on Linux.
+    fn open_file_for_lock_query<T: Debug + ?Sized>(
+        origin: &T,
+        path: &FilePath,
+    ) -> Result<Option<File>, ProcessMonitorOpenError> {
+        match FileBuilder::new(path).open_existing(AccessMode::Write) {
+            Ok(f) => Ok(Some(f)),
+            Err(FileOpenError::InsufficientPermissions) => {
+                Self::open_file(origin, path, AccessMode::Read)
+            }
+            Err(_) => Self::open_file(origin, path, AccessMode::Write),
         }
     }
 
