@@ -160,12 +160,22 @@ pub struct MuProcess {
 
 impl MuProcess {
     /// Spawns `exe` as `uid`/`gid` with the supplementary `groups`. The caller must be root.
-    pub fn spawn(exe: &str, label: &str, uid: u32, gid: u32, groups: &[u32], args: &[String]) -> Self {
+    pub fn spawn(
+        exe: &str,
+        label: &str,
+        uid: u32,
+        gid: u32,
+        groups: &[u32],
+        args: &[String],
+    ) -> Self {
         let groups: Vec<libc::gid_t> = groups.iter().map(|g| *g as libc::gid_t).collect();
         let mut command = Command::new(exe);
         command
             .args(args)
-            .env("IOX2_LOG_LEVEL", std::env::var("IOX2_LOG_LEVEL").unwrap_or("error".into()))
+            .env(
+                "IOX2_LOG_LEVEL",
+                std::env::var("IOX2_LOG_LEVEL").unwrap_or("error".into()),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -190,7 +200,10 @@ impl MuProcess {
         let lines_clone = Arc::clone(&lines);
         let tag = label.to_string();
         thread::spawn(move || {
-            for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
                 println!("[{tag}] {line}");
                 lines_clone.lock().unwrap().push(line);
             }

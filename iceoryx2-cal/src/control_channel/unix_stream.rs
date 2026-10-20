@@ -258,7 +258,11 @@ impl ControlChannelListenerBuilder<Channel> for ListenerBuilder {
 
         let listener = UnixStreamListenerBuilder::new(&full_path)
             .creation_mode(CreationMode::CreateExclusive)
-            .permission(self.config.shared_access.file_permission(SOCKET_PERMISSIONS))
+            .permission(
+                self.config
+                    .shared_access
+                    .file_permission(SOCKET_PERMISSIONS),
+            )
             .create();
 
         let inner = match listener {
@@ -944,12 +948,13 @@ mod tests {
     use iceoryx2_bb_container::semantic_string::SemanticString;
 
     fn connected_pair(tag: &str) -> (Listener, Client, Connection) {
-        let name = FileName::new(
-            format!("iox2_cc_test_{}_{}", tag, std::process::id()).as_bytes(),
-        )
-        .unwrap();
+        let name = FileName::new(format!("iox2_cc_test_{}_{}", tag, std::process::id()).as_bytes())
+            .unwrap();
         let config = Configuration::default().path_hint(&Path::new(b"/tmp").unwrap());
-        let listener = ListenerBuilder::new(&name).config(&config).create().unwrap();
+        let listener = ListenerBuilder::new(&name)
+            .config(&config)
+            .create()
+            .unwrap();
         let client = ClientBuilder::new(&name).config(&config).connect().unwrap();
         let connection = listener
             .timed_accept(Duration::from_secs(5))

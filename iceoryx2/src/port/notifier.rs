@@ -53,8 +53,8 @@ use iceoryx2_cal::{
 use iceoryx2_cal::{event::Event, named_concept::NamedConceptBuilder};
 use iceoryx2_log::{debug, fail, warn};
 
-use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::port::details::iam_attachment::IamPortAttachment;
+use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::service::SharedServiceState;
 use crate::{
     identifiers::{UniqueListenerId, UniqueNodeId, UniqueNotifierId},

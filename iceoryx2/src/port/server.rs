@@ -75,8 +75,8 @@
 
 use crate::iam::error::IamClientError;
 use crate::port::details::data_segment_shared_state::DataSegmentSharedState;
-use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::port::details::iam_attachment::IamPortAttachment;
+use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::port::port_name::PortName;
 use crate::port::update_connections::UpdateConnections;
 use crate::prelude::BackpressureStrategy;

@@ -1388,24 +1388,33 @@ roles = ["notifier", "publisher"]
     fn test_gid_rule_matches_supplementary_group_when_primary_group_differs() {
         let policy = sip_policy();
         // `usermod -aG sipwriters dbluser`: primary group 2001, supplementary 3000
-        let member = ProcessCredentials::new(10, 2001, 2001).with_supplementary_gids(vec![100, 3000]);
-        assert!(policy
-            .authorize_attach(&member, &service_id(), PortType::Notifier)
-            .is_allowed());
-        assert!(policy
-            .authorize_attach(&member, &service_id(), PortType::Publisher)
-            .is_allowed());
+        let member =
+            ProcessCredentials::new(10, 2001, 2001).with_supplementary_gids(vec![100, 3000]);
+        assert!(
+            policy
+                .authorize_attach(&member, &service_id(), PortType::Notifier)
+                .is_allowed()
+        );
+        assert!(
+            policy
+                .authorize_attach(&member, &service_id(), PortType::Publisher)
+                .is_allowed()
+        );
 
         let non_member = ProcessCredentials::new(11, 2003, 2003).with_supplementary_gids(vec![100]);
-        assert!(policy
-            .authorize_attach(&non_member, &service_id(), PortType::Notifier)
-            .is_denied());
+        assert!(
+            policy
+                .authorize_attach(&non_member, &service_id(), PortType::Notifier)
+                .is_denied()
+        );
 
         // primary-group membership keeps working
         let primary = ProcessCredentials::new(12, 2004, 3000);
-        assert!(policy
-            .authorize_attach(&primary, &service_id(), PortType::Notifier)
-            .is_allowed());
+        assert!(
+            policy
+                .authorize_attach(&primary, &service_id(), PortType::Notifier)
+                .is_allowed()
+        );
     }
 
     #[test]
@@ -1414,11 +1423,31 @@ roles = ["notifier", "publisher"]
         let broker = ProcessCredentials::new(1, 0, 0);
         let writer = ProcessCredentials::new(2, 2001, 2001).with_supplementary_gids(vec![3000]);
 
-        assert!(policy.authorize_attach(&broker, &service_id(), PortType::Listener).is_allowed());
-        assert!(policy.authorize_attach(&broker, &service_id(), PortType::Notifier).is_denied());
-        assert!(policy.authorize_attach(&writer, &service_id(), PortType::Notifier).is_allowed());
-        assert!(policy.authorize_attach(&writer, &service_id(), PortType::Listener).is_denied());
-        assert!(policy.authorize_attach(&writer, &service_id(), PortType::Subscriber).is_denied());
+        assert!(
+            policy
+                .authorize_attach(&broker, &service_id(), PortType::Listener)
+                .is_allowed()
+        );
+        assert!(
+            policy
+                .authorize_attach(&broker, &service_id(), PortType::Notifier)
+                .is_denied()
+        );
+        assert!(
+            policy
+                .authorize_attach(&writer, &service_id(), PortType::Notifier)
+                .is_allowed()
+        );
+        assert!(
+            policy
+                .authorize_attach(&writer, &service_id(), PortType::Listener)
+                .is_denied()
+        );
+        assert!(
+            policy
+                .authorize_attach(&writer, &service_id(), PortType::Subscriber)
+                .is_denied()
+        );
     }
 
     #[test]
@@ -1427,9 +1456,21 @@ roles = ["notifier", "publisher"]
         let writer = ProcessCredentials::new(2, 2001, 2001).with_supplementary_gids(vec![3000]);
         let stranger = ProcessCredentials::new(3, 2003, 2003);
         let owner = ProcessCredentials::new(1, 0, 0);
-        assert!(policy.authorize_add_segment(&writer, &service_id(), 4096).is_allowed());
-        assert!(policy.authorize_add_segment(&owner, &service_id(), 4096).is_allowed());
-        assert!(policy.authorize_add_segment(&stranger, &service_id(), 4096).is_denied());
+        assert!(
+            policy
+                .authorize_add_segment(&writer, &service_id(), 4096)
+                .is_allowed()
+        );
+        assert!(
+            policy
+                .authorize_add_segment(&owner, &service_id(), 4096)
+                .is_allowed()
+        );
+        assert!(
+            policy
+                .authorize_add_segment(&stranger, &service_id(), 4096)
+                .is_denied()
+        );
     }
 
     #[test]
@@ -1455,15 +1496,27 @@ roles = ["listener"]
         .unwrap();
         let policy = ConfiguredPolicy::from_policy_file(file, 0);
         let in_root_group = ProcessCredentials::new(1, 2001, 2001).with_supplementary_gids(vec![0]);
-        assert!(policy
-            .authorize_attach(&in_root_group, &service_id(), PortType::Publisher)
-            .is_allowed());
-        assert!(policy
-            .authorize_attach(&in_root_group, &service_id(), PortType::Subscriber)
-            .is_denied());
+        assert!(
+            policy
+                .authorize_attach(&in_root_group, &service_id(), PortType::Publisher)
+                .is_allowed()
+        );
+        assert!(
+            policy
+                .authorize_attach(&in_root_group, &service_id(), PortType::Subscriber)
+                .is_denied()
+        );
         let root = ProcessCredentials::new(1, 0, 0);
-        assert!(policy.authorize_attach(&root, &service_id(), PortType::Subscriber).is_allowed());
+        assert!(
+            policy
+                .authorize_attach(&root, &service_id(), PortType::Subscriber)
+                .is_allowed()
+        );
         // an unknown group never matches
-        assert!(policy.authorize_attach(&root, &service_id(), PortType::Listener).is_denied());
+        assert!(
+            policy
+                .authorize_attach(&root, &service_id(), PortType::Listener)
+                .is_denied()
+        );
     }
 }

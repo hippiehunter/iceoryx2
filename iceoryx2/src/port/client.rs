@@ -75,8 +75,8 @@
 use crate::active_request::RequestId;
 use crate::port::details::chunk::ChunkMut;
 use crate::port::details::data_segment_shared_state::DataSegmentSharedState;
-use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::port::details::iam_attachment::IamPortAttachment;
+use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::service::header::request_response::RequestHeader;
 use crate::service::marker::{CustomHeaderMarker, CustomPayloadMarker, Flatbuffer};
 use crate::service::resource::request_response::RequestResponseResources;

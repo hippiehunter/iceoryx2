@@ -53,8 +53,8 @@ use iceoryx2_cal::zero_copy_connection::{CHANNEL_STATE_OPEN, ChannelId};
 use iceoryx2_log::{fail, warn};
 
 use crate::iam::error::IamClientError;
-use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::port::details::iam_attachment::IamPortAttachment;
+use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::port::port_name::PortName;
 use crate::port::update_connections::UpdateConnections;
 use crate::service::SharedServiceState;

@@ -368,7 +368,10 @@ mod shared_access_tests {
         let a = SharedAccess::owner_only();
         assert!(a.is_owner_only());
         assert_eq!(bits(a.file_permission(Permission::OWNER_READ)), 0o400);
-        assert_eq!(bits(a.directory_permission(Permission::from_bits(0o750))), 0o750);
+        assert_eq!(
+            bits(a.directory_permission(Permission::from_bits(0o750))),
+            0o750
+        );
         assert_eq!(a.group(), None);
     }
 
@@ -378,7 +381,10 @@ mod shared_access_tests {
         assert_eq!(bits(a.file_permission(Permission::OWNER_READ)), 0o444);
         assert_eq!(bits(a.file_permission(Permission::OWNER_READ_WRITE)), 0o666);
         // directories never become writable for others
-        assert_eq!(bits(a.directory_permission(Permission::from_bits(0o750))), 0o755);
+        assert_eq!(
+            bits(a.directory_permission(Permission::from_bits(0o750))),
+            0o755
+        );
     }
 
     #[test]
@@ -396,4 +402,3 @@ mod shared_access_tests {
         assert_eq!(bits(a.file_permission(Permission::OWNER_ALL)), 0o760);
     }
 }
-

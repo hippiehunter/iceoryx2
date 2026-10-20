@@ -519,7 +519,9 @@ impl crate::static_storage::StaticStorageBuilder<Storage> for Builder {
         if !root_dir_exist {
             match Directory::create(
                 &self.config.path,
-                self.config.shared_access.directory_permission(DIR_PERMISSIONS),
+                self.config
+                    .shared_access
+                    .directory_permission(DIR_PERMISSIONS),
             ) {
                 Ok(_) | Err(DirectoryCreateError::DirectoryAlreadyExists) => (),
                 Err(e) => {

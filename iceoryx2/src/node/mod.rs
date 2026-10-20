@@ -1471,7 +1471,10 @@ impl<Service: service::Service> Node<Service> {
         }
     }
 
-    pub(crate) fn get_node_state(config: &Config, node_id: &UniqueNodeId) -> Result<State, NodeListFailure> {
+    pub(crate) fn get_node_state(
+        config: &Config,
+        node_id: &UniqueNodeId,
+    ) -> Result<State, NodeListFailure> {
         let config = node_monitoring_config::<Service>(config);
         let result = <Service::Monitoring as Monitoring>::Builder::new(&node_id.as_file_name())
             .config(&config)

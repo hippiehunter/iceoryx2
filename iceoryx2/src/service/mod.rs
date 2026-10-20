@@ -1296,7 +1296,6 @@ fn read_static_service_config<S: Service>(
     Ok(Some(service_config))
 }
 
-
 /// Deregisters all ports of a departed node (one whose process is gone) from a single service.
 ///
 /// Used by the IAM server of a secured service, which runs inside the service creator: when an
@@ -1325,8 +1324,7 @@ pub(crate) fn remove_departed_node_from_service<S: Service>(
         }
     };
 
-    let dynamic_config = match open_dynamic_config::<S>(config, static_config.unique_service_id())
-    {
+    let dynamic_config = match open_dynamic_config::<S>(config, static_config.unique_service_id()) {
         Ok(Some(c)) => c,
         Ok(None) => return 0,
         Err(e) => {
@@ -1349,7 +1347,8 @@ pub(crate) fn remove_departed_node_from_service<S: Service>(
                 );
             }
             UniquePortId::Subscriber(ref id) => {
-                let _ = unsafe { remove_receiver_port_from_all_connections::<S>(id.value(), config) };
+                let _ =
+                    unsafe { remove_receiver_port_from_all_connections::<S>(id.value(), config) };
             }
             UniquePortId::Listener(ref id) => {
                 let _ = unsafe { remove_connection_of_listener::<S>(id, config) };

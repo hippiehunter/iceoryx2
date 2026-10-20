@@ -141,7 +141,8 @@ impl<C: CalConnection> SessionEntry<C> {
 }
 
 /// Port types whose ports produce (and register) data segments and connection channels.
-const PRODUCER_PORT_TYPES: [PortType; 3] = [PortType::Publisher, PortType::Server, PortType::Client];
+const PRODUCER_PORT_TYPES: [PortType; 3] =
+    [PortType::Publisher, PortType::Server, PortType::Client];
 /// Port types whose ports consume data segments of producers.
 const CONSUMER_PORT_TYPES: [PortType; 3] =
     [PortType::Subscriber, PortType::Server, PortType::Client];
@@ -811,7 +812,8 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
                 Ok(response)
             }
 
-            IamRequest::AttachNotifier { service_id } | IamRequest::AttachListener { service_id }
+            IamRequest::AttachNotifier { service_id }
+            | IamRequest::AttachListener { service_id }
                 if !handshake_complete =>
             {
                 let _ = service_id;
@@ -1345,9 +1347,11 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
                 entry.session.credentials().clone(),
                 entry.has_port_type(&PRODUCER_PORT_TYPES),
             ),
-            None => return Some(IamResponse::ProtocolError {
-                message: String::from("Unknown session"),
-            }),
+            None => {
+                return Some(IamResponse::ProtocolError {
+                    message: String::from("Unknown session"),
+                });
+            }
         };
 
         let decision = if !is_producer {
@@ -1389,7 +1393,11 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
     /// Only sessions that attached a consumer port (subscriber, server, client) - and thereby
     /// passed the policy's role check - may obtain handles to producer resources. A principal
     /// that may only publish never receives another publisher's data segment.
-    fn authorize_consumer(&self, session_id: SessionId, sender_port_id: u128) -> Option<IamResponse> {
+    fn authorize_consumer(
+        &self,
+        session_id: SessionId,
+        sender_port_id: u128,
+    ) -> Option<IamResponse> {
         let entry = self.sessions.get(&session_id)?;
         if entry.has_port_type(&CONSUMER_PORT_TYPES) {
             return None;
@@ -2443,7 +2451,6 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
                     PortType::Notifier | PortType::Listener => {}
                 }
             }
-
         }
 
         // The handles registered under the session's (iceoryx2) producer ports are released
@@ -4155,7 +4162,12 @@ roles = ["publisher", "notifier"]
         assert!(server.claim_producer_port(writer_a, port_a).is_none());
         server
             .segment_manager
-            .register_segment_for_port(port_a, create_test_handle(), 4096, AccessRights::read_only())
+            .register_segment_for_port(
+                port_a,
+                create_test_handle(),
+                4096,
+                AccessRights::read_only(),
+            )
             .unwrap();
         server
             .segment_manager
@@ -4169,7 +4181,10 @@ roles = ["publisher", "notifier"]
         // writer B holds no consumer role: every handle request is refused
         let denied = |r: IamResponse| matches!(r, IamResponse::Denied { .. });
         assert!(denied(
-            server.handle_request_segment_handle(writer_b, port_a).unwrap().0
+            server
+                .handle_request_segment_handle(writer_b, port_a)
+                .unwrap()
+                .0
         ));
         assert!(denied(
             server
@@ -4192,7 +4207,10 @@ roles = ["publisher", "notifier"]
 
         // the broker (subscriber role) obtains them
         assert!(matches!(
-            server.handle_request_segment_handle(broker, port_a).unwrap().0,
+            server
+                .handle_request_segment_handle(broker, port_a)
+                .unwrap()
+                .0,
             IamResponse::SegmentHandleOk { .. }
         ));
         assert!(matches!(
@@ -4279,7 +4297,10 @@ roles = ["publisher", "notifier"]
                 .unwrap();
         }
         assert_eq!(
-            server.sessions[&writer].session.resource_usage().publisher_count,
+            server.sessions[&writer]
+                .session
+                .resource_usage()
+                .publisher_count,
             0
         );
     }

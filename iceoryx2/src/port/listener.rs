@@ -59,8 +59,8 @@
 //! ```
 
 use crate::config::Config;
-use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::port::details::iam_attachment::IamPortAttachment;
+use crate::port::port_lifetime_tag::PortLifetimeTag;
 use crate::port::port_name::PortName;
 use crate::service::SharedServiceState;
 use crate::service::config_scheme::event_config;

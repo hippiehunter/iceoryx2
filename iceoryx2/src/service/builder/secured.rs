@@ -24,9 +24,9 @@ use iceoryx2_bb_system_types::file_name::FileName;
 use iceoryx2_cal::control_channel::{
     ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder,
 };
-use iceoryx2_cal::named_concept::{NamedConceptBuilder, NamedConceptMgmt};
 use iceoryx2_cal::monitoring::State;
 use iceoryx2_cal::named_concept::NamedConceptConfiguration;
+use iceoryx2_cal::named_concept::{NamedConceptBuilder, NamedConceptMgmt};
 use iceoryx2_cal::security::credentials::ProcessCredentials;
 use iceoryx2_log::{debug, warn};
 
@@ -153,10 +153,9 @@ pub(crate) fn create_secured_resource<Service: service::Service>(
 /// directory does not exist) disables auditing for this service with a warning.
 fn audit_logger(config: &crate::config::Config) -> Option<Box<dyn AuditLogger>> {
     let origin = "audit_logger";
-    let configured = core::str::from_utf8(
-        config.global.node.security.iam.audit_log_path.as_bytes(),
-    )
-    .unwrap_or("");
+    let configured =
+        core::str::from_utf8(config.global.node.security.iam.audit_log_path.as_bytes())
+            .unwrap_or("");
     if configured.is_empty() {
         return None;
     }
@@ -203,7 +202,8 @@ fn departure_handler<Service: service::Service>(
             Ok(State::DoesNotExist) => PeerDepartureOutcome::Completed,
             Ok(State::Dead) => {
                 match Node::<Service>::get_node_details(&config, &node_id) {
-                    Ok(Some(details)) if details.process_id().value() as u32 == credentials.pid() => {}
+                    Ok(Some(details))
+                        if details.process_id().value() as u32 == credentials.pid() => {}
                     Ok(Some(details)) => {
                         warn!(from origin,
                             "Ignoring the departure of node {node_id} since it belongs to process {} and not to the peer process {}.",

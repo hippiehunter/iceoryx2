@@ -27,8 +27,8 @@ use iceoryx2::port::publisher::PublisherCreateError;
 use iceoryx2::port::subscriber::SubscriberCreateError;
 use iceoryx2::prelude::*;
 use linux_e2e_tests::multi_user::{
-    DATA_SERVICE, EVENTS_SERVICE, MuCli, ReplicationHeader, Role, SPACE_SERVICE,
-    multi_user_config, payload_for,
+    DATA_SERVICE, EVENTS_SERVICE, MuCli, ReplicationHeader, Role, SPACE_SERVICE, multi_user_config,
+    payload_for,
 };
 
 extern crate iceoryx2_bb_loggers;
@@ -139,7 +139,10 @@ fn run_broker(cli: &MuCli) -> Result<(), String> {
     let mut notify_warnings = 0usize;
     while received < cli.count {
         if Instant::now() > deadline {
-            return Err(format!("timed out after receiving {received} of {} samples", cli.count));
+            return Err(format!(
+                "timed out after receiving {received} of {} samples",
+                cli.count
+            ));
         }
 
         let mut events_seen = 0;
@@ -148,7 +151,10 @@ fn run_broker(cli: &MuCli) -> Result<(), String> {
             .map_err(|e| format!("listener wait: {e:?}"))?;
 
         let mut drained = 0;
-        while let Some(sample) = subscriber.receive().map_err(|e| format!("receive: {e:?}"))? {
+        while let Some(sample) = subscriber
+            .receive()
+            .map_err(|e| format!("receive: {e:?}"))?
+        {
             let header = *sample.user_header();
             let payload = sample.payload();
             let expected = payload_for(header.uid, header.seq);
@@ -296,7 +302,10 @@ fn run_writer(cli: &MuCli) -> Result<(), String> {
         let sample = sample.write_from_slice(&payload);
         let delivered = sample.send().map_err(|e| format!("send: {e:?}"))?;
         notifier.notify().map_err(|e| format!("notify: {e:?}"))?;
-        mark!("WRITER uid={me}: sent seq={seq} len={} delivered={delivered}", payload.len());
+        mark!(
+            "WRITER uid={me}: sent seq={seq} len={} delivered={delivered}",
+            payload.len()
+        );
 
         let mut space_events = 0;
         listener

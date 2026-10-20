@@ -228,7 +228,11 @@ impl Drop for Layout {
         // anything a killed process left in /dev/shm
         if let Ok(entries) = std::fs::read_dir("/dev/shm") {
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(&self.prefix) {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&self.prefix)
+                {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -278,7 +282,10 @@ fn shm_objects(prefix: &str) -> Vec<(String, u32)> {
 /// named (and thus openable) object - those are anonymous memfds brokered by IAM.
 fn assert_no_named_data_plane(prefix: &str) {
     let objects = shm_objects(prefix);
-    assert!(!objects.is_empty(), "expected the dynamic configs in /dev/shm");
+    assert!(
+        !objects.is_empty(),
+        "expected the dynamic configs in /dev/shm"
+    );
     for (name, mode) in &objects {
         assert!(
             !name.ends_with(".data") && !name.ends_with(".connection"),
@@ -371,7 +378,7 @@ fn run_allow_with(mode: Mode, tag: &str, setup: BrokerSetup) {
                 &layout.exe,
                 &format!("writer{uid}"),
                 uid,
-                uid, // primary group is the user's own ...
+                uid,                // primary group is the user's own ...
                 &[ids.writers_gid], // ... the grant comes from the SUPPLEMENTARY writers group
                 &layout.args("writer", &mode, &["--count", &count]),
             )
@@ -398,8 +405,18 @@ fn run_allow_with(mode: Mode, tag: &str, setup: BrokerSetup) {
     let services = std::fs::read_dir(format!("{}services", layout.root)).unwrap();
     for entry in services.flatten() {
         let mode_bits = entry.metadata().unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode_bits & 0o022, 0, "static config {:?} is writable by others", entry.path());
-        assert_ne!(mode_bits & 0o044, 0, "static config {:?} not shared", entry.path());
+        assert_eq!(
+            mode_bits & 0o022,
+            0,
+            "static config {:?} is writable by others",
+            entry.path()
+        );
+        assert_ne!(
+            mode_bits & 0o044,
+            0,
+            "static config {:?} not shared",
+            entry.path()
+        );
     }
 
     for writer in writers.iter_mut() {
@@ -414,13 +431,19 @@ fn run_allow_with(mode: Mode, tag: &str, setup: BrokerSetup) {
     for uid in ids.writers {
         assert!(
             audit.iter().any(|e| e["uid"] == uid
-                && e["kind"].as_str().unwrap_or("").starts_with("attach:Publisher")
+                && e["kind"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("attach:Publisher")
                 && e["decision"] == "allow"),
             "no allowed publisher attach of uid {uid} in the audit log: {audit:?}"
         );
         assert!(
             audit.iter().any(|e| e["uid"] == uid
-                && e["kind"].as_str().unwrap_or("").starts_with("attach:Subscriber")
+                && e["kind"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("attach:Subscriber")
                 && e["decision"] == "deny"),
             "no denied subscriber attach of uid {uid} in the audit log"
         );
@@ -492,7 +515,11 @@ fn multi_user_unauthorized_uid_is_denied_by_iam() {
     );
     // file-system access works: the denial below is not an EACCES
     intruder.expect("INTRUDER", STEP);
-    assert_eq!(intruder.wait_exit(STEP), 0, "intruder was not denied everything");
+    assert_eq!(
+        intruder.wait_exit(STEP),
+        0,
+        "intruder was not denied everything"
+    );
     intruder.expect("opened all services", STEP);
     for port in ["publisher", "subscriber", "notifier", "listener"] {
         intruder.expect(&format!("{port} denied by IAM"), STEP);
@@ -530,9 +557,9 @@ fn multi_user_unauthorized_uid_is_denied_by_iam() {
         );
     }
     assert!(
-        !audit
-            .iter()
-            .any(|e| e["uid"] == ids.intruder && e["decision"] == "allow" && e["kind"] != "connect"),
+        !audit.iter().any(|e| e["uid"] == ids.intruder
+            && e["decision"] == "allow"
+            && e["kind"] != "connect"),
         "uid {} was granted something: {audit:?}",
         ids.intruder
     );
@@ -557,11 +584,7 @@ fn multi_user_killed_writer_is_released_and_replaced() {
         ids.broker,
         ids.broker,
         &[],
-        &layout.args(
-            "broker",
-            &mode,
-            &["--count", "6", "--max-publishers", "1"],
-        ),
+        &layout.args("broker", &mode, &["--count", "6", "--max-publishers", "1"]),
     );
     broker.expect("BROKER: ready", STEP);
 
@@ -611,5 +634,9 @@ fn multi_user_killed_writer_is_released_and_replaced() {
     writer_c.quit();
     assert_eq!(writer_c.wait_exit(STEP), 0);
     broker.quit();
-    assert_eq!(broker.wait_exit(STEP), 0, "broker failed after the writer was killed");
+    assert_eq!(
+        broker.wait_exit(STEP),
+        0,
+        "broker failed after the writer was killed"
+    );
 }

@@ -790,15 +790,24 @@ impl<C: CalClient + Send + 'static> ErasedSecuredContext for SecuredServiceConte
     }
 
     fn attach_notifier(&self) -> Result<u128, IamClientError> {
-        self.client.lock().unwrap().attach_notifier(&self.service_id)
+        self.client
+            .lock()
+            .unwrap()
+            .attach_notifier(&self.service_id)
     }
 
     fn detach(&self, port_id: u128) -> Result<(), IamClientError> {
-        self.client.lock().unwrap().detach(&self.service_id, port_id)
+        self.client
+            .lock()
+            .unwrap()
+            .detach(&self.service_id, port_id)
     }
 
     fn attach_listener(&self) -> Result<u128, IamClientError> {
-        self.client.lock().unwrap().attach_listener(&self.service_id)
+        self.client
+            .lock()
+            .unwrap()
+            .attach_listener(&self.service_id)
     }
 
     fn is_active(&self) -> bool {

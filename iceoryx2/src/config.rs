@@ -195,7 +195,11 @@ impl FileMode {
     /// Creates a mode from its raw bits, e.g. `FileMode::new(0o2770)`. Bits outside of `0o7777`
     /// are rejected.
     pub const fn new(bits: u32) -> Option<Self> {
-        if bits > 0o7777 { None } else { Some(Self(bits)) }
+        if bits > 0o7777 {
+            None
+        } else {
+            Some(Self(bits))
+        }
     }
 
     /// The raw mode bits.
@@ -1066,8 +1070,22 @@ endpoint-group = "sipwriters"
         config.global.node.security.shared_directory_mode = FileMode::new(0o1777);
         config.global.node.security.iam.endpoint_mode = FileMode::new(0o666);
         assert!(!config.global.node.security.is_multi_user());
-        assert!(config.global.node.security.metadata_access().is_owner_only());
-        assert!(config.global.node.security.endpoint_access().is_owner_only());
+        assert!(
+            config
+                .global
+                .node
+                .security
+                .metadata_access()
+                .is_owner_only()
+        );
+        assert!(
+            config
+                .global
+                .node
+                .security
+                .endpoint_access()
+                .is_owner_only()
+        );
     }
 
     #[test]
@@ -1075,4 +1093,3 @@ endpoint-group = "sipwriters"
         assert_eq!(resolve_group(&FileName::new(b"3000").unwrap()), Some(3000));
     }
 }
-
