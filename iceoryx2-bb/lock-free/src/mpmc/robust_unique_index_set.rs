@@ -155,11 +155,6 @@ impl OwnerId {
     }
 }
 
-struct SetState {
-    generation_counter: u64,
-    borrowed_indices: u64,
-}
-
 #[repr(C)]
 #[derive(Debug)]
 pub struct RobustUniqueIndexSet {
@@ -238,33 +233,54 @@ impl RobustUniqueIndexSet {
         self.generation_counter.load(Ordering::Relaxed) == GENERATION_COUNTER_LOCK_INDICATOR
     }
 
+    /// Locks the set when it does not contain any borrowed index.
+    ///
+    /// Many owners may release their indices concurrently (e.g. many nodes leaving a service at
+    /// once), therefore this must not depend on a full scan of the set being undisturbed by the
+    /// other releasers:
+    ///
+    ///  * the scan stops at the first borrowed index - the set is not empty, the owner of that index
+    ///    is responsible for locking the set when it releases it,
+    ///  * the scan does not modify the generation counter, so concurrent lockers never invalidate
+    ///    each other; only a real modification (acquire/release/recover) forces a retry.
+    ///
+    /// Correctness of "the last releaser locks": every release clears its cell and then performs
+    /// an `AcqRel` read-modify-write on the generation counter before calling `lock()`. These RMWs
+    /// are totally ordered, so the releaser whose RMW comes last observes all cells cleared by the
+    /// others and finds the set empty.
     fn lock(&self) -> ReleaseState {
-        if self.is_locked() {
-            return ReleaseState::Locked;
-        }
+        let cell_ptr = self.cell_ptr.as_ptr();
 
         loop {
-            let state = self.borrowed_indices_and_generation_counter();
+            //////////////////////////////////////
+            // SYNC POINT enforce order of:
+            //   1. cell
+            //   2. generation counter
+            //////////////////////////////////////
+            let generation_counter = self.generation_counter.load(Ordering::Acquire);
+            if generation_counter == GENERATION_COUNTER_LOCK_INDICATOR {
+                return ReleaseState::Locked;
+            }
 
-            // When the number of borrowed indices is 0 and the generation counter is unchanged
-            // this means that either the set is empty or that another thread is currently calling
-            // `acquire()` may have already populated a cell but before incrementing the generation counter
-            //
-            // In the latter case, the `acquire()` operation needs to finish by calling
-            // `increment_generation_counter` which would return `ReleaseState::Locked` and therefore
-            // the index would not be provided to the user.
-            if state.borrowed_indices == 0 {
-                match self.generation_counter.compare_exchange(
-                    state.generation_counter,
-                    GENERATION_COUNTER_LOCK_INDICATOR,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => return ReleaseState::Locked,
-                    Err(_) => continue,
+            for n in 0..self.capacity {
+                let cell = unsafe { &*cell_ptr.add(n) };
+                if cell.load(Ordering::Relaxed) != OwnerId::EMPTY.0 {
+                    return ReleaseState::Unlocked;
                 }
-            } else {
-                return ReleaseState::Unlocked;
+            }
+
+            // When no index is borrowed and the generation counter is unchanged the set is empty.
+            // A concurrent `acquire()` that already populated a cell but did not yet increment the
+            // generation counter fails when it tries to increment the counter and observes
+            // `GENERATION_COUNTER_LOCK_INDICATOR`, so the index is never handed out.
+            match self.generation_counter.compare_exchange(
+                generation_counter,
+                GENERATION_COUNTER_LOCK_INDICATOR,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return ReleaseState::Locked,
+                Err(_) => continue,
             }
         }
     }
@@ -459,8 +475,10 @@ impl RobustUniqueIndexSet {
                 // SYNC POINT enforce order of:
                 //   1. cell
                 //   2. generation counter
+                // AcqRel: a subsequent `lock()` must observe the cells released by all releasers
+                // whose counter increment precedes this one (see `lock()`).
                 //////////////////////////////////////
-                self.increment_generation_counter(Ordering::Release);
+                self.increment_generation_counter(Ordering::AcqRel);
             }
             Err(v) => {
                 fail!(from self,
@@ -520,7 +538,7 @@ impl RobustUniqueIndexSet {
                 //   1. cell
                 //   2. generation counter
                 //////////////////////////////////////
-                if self.increment_generation_counter(Ordering::Release)
+                if self.increment_generation_counter(Ordering::AcqRel)
                     == GENERATION_COUNTER_LOCK_INDICATOR
                 {
                     return ReleaseState::Locked;
@@ -563,14 +581,12 @@ impl RobustUniqueIndexSet {
 
     /// Returns how many indices were already borrowed.
     pub fn borrowed_indices(&self) -> usize {
-        self.borrowed_indices_and_generation_counter()
-            .borrowed_indices as usize
+        self.borrowed_indices_snapshot() as usize
     }
 
     /// This function returns the number of borrowed indices, meaning how many
-    /// `cell`s != `OwnerId::EMPTY` combined with the generation counter at that
-    /// time.
-    fn borrowed_indices_and_generation_counter(&self) -> SetState {
+    /// `cell`s != `OwnerId::EMPTY`, as a consistent snapshot (no modification during the scan).
+    fn borrowed_indices_snapshot(&self) -> u64 {
         let cell_ptr = self.cell_ptr.as_ptr();
         loop {
             //////////////////////////////////////
@@ -581,10 +597,7 @@ impl RobustUniqueIndexSet {
             let initial_generation_count = self.generation_counter.load(Ordering::Acquire);
 
             if initial_generation_count == GENERATION_COUNTER_LOCK_INDICATOR {
-                return SetState {
-                    generation_counter: initial_generation_count,
-                    borrowed_indices: 0,
-                };
+                return 0;
             }
 
             let mut count = 0;
@@ -599,14 +612,21 @@ impl RobustUniqueIndexSet {
             // SYNC POINT enforce order of:
             //   1. cell
             //   2. generation counter
+            // The snapshot is valid when no modification happened during the scan. The check is a
+            // read-modify-write that does not change the counter, so concurrent readers do not
+            // invalidate each other's snapshots (which would starve them).
             //////////////////////////////////////
-            let new_generation_count = self.increment_generation_counter(Ordering::Release);
-
-            if initial_generation_count + 1 == new_generation_count {
-                return SetState {
-                    generation_counter: new_generation_count,
-                    borrowed_indices: count,
-                };
+            if self
+                .generation_counter
+                .compare_exchange(
+                    initial_generation_count,
+                    initial_generation_count,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return count;
             }
         }
     }

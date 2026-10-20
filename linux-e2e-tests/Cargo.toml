@@ -27,6 +27,10 @@ path = "bins/src/client.rs"
 name = "iox2-e2e-mu"
 path = "bins/src/multi_user.rs"
 
+[[bin]]
+name = "iox2-e2e-departure"
+path = "bins/src/departure.rs"
+
 # NOTE (differs from windows-e2e-tests): dependencies are UNCONDITIONAL, not gated
 # under [target.'cfg(windows)'.dependencies]. The coordinator + scenario code are
 # portable and the child binaries perform real cross-process secured IPC on Linux.

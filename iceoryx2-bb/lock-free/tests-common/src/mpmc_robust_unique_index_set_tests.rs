@@ -558,6 +558,90 @@ pub fn concurrent_acquire_release() {
     assert_that!(e.err().unwrap(), eq UniqueIndexSetAcquireFailure::OutOfIndices);
 }
 
+/// Mass departure: many owners release their (last) indices concurrently with
+/// `ReleaseMode::LockIfLastIndex`, as many nodes leaving a service at once do via
+/// `deregister_node_id`. The release must not starve: every releaser finishes within a time
+/// bound, exactly the expected final state (locked, no borrowed indices) is reached and at least
+/// one releaser observes `ReleaseState::Locked`.
+fn mass_release_with_lock_if_last_index(number_of_threads: usize, occupy_high_indices: bool) {
+    const LARGE_CAPACITY: usize = 10_000;
+    const TIME_LIMIT: core::time::Duration = core::time::Duration::from_secs(5);
+
+    let sut = alloc::boxed::Box::new(StaticRobustUniqueIndexSet::<LARGE_CAPACITY>::new());
+
+    // optionally push the participants' indices to the end of the set - the worst case for a
+    // scan that stops at the first borrowed index
+    let filler_owner = OwnerId::new(1).unwrap();
+    let mut fillers = vec![];
+    if occupy_high_indices {
+        for _ in 0..LARGE_CAPACITY - number_of_threads {
+            fillers.push(sut.acquire(filler_owner).unwrap());
+        }
+    }
+
+    let mut indices = vec![];
+    for n in 0..number_of_threads {
+        let owner = OwnerId::new(1000 + n as u64).unwrap();
+        indices.push((sut.acquire(owner).unwrap(), owner));
+    }
+
+    for index in fillers {
+        assert_that!(
+            sut.release(index, filler_owner, ReleaseMode::Default),
+            is_ok
+        );
+    }
+
+    let barrier_handle = BarrierHandle::new();
+    let barrier = BarrierBuilder::new(number_of_threads as u32 + 1)
+        .create(&barrier_handle)
+        .unwrap();
+    let locked_count = AtomicUsize::new(0);
+
+    let mut start = None;
+    thread_scope(|s| {
+        for (index, owner) in indices.iter().copied() {
+            let sut = &sut;
+            let barrier = &barrier;
+            let locked_count = &locked_count;
+            s.thread_builder()
+                .spawn(move || {
+                    barrier.wait();
+                    match sut.release(index, owner, ReleaseMode::LockIfLastIndex) {
+                        Ok(ReleaseState::Locked) => {
+                            locked_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(ReleaseState::Unlocked) => (),
+                        Err(e) => panic!("release failed: {e:?}"),
+                    }
+                })
+                .expect("failed to spawn thread");
+        }
+
+        start = Some(iceoryx2_bb_posix::clock::Time::now().unwrap());
+        barrier.wait();
+        // the scope joins all threads when the closure returns
+        Ok(())
+    })
+    .expect("failed to run thread scope");
+    let elapsed = start.unwrap().elapsed().unwrap();
+
+    assert_that!(sut.is_locked(), eq true);
+    assert_that!(sut.borrowed_indices(), eq 0);
+    assert_that!(locked_count.load(Ordering::Relaxed), ge 1);
+    assert_that!(elapsed, lt TIME_LIMIT);
+}
+
+#[test]
+pub fn mass_release_with_lock_if_last_index_does_not_starve_with_low_indices() {
+    mass_release_with_lock_if_last_index(120, false);
+}
+
+#[test]
+pub fn mass_release_with_lock_if_last_index_does_not_starve_with_high_indices() {
+    mass_release_with_lock_if_last_index(120, true);
+}
+
 #[should_panic]
 #[test]
 pub fn relocatable_variant_panics_when_initialized_twice() {
