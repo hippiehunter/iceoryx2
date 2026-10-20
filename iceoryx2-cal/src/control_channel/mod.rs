@@ -281,12 +281,25 @@ pub trait ControlChannelListener: Debug + NamedConcept + Sized + Send {
 
     /// Blocks until a connection is accepted.
     fn blocking_accept(&self) -> Result<Self::Connection, ControlChannelAcceptError>;
+
+    /// The OS file descriptor that becomes readable when a connection is pending, so that a
+    /// server can wait for many listeners and connections at once (epoll). `None` when the
+    /// implementation has no such descriptor; the caller then has to poll.
+    fn readiness_fd(&self) -> Option<i32> {
+        None
+    }
 }
 
 /// Server-side connection after accepting a client.
 ///
 /// Provides access to peer credentials and can send/receive handles.
 pub trait ControlChannelConnection: Debug + Sized + Send {
+    /// The OS file descriptor that becomes readable when data (or EOF) arrives, for waiting on
+    /// many connections at once (epoll). `None` when the implementation has none.
+    fn readiness_fd(&self) -> Option<i32> {
+        None
+    }
+
     /// Returns the credentials of the connected peer.
     ///
     /// Uses SO_PEERCRED to get the peer's pid, uid, and gid. This is
@@ -345,6 +358,13 @@ pub trait ControlChannelConnection: Debug + Sized + Send {
 pub trait ControlChannelClient: Debug + NamedConcept + Sized + Send {
     /// Returns the credentials of the connected peer (the server).
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError>;
+
+    /// Returns `true` when the listener side has closed the connection (end of stream; for
+    /// instance because the process hosting it exited), without consuming pending data and
+    /// without blocking. Implementations that cannot tell return `false`.
+    fn is_peer_closed(&self) -> bool {
+        false
+    }
 
     /// Sends platform handles (file descriptors) to the server.
     fn send_handles(&self, handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError>;

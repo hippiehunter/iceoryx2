@@ -31,7 +31,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use iceoryx2_bb_posix::unique_system_id::UniqueSystemId;
 use iceoryx2_cal::security::AccessRights;
-use iceoryx2_cal::shm_allocator::SegmentId;
 use serde::{Deserialize, Serialize};
 
 use crate::service::service_hash::ServiceHash;
@@ -49,6 +48,32 @@ pub const MAX_HANDLES_PER_MESSAGE: usize = 64;
 
 /// Maximum length of error messages in bytes.
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 512;
+
+// ============================================================================
+// SegmentId
+// ============================================================================
+
+/// Server-wide identifier of a segment brokered by an IAM server.
+///
+/// It is independent of the `u8` segment ids that a producer stamps into its pointer offsets
+/// (`iceoryx2_cal::shm_allocator::SegmentId`): those are per producer port (an index into the
+/// port's dynamic segment set), whereas this id names a handle held by the server. Keeping the two
+/// apart lets one server broker the segments of any number of producers; with a shared `u8` id
+/// space a server could hold at most 254 producer segments, i.e. 254 publishers per service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SegmentId(u32);
+
+impl SegmentId {
+    /// Creates a segment id from its value.
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the value of the segment id.
+    pub const fn value(&self) -> u32 {
+        self.0
+    }
+}
 
 // ============================================================================
 // ProtocolVersion
@@ -74,8 +99,9 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
-    /// The current protocol version (1.0).
-    pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+    /// The current protocol version (2.0). 2.0: segment ids are 32-bit server-wide ids
+    /// ([`SegmentId`]); `AddSegmentOk::segment_id` is the producer's per-port segment index.
+    pub const CURRENT: ProtocolVersion = ProtocolVersion { major: 2, minor: 0 };
 
     /// Creates a new protocol version with the given major and minor numbers.
     pub const fn new(major: u16, minor: u16) -> Self {
@@ -554,7 +580,9 @@ pub enum IamResponse {
 
     /// Successful response to an AddSegment request.
     AddSegmentOk {
-        /// The identifier of the new segment.
+        /// The index (`1..=254`) of the new segment within the producer port's segment set. The
+        /// producer uses it as the segment id in its pointer offsets; consumers request the
+        /// handle by `(port, index)`. It is not the server-wide [`SegmentId`] of the handle.
         segment_id: SegmentId,
         /// The actual size of the segment.
         size: usize,
@@ -716,7 +744,7 @@ mod tests {
     #[test]
     fn test_protocol_version_current() {
         let version = ProtocolVersion::CURRENT;
-        assert_eq!(version.major(), 1);
+        assert_eq!(version.major(), 2);
         assert_eq!(version.minor(), 0);
     }
 

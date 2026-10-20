@@ -315,6 +315,12 @@ impl NamedConcept for Listener {
 impl ControlChannelListener for Listener {
     type Connection = Connection;
 
+    fn readiness_fd(&self) -> Option<i32> {
+        use iceoryx2_bb_posix::file_descriptor::FileDescriptorBased;
+        // SAFETY: the descriptor is only used for readiness polling, never closed or modified.
+        Some(unsafe { self.inner.file_descriptor().native_handle() })
+    }
+
     fn try_accept(&self) -> Result<Option<Connection>, ControlChannelAcceptError> {
         match self.inner.try_accept() {
             Ok(Some(conn)) => Ok(Some(Connection { inner: conn })),
@@ -378,6 +384,12 @@ pub struct Connection {
 }
 
 impl ControlChannelConnection for Connection {
+    fn readiness_fd(&self) -> Option<i32> {
+        use iceoryx2_bb_posix::file_descriptor::FileDescriptorBased;
+        // SAFETY: the descriptor is only used for readiness polling, never closed or modified.
+        Some(unsafe { self.inner.file_descriptor().native_handle() })
+    }
+
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
         match self.inner.peer_credentials() {
             Ok(cred) => {
@@ -592,6 +604,30 @@ impl NamedConcept for Client {
 }
 
 impl ControlChannelClient for Client {
+    #[cfg(target_os = "linux")]
+    fn is_peer_closed(&self) -> bool {
+        use iceoryx2_bb_posix::file_descriptor::FileDescriptorBased;
+        use iceoryx2_pal_posix::posix;
+        let mut byte = 0u8;
+        // SAFETY: a one-byte peek into a local buffer; the descriptor stays owned by `inner`.
+        let received = unsafe {
+            posix::recv(
+                self.inner.file_descriptor().native_handle(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                posix::MSG_PEEK | posix::MSG_DONTWAIT,
+            )
+        };
+        // 0: orderly shutdown by the peer; -1 with ECONNRESET/EPIPE: the peer is gone as well.
+        // -1 with EAGAIN: open and idle; > 0: data pending.
+        received == 0
+            || (received < 0
+                && matches!(
+                    posix::Errno::get(),
+                    posix::Errno::ECONNRESET | posix::Errno::EPIPE | posix::Errno::ENOTCONN
+                ))
+    }
+
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
         match self.inner.peer_credentials() {
             Ok(cred) => {

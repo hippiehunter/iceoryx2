@@ -37,12 +37,12 @@ use core::alloc::Layout;
 use core::any::Any;
 use std::sync::Mutex;
 
+use super::protocol::SegmentId;
 use iceoryx2_bb_container::semantic_string::SemanticString;
 use iceoryx2_bb_system_types::file_name::FileName;
 use iceoryx2_cal::named_concept::NamedConceptBuilder;
 use iceoryx2_cal::security::PlatformHandle;
 use iceoryx2_cal::shared_memory::{SharedMemory, SharedMemoryBuilder};
-use iceoryx2_cal::shm_allocator::SegmentId;
 use iceoryx2_cal::shm_allocator::pool_allocator::PoolAllocator;
 
 use crate::service::config_scheme::data_segment_config;
@@ -100,6 +100,10 @@ pub trait SegmentFactory: Send + Sync {
     /// from being dropped. This method allows the factory to be used as a
     /// segment storage.
     fn get_stored_segment(&self, segment_id: SegmentId) -> Option<Arc<dyn Any + Send + Sync>>;
+
+    /// Releases a segment this factory created (its producer port is gone). Without this, every
+    /// growth segment stayed mapped in the creating process for the service's lifetime.
+    fn release_segment(&self, _segment_id: SegmentId) {}
 }
 
 // ============================================================================
@@ -151,7 +155,7 @@ pub struct ServiceSegmentFactory<Service: service::Service> {
     segment_counter: Mutex<u64>,
     /// Storage for created segments to keep them alive.
     /// Maps segment_id -> Arc<SharedMemory>
-    segments: Mutex<std::collections::HashMap<u8, Arc<dyn Any + Send + Sync>>>,
+    segments: Mutex<std::collections::HashMap<u32, Arc<dyn Any + Send + Sync>>>,
     /// Phantom data for the service type.
     /// Using fn() -> Service to avoid requiring Service: Send + Sync.
     _phantom: core::marker::PhantomData<fn() -> Service>,
@@ -233,6 +237,10 @@ where
             .insert(segment_id.value(), memory_arc);
 
         Ok((handle, actual_size))
+    }
+
+    fn release_segment(&self, segment_id: SegmentId) {
+        self.segments.lock().unwrap().remove(&segment_id.value());
     }
 
     fn get_stored_segment(&self, segment_id: SegmentId) -> Option<Arc<dyn Any + Send + Sync>> {

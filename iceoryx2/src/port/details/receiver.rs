@@ -11,6 +11,12 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use alloc::format;
+use core::cell::Cell;
+use core::time::Duration;
+use iceoryx2_bb_posix::clock::{ClockType, Time};
+
+/// Interval of the secured-mode housekeeping of a receiver.
+pub(crate) const SECURED_HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(10);
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
@@ -223,6 +229,13 @@ pub(crate) struct Receiver<Service: service::Service, Resource: ServiceResource>
     pub(crate) number_of_channels: usize,
     pub(crate) connection_storage: UnsafeCell<SlotMap<Connection<Service, Resource>>>,
     pub(crate) initial_channel_state: ChannelState,
+    /// Connection key where the next `receive` starts looking for data (round robin).
+    pub(crate) receive_cursor: Cell<usize>,
+    /// At least one sender could not be connected in the last update cycle (retried later).
+    pub(crate) has_failed_connections: Cell<bool>,
+    /// When the secured-mode housekeeping (retry of failed connections, IAM notifications) ran
+    /// last, see [`Receiver::secured_housekeeping_due`].
+    pub(crate) last_secured_housekeeping: Cell<Option<Time>>,
 }
 
 impl<Service: service::Service, Resource: ServiceResource> Abandonable
@@ -697,7 +710,18 @@ impl<Service: service::Service, Resource: ServiceResource> Receiver<Service, Res
         let mut active_channel_count = 0;
         let mut all_channels_exceed_max_borrows = true;
         let connection_storage = unsafe { &*self.connection_storage.get() };
-        for (connection_key, connection) in connection_storage.iter() {
+        // Round robin: start at the connection that delivered last and wrap around, so that a
+        // drain of K samples from many senders visits every connection about once instead of
+        // rescanning from the first connection for every sample (O(N + K) instead of O(K * N)),
+        // and low connection keys are not favoured.
+        let start = self.receive_cursor.get();
+        let from_cursor = connection_storage
+            .iter()
+            .skip_while(|(key, _)| key.value() < start);
+        let before_cursor = connection_storage
+            .iter()
+            .take_while(|(key, _)| key.value() < start);
+        for (connection_key, connection) in from_cursor.chain(before_cursor) {
             if !connection.receiver.has_data(channel_id) {
                 continue;
             }
@@ -714,6 +738,7 @@ impl<Service: service::Service, Resource: ServiceResource> Receiver<Service, Res
             if let Some((details, absolute_address)) =
                 self.receive_from_connection(connection, connection_key, channel_id)?
             {
+                self.receive_cursor.set(connection_key.value());
                 return Ok(Some((details, absolute_address)));
             }
         }
@@ -726,8 +751,32 @@ impl<Service: service::Service, Resource: ServiceResource> Receiver<Service, Res
         Ok(None)
     }
 
+    /// Secured mode: whether the periodic housekeeping is due (at most every
+    /// [`SECURED_HOUSEKEEPING_INTERVAL`]). It retries senders that could not be connected
+    /// (their handles were not brokered yet) and drains pushed IAM notifications. Running it on
+    /// every `receive` made each sample cost two walks over all sender slots plus an IAM
+    /// syscall.
+    pub(crate) fn secured_housekeeping_due(&self) -> bool {
+        let last = self.last_secured_housekeeping.take();
+        let due = match &last {
+            None => true,
+            Some(t) => t
+                .elapsed()
+                .map(|e| e >= SECURED_HOUSEKEEPING_INTERVAL)
+                .unwrap_or(true),
+        };
+        if due {
+            self.last_secured_housekeeping
+                .set(Time::now_with_clock(ClockType::Monotonic).ok());
+        } else {
+            self.last_secured_housekeeping.set(last);
+        }
+        due
+    }
+
     pub(crate) fn start_update_connection_cycle(&self) {
         self.tagger.next_cycle();
+        self.has_failed_connections.set(false);
 
         // Poll for IAM notifications in secured mode.
         // This allows proactive segment handle delivery from the server.
@@ -739,7 +788,7 @@ impl<Service: service::Service, Resource: ServiceResource> Receiver<Service, Res
     /// In secured mode, the IAM server can push segment handles to consumers
     /// when producers add new segments. This method drains the notification
     /// queue and adds any received segment handles to the appropriate connections.
-    fn poll_iam_notifications(&self) {
+    pub(crate) fn poll_iam_notifications(&self) {
         let ctx = match self.service_state.additional_resource().as_client() {
             Some(ctx) => ctx,
             None => return, // Not in secured mode
@@ -802,18 +851,21 @@ impl<Service: service::Service, Resource: ServiceResource> Receiver<Service, Res
 
             match self.create(index, &sender_details) {
                 Ok(()) => Ok(()),
-                Err(e) => match self.degradation_handler.call(
-                    DegradationCause::FailedToEstablishConnection,
-                    &DegradationInfo {
-                        service_id: self
-                            .service_state
-                            .static_config()
-                            .unique_service_id()
-                            .value(),
-                        sender_port_id: sender_details.port_id,
-                        receiver_port_id: self.receiver_port_id(),
-                    },
-                ) {
+                Err(e) => match {
+                    self.has_failed_connections.set(true);
+                    self.degradation_handler.call(
+                        DegradationCause::FailedToEstablishConnection,
+                        &DegradationInfo {
+                            service_id: self
+                                .service_state
+                                .static_config()
+                                .unique_service_id()
+                                .value(),
+                            sender_port_id: sender_details.port_id,
+                            receiver_port_id: self.receiver_port_id(),
+                        },
+                    )
+                } {
                     DegradationAction::Ignore => Ok(()),
                     DegradationAction::Warn => {
                         warn!(from self, "Unable to establish connection to new sender {:?}.",

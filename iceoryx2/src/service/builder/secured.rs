@@ -22,7 +22,8 @@ use std::time::Instant;
 use iceoryx2_bb_container::semantic_string::SemanticString;
 use iceoryx2_bb_system_types::file_name::FileName;
 use iceoryx2_cal::control_channel::{
-    ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder,
+    ControlChannel, ControlChannelClientBuilder, ControlChannelConnectError,
+    ControlChannelListenerBuilder,
 };
 use iceoryx2_cal::monitoring::State;
 use iceoryx2_cal::named_concept::NamedConceptConfiguration;
@@ -102,13 +103,34 @@ pub(crate) fn create_secured_resource<Service: service::Service>(
         }
     };
 
-    let listener = <Service::ControlChannel as ControlChannel>::ListenerBuilder::new(&endpoint)
-        .config(&cc_config)
-        .create()
-        .map_err(|e| {
+    let create_listener = || {
+        <Service::ControlChannel as ControlChannel>::ListenerBuilder::new(&endpoint)
+            .config(&cc_config)
+            .create()
+    };
+    let listener = match create_listener() {
+        Ok(listener) => listener,
+        // This process just created the static config exclusively, so an endpoint of that name
+        // is a leftover of an earlier incarnation whose creator died (the socket file of a
+        // crashed process stays). Replace it unless somebody still answers on it.
+        Err(iceoryx2_cal::control_channel::ControlChannelListenerCreateError::AlreadyExists)
+            if endpoint_is_dead::<Service>(&endpoint, &cc_config) =>
+        {
+            warn!(from origin, "Removing the stale IAM endpoint {:?} of a previous creator of {:?}.",
+                endpoint, static_config.name());
+            let _ = unsafe {
+                <Service::ControlChannel as NamedConceptMgmt>::remove_cfg(&endpoint, &cc_config)
+            };
+            create_listener().map_err(|e| {
+                debug!(from origin, "Unable to create the IAM control-channel listener ({:?}).", e);
+                ServiceCreateError::InternalFailure
+            })?
+        }
+        Err(e) => {
             debug!(from origin, "Unable to create the IAM control-channel listener ({:?}).", e);
-            ServiceCreateError::InternalFailure
-        })?;
+            return Err(ServiceCreateError::InternalFailure);
+        }
+    };
 
     // Multi-user: hand the control socket to the configured endpoint group. The socket is not
     // the security boundary (the policy is), so a failure only limits who can connect.
@@ -235,6 +257,104 @@ fn departure_handler<Service: service::Service>(
 
 /// Opener side: connect an IAM client to the creator's server, handshake, and wrap it.
 /// Returns [`SecurityResource::SecuredClient`].
+/// Whether nobody listens on the IAM endpoint (connection refused or no socket file).
+fn endpoint_is_dead<Service: service::Service>(
+    endpoint: &FileName,
+    cc_config: &CcConfig<Service>,
+) -> bool {
+    matches!(
+        <Service::ControlChannel as ControlChannel>::ClientBuilder::new(endpoint)
+            .config(cc_config)
+            .try_connect(),
+        Err(ControlChannelConnectError::ConnectionRefused)
+            | Err(ControlChannelConnectError::DoesNotExist)
+    )
+}
+
+/// Reclaims a secured service whose IAM server is gone (orphaned): its creator exited or
+/// crashed while other processes still had the service open, so the service can neither be
+/// opened (no IAM server to connect to) nor created (its static config still exists) until every
+/// participant has left. Called by `open_or_create` of a process that may take the creator's
+/// place, i.e. one whose effective uid owns the static config.
+///
+/// The service is reclaimed when
+/// * it is secured and its static config exists, belongs to this process's effective uid and is
+///   older than twice the creation timeout (a service being created right now is never touched),
+/// * and its IAM endpoint refuses connections or does not exist.
+///
+/// Then the endpoint, the dynamic config's name and the static config are removed, so that the
+/// caller can create the service anew. Remaining participants keep their mappings of the old
+/// (now nameless) resources; [`is_orphaned`](crate::service::port_factory::publish_subscribe::PortFactory::is_orphaned)
+/// tells them to drop the service and open it again. Returns whether the service was reclaimed.
+pub(crate) fn reclaim_orphaned_service<Service: service::Service>(
+    shared_node: &SharedNode<Service>,
+    static_config: &StaticConfig,
+) -> bool {
+    let origin = "reclaim_orphaned_service";
+    let config = shared_node.config();
+    if !config.global.node.security.mode.is_secured() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let storage_config =
+            crate::service::config_scheme::static_config_storage_config::<Service>(config);
+        let name = crate::service::naming_scheme::static_config_name(static_config.service_hash());
+        let path = storage_config.path_for(&name);
+        let path = core::str::from_utf8(path.as_bytes()).unwrap_or("");
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { iceoryx2_pal_posix::posix::geteuid() } {
+            return false;
+        }
+        let min_age = config.global.creation_timeout * 2;
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if !old_enough {
+            return false;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        return false;
+    }
+
+    let (endpoint, cc_config) = endpoint_of(shared_node, static_config);
+    // Somebody hosting the IAM server, or an endpoint in an unknown state: not orphaned.
+    if !endpoint_is_dead::<Service>(&endpoint, &cc_config) {
+        return false;
+    }
+
+    warn!(from origin,
+        "Reclaiming the secured service {:?}: its creator is gone (IAM endpoint unreachable) but processes still use it. They have to open it again.",
+        static_config.name());
+    if let Err(e) =
+        unsafe { <Service::ControlChannel as NamedConceptMgmt>::remove_cfg(&endpoint, &cc_config) }
+    {
+        debug!(from origin, "Unable to remove the stale IAM endpoint ({:?}).", e);
+    }
+    match unsafe {
+        <Service as crate::service::internal::ServiceInternal<Service>>::__internal_remove_service(
+            static_config,
+            config,
+        )
+    } {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(from origin, "Unable to reclaim the orphaned service {:?} ({:?}).",
+                static_config.name(), e);
+            false
+        }
+    }
+}
+
 pub(crate) fn open_secured_resource<Service: service::Service>(
     shared_node: &SharedNode<Service>,
     static_config: &StaticConfig,
@@ -280,6 +400,13 @@ fn connect_client<Service: service::Service>(
             .try_connect()
         {
             Ok(connection) => break connection,
+            // The listener is created before the dynamic config, so an opener that got this far
+            // finds it unless the creator is gone (orphaned service): do not wait for it.
+            Err(e @ ControlChannelConnectError::ConnectionRefused)
+            | Err(e @ ControlChannelConnectError::DoesNotExist) => {
+                debug!(from origin, "The IAM server at {:?} is gone ({:?}).", endpoint, e);
+                return Err(());
+            }
             Err(e) => {
                 if start.elapsed() >= timeout {
                     debug!(from origin, "IAM connect to {:?} timed out ({:?}).", endpoint, e);

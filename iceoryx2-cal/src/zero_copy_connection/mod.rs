@@ -383,6 +383,12 @@ pub trait ZeroCopySender: Debug + ZeroCopyPortDetails + NamedConcept + Send + Ab
     fn reclaim(&self, channel_id: ChannelId)
     -> Result<Option<PointerOffset>, ZeroCopyReclaimError>;
 
+    /// Returns `true` while samples sent over this connection have not been returned by the
+    /// receiver yet (still queued, being read, or not yet reclaimed with
+    /// [`ZeroCopySender::reclaim()`]). Call [`ZeroCopySender::reclaim()`] first to account for
+    /// samples the receiver has already given back.
+    fn has_samples_in_flight(&self) -> bool;
+
     /// # Safety
     ///
     /// * must ensure that no receiver is still holding data, otherwise data races may occur on

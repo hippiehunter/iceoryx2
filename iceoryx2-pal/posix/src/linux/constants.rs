@@ -188,6 +188,7 @@ pub const SOCK_DGRAM: int = libc::SOCK_DGRAM as _;
 pub const IPPROTO_UDP: int = libc::IPPROTO_UDP as _;
 pub const SOCK_NONBLOCK: int = O_NONBLOCK;
 pub const MSG_PEEK: int = libc::MSG_PEEK as _;
+pub const MSG_DONTWAIT: int = libc::MSG_DONTWAIT as _;
 pub const MSG_NOSIGNAL: int = libc::MSG_NOSIGNAL as _;
 pub const SCM_MAX_FD: u32 = 253;
 pub const SCM_RIGHTS: int = libc::SCM_RIGHTS as _;

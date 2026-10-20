@@ -79,6 +79,7 @@ pub mod client;
 pub mod configured_policy;
 pub mod error;
 pub mod policy;
+pub(crate) mod poller;
 pub mod protocol;
 pub mod segment_factory;
 pub mod segment_manager;

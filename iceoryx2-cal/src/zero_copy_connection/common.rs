@@ -1200,6 +1200,14 @@ pub mod details {
             }
         }
 
+        fn has_samples_in_flight(&self) -> bool {
+            self.storage
+                .get()
+                .segment_details
+                .iter()
+                .any(|segment_details| !segment_details.used_chunk_list.is_empty())
+        }
+
         unsafe fn acquire_used_offsets<F: FnMut(PointerOffset)>(&self, mut callback: F) {
             for (n, segment_details) in self.storage.get().segment_details.iter().enumerate() {
                 segment_details.used_chunk_list.remove_all(|index| {

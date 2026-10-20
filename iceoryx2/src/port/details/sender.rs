@@ -535,6 +535,10 @@ impl<Service: service::Service, Resource: ServiceResource> Sender<Service, Resou
                                         iceoryx2_cal::shm_allocator::pool_allocator::Config {
                                             bucket_layout: layout,
                                         };
+                                    // AddSegmentOk carries the per-port index (1..=254).
+                                    let segment_id = iceoryx2_cal::shm_allocator::SegmentId::new(
+                                        segment_id.value() as u8,
+                                    );
                                     if let Err(e) =
                                         self.data_segment.add_segment(segment_id, handle, &config)
                                     {
@@ -613,6 +617,17 @@ impl<Service: service::Service, Resource: ServiceResource> Sender<Service, Resou
                 }
             }
         }
+    }
+
+    /// Returns `true` while a connected receiver still holds (or has not yet taken) samples this
+    /// sender delivered. Reclaims returned samples first.
+    pub(crate) fn has_samples_in_flight(&self) -> bool {
+        self.retrieve_returned_chunks();
+        (0..self.len()).any(|i| {
+            self.get(i)
+                .as_ref()
+                .is_some_and(|connection| connection.sender.has_samples_in_flight())
+        })
     }
 
     pub(crate) fn untrack_chunk(&self, offset: PointerOffset) -> u64 {

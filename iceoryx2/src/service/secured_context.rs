@@ -52,7 +52,7 @@ use iceoryx2_cal::security::handle::PlatformHandle;
 
 use iceoryx2_cal::control_channel::ControlChannelClient as CalClient;
 
-use iceoryx2_cal::shm_allocator::SegmentId;
+use crate::iam::protocol::SegmentId;
 
 use crate::iam::client::IamClient;
 use crate::iam::error::IamClientError;
@@ -109,6 +109,9 @@ pub(crate) trait ErasedSecuredContext: Send + Sync {
 
     /// Returns true if the IAM client is active.
     fn is_active(&self) -> bool;
+
+    /// Returns true if the IAM server closed the connection (see [`IamClient::is_server_closed`]).
+    fn is_server_closed(&self) -> bool;
 
     /// Returns the session ID.
     fn session_id(&self) -> SessionId;
@@ -253,6 +256,11 @@ impl TypeErasedSecuredContext {
     }
 
     /// Attaches as a publisher to the service.
+    /// Returns true if the IAM server closed the connection: the service's creator is gone.
+    pub fn is_server_closed(&self) -> bool {
+        self.inner.is_server_closed()
+    }
+
     pub fn attach_publisher(
         &self,
         history_size: usize,
@@ -812,6 +820,14 @@ impl<C: CalClient + Send + 'static> ErasedSecuredContext for SecuredServiceConte
 
     fn is_active(&self) -> bool {
         SecuredServiceContext::is_active(self)
+    }
+
+    fn is_server_closed(&self) -> bool {
+        // A request in flight holds the lock: the server is evidently there to answer it.
+        match self.client.try_lock() {
+            Ok(client) => client.is_server_closed(),
+            Err(_) => false,
+        }
     }
 
     fn session_id(&self) -> SessionId {

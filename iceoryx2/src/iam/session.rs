@@ -42,12 +42,12 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
+use super::protocol::SegmentId;
 use iceoryx2_cal::security::credentials::ProcessCredentials;
-use iceoryx2_cal::shm_allocator::SegmentId;
 
 /// Type alias for segment ID underlying value used in sets.
 /// We use the underlying u8 value since SegmentId doesn't implement Hash/Ord.
-type SegmentIdValue = u8;
+type SegmentIdValue = u32;
 
 use super::PortType;
 use super::protocol::SessionId;

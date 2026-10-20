@@ -344,6 +344,9 @@ impl<
                 number_of_channels: 1,
                 connection_storage: UnsafeCell::new(SlotMap::new(number_of_connections)),
                 initial_channel_state: CHANNEL_STATE_OPEN,
+                receive_cursor: core::cell::Cell::new(0),
+                has_failed_connections: core::cell::Cell::new(false),
+                last_secured_housekeeping: core::cell::Cell::new(None),
             },
         });
 
@@ -484,14 +487,25 @@ impl<
         // In secured mode the connection channel is created by the producer and brokered by
         // handle; a consumer that discovered the producer before it registered the channel gets no
         // handle on the first attempt. The peer-list change counter is edge-triggered and will not
-        // fire again for an already-known producer, so re-attempt every cycle in secured mode. The
-        // public (non-secured) path keeps the edge-gated behaviour byte-for-byte.
-        let force_secured = subscriber_shared_state
-            .receiver
+        // fire again for an already-known producer, so failed connections are retried by the
+        // periodic housekeeping (not on every call: that cost two walks over all publisher slots
+        // and an IAM syscall per received sample). The public (non-secured) path keeps the
+        // edge-gated behaviour byte-for-byte.
+        let receiver = &subscriber_shared_state.receiver;
+        let mut force_secured = false;
+        if receiver
             .service_state
             .additional_resource()
             .as_client()
-            .is_some();
+            .is_some()
+            && receiver.secured_housekeeping_due()
+        {
+            if receiver.has_failed_connections.get() {
+                force_secured = true;
+            } else {
+                receiver.poll_iam_notifications();
+            }
+        }
         if connections_changed || force_secured {
             fail!(from self, when Self::force_update_connections(&subscriber_shared_state),
                 "Connections were updated only partially since at least one connection to a publisher failed.");

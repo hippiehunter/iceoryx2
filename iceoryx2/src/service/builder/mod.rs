@@ -400,8 +400,26 @@ impl<ServiceType: service::Service> BuilderWithServiceType<ServiceType> {
         // If the flux_counter is greater than 1 we know that we had some ping-pongs between open
         // and it did not exist and create where it no longer existed. This defines a system in
         // flux where the service is repeatedly created and destroyed.
+        let mut reclaim_checked = false;
         loop {
             let mut try_create_service = true;
+            // A secured service whose creator died while others still use it can be neither
+            // opened nor created; a process of the creator's uid takes it over (once).
+            if !reclaim_checked
+                && self
+                    .shared_node
+                    .config()
+                    .global
+                    .node
+                    .security
+                    .mode
+                    .is_secured()
+            {
+                reclaim_checked = true;
+                if let Ok(Some((static_config, _))) = self.is_service_available(msg) {
+                    secured::reclaim_orphaned_service(&self.shared_node, &static_config);
+                }
+            }
             match open_call(attributes) {
                 Ok(service) => return Ok(service),
                 Err(e) => {

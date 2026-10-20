@@ -552,7 +552,17 @@ impl<S: Service, R: ServiceResource> Drop for ServiceState<S, R> {
                             self.static_config.name(), hash);
                 }
                 Ok(DeregisterNodeState::NoMoreOwners) => {
-                    self.static_storage.acquire_ownership();
+                    // A reclaimed (orphaned) service may have been created again under the same
+                    // name: its static config must not be removed by the last user of the old
+                    // incarnation.
+                    let still_ours = match read_static_service_config::<S>(self.shared_node.config(), hash) {
+                        Ok(Some(on_disk)) => on_disk.unique_service_id() == self.static_config.unique_service_id(),
+                        Ok(None) => false,
+                        Err(_) => true,
+                    };
+                    if still_ours {
+                        self.static_storage.acquire_ownership();
+                    }
                     self.dynamic_storage.acquire_ownership();
                     self.additional_resource.acquire_ownership();
                     trace!(from origin, "close and remove service: {} ({:?})",

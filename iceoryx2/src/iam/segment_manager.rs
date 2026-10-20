@@ -49,12 +49,19 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use super::protocol::SegmentId;
 use iceoryx2_cal::security::AccessRights;
 use iceoryx2_cal::security::handle::PlatformHandle;
-use iceoryx2_cal::shm_allocator::SegmentId;
 
 /// Type alias for segment ID underlying value used as map key.
-type SegmentIdKey = u8;
+type SegmentIdKey = u32;
+
+/// Marks an unused slot in a port's segment vector (never handed out as a segment id).
+const PLACEHOLDER: SegmentId = SegmentId::new(u32::MAX);
+
+/// Largest per-port segment index (a producer's pointer offsets carry a `u8` segment id; `255`
+/// is reserved, `0` is the port's initial segment).
+const MAX_PORT_SEGMENT_INDEX: u8 = 254;
 
 use super::error::IamServerError;
 use super::protocol::{SegmentInfo, SessionId};
@@ -186,7 +193,7 @@ pub struct SegmentManager {
     /// Counter for generating unique segment IDs.
     ///
     /// Uses u8 since SegmentId is based on u8.
-    next_id: u8,
+    next_id: u32,
 }
 
 impl Default for SegmentManager {
@@ -347,7 +354,7 @@ impl SegmentManager {
     /// producer's segment id for every producer — including multi-producer services, where
     /// the global [`allocate_segment_id`] counter diverges from per-port push order.
     ///
-    /// Gaps are filled with the placeholder marker `SegmentId::new(255)`, exactly like
+    /// Gaps are filled with the placeholder marker `PLACEHOLDER`, exactly like
     /// [`register_dynamic_segment_for_port`], so an out-of-order or non-contiguous index does
     /// not shift the meaning of already-placed slots.
     ///
@@ -372,12 +379,12 @@ impl SegmentManager {
         let segments = self.port_segments.entry(port_id).or_default();
 
         // Ensure the vector is large enough to hold this index, filling any gap with the
-        // placeholder marker (SegmentId::new(255)).
+        // placeholder marker (PLACEHOLDER).
         while segments.len() <= index as usize {
             if segments.len() == index as usize {
                 segments.push(segment_id);
             } else {
-                segments.push(SegmentId::new(255));
+                segments.push(PLACEHOLDER);
             }
         }
 
@@ -389,54 +396,48 @@ impl SegmentManager {
         Ok(())
     }
 
-    /// Allocates the next available segment ID.
+    /// Allocates the next available server-wide segment ID.
     ///
-    /// This handles wrapping and checking for ID collisions.
+    /// Ids are 32-bit and wrap around, skipping ids in use, `0` and the placeholder marker
+    /// (`u32::MAX`, which marks gaps in `port_segments`). They name handles held by this server
+    /// and are unrelated to the `u8` segment ids in a producer's pointer offsets, which are
+    /// per-port indices into `port_segments[port]` (`0` for the port's initial segment, growth
+    /// segments from [`allocate_port_segment_index`](Self::allocate_port_segment_index)).
     ///
-    /// `SegmentId` values `0` and `255` are permanently **reserved** and are never handed out, so
-    /// the usable id range is `1..=254` (254 ids):
-    ///   * `255` (`SegmentId::max_segment_id()`) is the gap/placeholder marker in `port_segments`
-    ///     (see `register_dynamic_segment_for_port` / `associate_segment_with_port_at_index`), and
-    ///     `get_dynamic_segment_handle` treats it as "no segment". Keeping it out of the allocation
-    ///     range means a real segment can never collide with the sentinel and be silently dropped,
-    ///     and — because the largest handed-out id is `254` — a producer can never index its
-    ///     `segment_states` (length `max_number_of_segments` == 255, valid indices `0..=254`) out
-    ///     of bounds.
-    ///   * `0` is reserved for each port's **initial** dynamic segment. The initial is stored at
-    ///     the fixed slot `port_segments[port][0]` (`register_dynamic_segment_for_port` with
-    ///     `segment_index == 0`) and its offsets carry the *local* id `0`, whereas **growth**
-    ///     segments are stored at `port_segments[port][global_id]`
-    ///     (`associate_segment_with_port_at_index`) and their offsets carry the adopted
-    ///     *server-global* id. If a growth segment were ever handed global id `0` it would be
-    ///     placed at index `0` and overwrite the initial's slot — a later consumer requesting
-    ///     index `0` would then map the differently-sized growth segment and read out of bounds.
-    ///     Reserving `0` keeps growth ids in `1..=254`, disjoint from the initial's fixed
-    ///     index-`0` slot.
+    /// # Errors
+    ///
+    /// [`IamServerError::ResourceLimitExceeded`] when all 2^32 - 2 ids are in use.
     pub fn allocate_segment_id(&mut self) -> Result<SegmentId, IamServerError> {
-        // 0 and 255 are reserved (see the doc comment); the usable id range is 1..=254.
-        const RESERVED_SENTINEL: u8 = 255;
-        const RESERVED_INITIAL: u8 = 0;
+        // 0 and the placeholder are never handed out.
         let start_id = self.next_id;
-
         loop {
             let candidate = self.next_id;
             self.next_id = self.next_id.wrapping_add(1);
-
-            // The candidate is usable if it is neither reserved value nor already in use.
-            if candidate != RESERVED_SENTINEL
-                && candidate != RESERVED_INITIAL
+            if candidate != 0
+                && candidate != PLACEHOLDER.value()
                 && !self.segments.contains_key(&candidate)
             {
                 return Ok(SegmentId::new(candidate));
             }
-
-            // If we've wrapped around completely, we're out of IDs. The scan advances `next_id` by
-            // one every iteration and stops when it returns to `start_id`, so it always terminates
-            // after at most 256 iterations regardless of how many values are reserved or in use.
             if self.next_id == start_id {
                 return Err(IamServerError::ResourceLimitExceeded);
             }
         }
+    }
+
+    /// Allocates the per-port segment index for a new **growth** segment of `port_id`: the
+    /// smallest index in `1..=254` that is not occupied in the port's segment vector. Index `0`
+    /// is the port's initial segment. The producer stamps this index into its pointer offsets,
+    /// so it only has to be unique within the port; the server-wide handle id is separate
+    /// ([`allocate_segment_id`](Self::allocate_segment_id)).
+    ///
+    /// Returns `None` when the port already has 254 growth segments.
+    pub fn allocate_port_segment_index(&self, port_id: u128) -> Option<u8> {
+        let used = self.port_segments.get(&port_id);
+        (1..=MAX_PORT_SEGMENT_INDEX).find(|&index| match used.and_then(|v| v.get(index as usize)) {
+            None => true,
+            Some(id) => *id == PLACEHOLDER || !self.segments.contains_key(&id.value()),
+        })
     }
 
     /// Removes a segment without the retirement protocol.
@@ -485,17 +486,21 @@ impl SegmentManager {
     ///
     /// [`allocate_segment_id`]: Self::allocate_segment_id
     /// [`revoke_session`]: Self::revoke_session
-    pub fn remove_all_segments_for_port(&mut self, port_id: u128) {
+    pub fn remove_all_segments_for_port(&mut self, port_id: u128) -> Vec<SegmentId> {
+        let mut removed = Vec::new();
         if let Some(segment_ids) = self.port_segments.remove(&port_id) {
             for segment_id in segment_ids {
                 // Skip the reserved gap sentinel; it is never a live segment.
-                if segment_id.value() == 255 {
+                if segment_id == PLACEHOLDER {
                     continue;
                 }
                 // Dropping the removed ManagedSegment drops its PlatformHandle → closes the fd.
-                self.segments.remove(&segment_id.value());
+                if self.segments.remove(&segment_id.value()).is_some() {
+                    removed.push(segment_id);
+                }
             }
         }
+        removed
     }
 
     // ========================================================================
@@ -608,9 +613,9 @@ impl SegmentManager {
             if segments.len() == segment_index as usize {
                 segments.push(segment_id);
             } else {
-                // Push a placeholder (SegmentId::new(255) as invalid marker)
+                // Push a placeholder (PLACEHOLDER as invalid marker)
                 // This handles gaps if segments are registered out of order
-                segments.push(SegmentId::new(255));
+                segments.push(PLACEHOLDER);
             }
         }
 
@@ -647,8 +652,7 @@ impl SegmentManager {
         let segment_ids = self.port_segments.get(&port_id)?;
         let segment_id = segment_ids.get(segment_index as usize)?;
 
-        // Check for placeholder (invalid segment ID 255)
-        if segment_id.value() == 255 {
+        if *segment_id == PLACEHOLDER {
             return None;
         }
 
@@ -1140,7 +1144,7 @@ mod tests {
                 .register_segment(handle, (i + 1) * 1024, AccessRights::read_write())
                 .unwrap();
             // Id 0 is reserved, so the sequence starts at 1: 1, 2, 3, 4, 5.
-            assert_eq!(segment_id.value(), i as u8 + 1);
+            assert_eq!(segment_id.value(), i as u32 + 1);
         }
 
         assert_eq!(manager.segment_count(), 5);
@@ -1829,10 +1833,10 @@ mod tests {
         assert_eq!(seg_b.value(), 5);
 
         manager
-            .associate_segment_with_port_at_index(seg_a, port_id, seg_a.value())
+            .associate_segment_with_port_at_index(seg_a, port_id, seg_a.value() as u8)
             .unwrap();
         manager
-            .associate_segment_with_port_at_index(seg_b, port_id, seg_b.value())
+            .associate_segment_with_port_at_index(seg_b, port_id, seg_b.value() as u8)
             .unwrap();
 
         // port_segments must be aligned so that port_segments[i] holds the segment whose id
@@ -1840,10 +1844,10 @@ mod tests {
         let segments = manager.get_segments_for_port(port_id);
         assert_eq!(segments.len(), 6);
         assert_eq!(segments[0].value(), seg_initial.value()); // initial data segment (id 1)
-        assert_eq!(segments[1].value(), 255); // gap placeholder
-        assert_eq!(segments[2].value(), 255); // gap placeholder (another producer's id 2)
+        assert_eq!(segments[1], PLACEHOLDER); // gap placeholder
+        assert_eq!(segments[2], PLACEHOLDER); // gap placeholder (another producer's id 2)
         assert_eq!(segments[3].value(), 3); // runtime segment id 3
-        assert_eq!(segments[4].value(), 255); // gap placeholder (another producer's id 4)
+        assert_eq!(segments[4], PLACEHOLDER); // gap placeholder (another producer's id 4)
         assert_eq!(segments[5].value(), 5); // runtime segment id 5
 
         // A consumer requesting by offset.segment_id().value() resolves the correct handle.
@@ -2033,8 +2037,8 @@ mod tests {
             .unwrap();
         let segments = manager.get_segments_for_port(port_id);
         assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].value(), 255);
-        assert_eq!(segments[1].value(), 255);
+        assert_eq!(segments[0], PLACEHOLDER);
+        assert_eq!(segments[1], PLACEHOLDER);
         assert_eq!(segments[2].value(), seg.value());
 
         // Reaping must skip the 255 gap markers and only remove the real segment.
@@ -2057,73 +2061,95 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_allocate_segment_id_never_returns_255_across_wrap() {
+    fn test_allocate_segment_id_skips_reserved_ids_across_wrap() {
         let mut manager = SegmentManager::new();
-        // Drive the monotonic counter right up to the wrap point so the sequence crosses 255.
-        manager.next_id = 250;
+        // Drive the counter right up to the wrap point: the placeholder (u32::MAX) and 0 are
+        // never handed out.
+        manager.next_id = u32::MAX - 3;
 
         let mut allocated = Vec::new();
-        for _ in 0..12 {
+        for _ in 0..8 {
             let id = manager.allocate_segment_id().unwrap();
-            // 255 is the reserved gap sentinel and must never be handed out.
-            assert_ne!(id.value(), 255);
+            assert_ne!(id, PLACEHOLDER);
             allocated.push(id.value());
         }
-
-        // The sequence crosses the wrap point: 250..=254, then 255 AND 0 are SKIPPED, then 1, 2...
         assert_eq!(
             allocated,
-            vec![250, 251, 252, 253, 254, 1, 2, 3, 4, 5, 6, 7]
+            vec![u32::MAX - 3, u32::MAX - 2, u32::MAX - 1, 1, 2, 3, 4, 5]
         );
     }
 
-    // R2: neither reserved id (0 or 255) may ever be handed out across a full wrap of the id
-    // space. 0 is reserved because the initial dynamic segment occupies each port's fixed
-    // port_segments index 0; a growth segment handed id 0 would overwrite that slot and a fresh
-    // consumer requesting index 0 would map the wrong-sized segment and read out of bounds.
+    // Many producers on one server: each port's initial dynamic segment takes a server-wide id,
+    // which is no longer limited to the 254 values of a u8 (formerly the 255th producer's
+    // registration failed and its session was dropped).
     #[test]
-    fn test_allocate_segment_id_never_returns_0_or_255_across_full_wrap() {
+    fn test_more_than_254_producers_register_their_initial_segments() {
         let mut manager = SegmentManager::new();
-        manager.next_id = 0;
-
-        // A full wrap yields exactly the 254 usable ids 1..=254, each exactly once, never 0/255.
-        let mut allocated = Vec::new();
-        loop {
-            let id = manager
-                .allocate_segment_id()
-                .expect("254 ids must be allocatable before exhaustion");
-            assert_ne!(
-                id.value(),
-                0,
-                "id 0 is reserved for the initial-segment slot"
-            );
-            assert_ne!(id.value(), 255, "id 255 is the reserved gap sentinel");
-            // Occupy the id so the allocator advances and eventually exhausts.
-            manager.segments.insert(
-                id.value(),
-                ManagedSegment::new(id, create_test_handle(), 4096, AccessRights::read_write()),
-            );
-            allocated.push(id.value());
-            if allocated.len() == 254 {
-                break;
-            }
+        let session = SessionId::from_value(3);
+        const PRODUCERS: u128 = 2000;
+        for port in 1..=PRODUCERS {
+            manager
+                .register_dynamic_segment_for_port(
+                    port,
+                    0,
+                    create_test_handle(),
+                    4096,
+                    AccessRights::read_only(),
+                )
+                .unwrap();
         }
-        allocated.sort_unstable();
-        let expected: Vec<u8> = (1..=254).collect();
-        assert_eq!(allocated, expected);
+        assert_eq!(manager.segment_count(), PRODUCERS as usize);
+        for port in [1, 254, 255, 1000, PRODUCERS] {
+            assert!(
+                manager
+                    .get_dynamic_segment_handle(port, 0, session)
+                    .is_some()
+            );
+        }
+        // Reaping one port frees exactly its segment.
+        assert_eq!(manager.remove_all_segments_for_port(255).len(), 1);
+        assert_eq!(manager.segment_count(), PRODUCERS as usize - 1);
+    }
 
-        // With all 254 usable ids occupied the allocator reports exhaustion rather than looping
-        // forever or returning a reserved value.
-        assert!(matches!(
-            manager.allocate_segment_id(),
-            Err(IamServerError::ResourceLimitExceeded)
-        ));
+    // Growth-segment indices are per port: 1..=254 for every port, independent of other ports.
+    #[test]
+    fn test_port_segment_indices_are_per_port() {
+        let mut manager = SegmentManager::new();
+        let (a, b): (u128, u128) = (0xA, 0xB);
+        for port in [a, b] {
+            manager
+                .register_dynamic_segment_for_port(
+                    port,
+                    0,
+                    create_test_handle(),
+                    4096,
+                    AccessRights::read_only(),
+                )
+                .unwrap();
+        }
+        let mut indices = Vec::new();
+        while let Some(index) = manager.allocate_port_segment_index(a) {
+            let seg = manager
+                .register_segment(create_test_handle(), 4096, AccessRights::read_write())
+                .unwrap();
+            manager
+                .associate_segment_with_port_at_index(seg, a, index)
+                .unwrap();
+            indices.push(index);
+        }
+        assert_eq!(indices, (1..=254).collect::<Vec<u8>>());
+        // The other port still starts at 1.
+        assert_eq!(manager.allocate_port_segment_index(b), Some(1));
+        // A reaped growth segment frees its index for reuse.
+        let seg3 = manager.get_segments_for_port(a)[3];
+        manager.segments.remove(&seg3.value());
+        assert_eq!(manager.allocate_port_segment_index(a), Some(3));
     }
 
     // R2: a growth segment can never overwrite a port's initial (index-0) slot, because growth
-    // ids are drawn from 1..=254 and the initial always lives at the fixed index 0. This models
-    // the server placement: initial via register_dynamic_segment_for_port(_, 0), growth via
-    // associate_segment_with_port_at_index(seg, _, seg.value()).
+    // indices are drawn from 1..=254 per port and the initial always lives at the fixed index 0.
+    // This models the server placement: initial via register_dynamic_segment_for_port(_, 0),
+    // growth via associate_segment_with_port_at_index(seg, _, allocate_port_segment_index(_)).
     #[test]
     fn test_growth_segment_never_overwrites_initial_index_0_slot() {
         let mut manager = SegmentManager::new();
@@ -2147,15 +2173,17 @@ mod tests {
         );
 
         // Drive the global counter across the wrap point and place many growth segments at
-        // index == their global id. No growth id is ever 0, so index 0 is never targeted.
-        manager.next_id = 250;
+        // their per-port index, which is never 0.
+        manager.next_id = u32::MAX - 10;
         for _ in 0..20 {
             let seg = manager
                 .register_segment(create_test_handle(), 4096, AccessRights::read_write())
                 .unwrap();
             assert_ne!(seg.value(), 0, "growth ids must never be 0");
+            let index = manager.allocate_port_segment_index(port_id).unwrap();
+            assert_ne!(index, 0, "growth indices must never be 0");
             manager
-                .associate_segment_with_port_at_index(seg, port_id, seg.value())
+                .associate_segment_with_port_at_index(seg, port_id, index)
                 .unwrap();
         }
 
@@ -2169,27 +2197,22 @@ mod tests {
     }
 
     #[test]
-    fn test_register_segment_skips_255_across_wrap() {
+    fn test_register_segment_skips_reserved_ids_across_wrap() {
         let mut manager = SegmentManager::new();
-        manager.next_id = 252;
+        manager.next_id = u32::MAX - 3;
 
-        // register_segment allocates through allocate_segment_id, so real registrations must also
-        // skip 255 (and 0) while crossing the wrap point.
+        // register_segment allocates through allocate_segment_id, so real registrations also
+        // skip the placeholder (u32::MAX) and 0 while crossing the wrap point.
         let mut ids = Vec::new();
         for _ in 0..6 {
             let id = manager
                 .register_segment(create_test_handle(), 4096, AccessRights::read_write())
                 .unwrap();
-            assert_ne!(
-                id.value(),
-                255,
-                "255 is reserved and must never be allocated"
-            );
+            assert_ne!(id, PLACEHOLDER);
             assert_ne!(id.value(), 0, "0 is reserved and must never be allocated");
             ids.push(id.value());
         }
-        // 252, 253, 254, (255 skipped), (0 skipped), 1, 2, 3
-        assert_eq!(ids, vec![252, 253, 254, 1, 2, 3]);
+        assert_eq!(ids, vec![u32::MAX - 3, u32::MAX - 2, u32::MAX - 1, 1, 2, 3]);
     }
 
     #[test]

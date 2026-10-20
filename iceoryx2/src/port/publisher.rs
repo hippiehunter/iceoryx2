@@ -755,6 +755,20 @@ impl<
         })
     }
 
+    /// Returns `true` while a connected [`Subscriber`](crate::port::subscriber::Subscriber) has
+    /// not yet received and released every sample this [`Publisher`] sent to it.
+    ///
+    /// A [`Publisher`] that is dropped before that point takes its data segment with it (named
+    /// segments are removed, IAM-brokered handles are released), so a subscriber that had not
+    /// mapped the segment yet loses those samples. A short-lived publisher that must not lose
+    /// what it sent waits (bounded) until this returns `false` before it is dropped.
+    pub fn has_samples_in_flight(&self) -> bool {
+        self.publisher_shared_state
+            .lock()
+            .sender
+            .has_samples_in_flight()
+    }
+
     /// Returns the [`UniquePublisherId`] of the [`Publisher`]
     pub fn id(&self) -> UniquePublisherId {
         self.publisher_details.publisher_id

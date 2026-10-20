@@ -59,6 +59,7 @@ iceoryx2-bb-print = { workspace = true }
 iceoryx2-bb-si-units = { workspace = true }
 iceoryx2-bb-system-types = { workspace = true }
 iceoryx2-pal-configuration = { workspace = true }
+iceoryx2-pal-posix = { workspace = true }
 
 flatbuffers = { workspace = true }
 serde = { workspace = true }
@@ -73,6 +74,9 @@ iceoryx2-bb-testing = { workspace = true, features = ["std"] }
 iceoryx2-pal-posix = { workspace = true }
 iceoryx2-pal-testing = { workspace = true }
 postcard = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+iceoryx2-pal-os-api = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true }

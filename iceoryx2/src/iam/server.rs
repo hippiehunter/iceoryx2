@@ -74,19 +74,22 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use iceoryx2_log::warn;
+
+use super::protocol::SegmentId;
 use iceoryx2_cal::control_channel::{
     ControlChannelConnection as CalConnection, ControlChannelListener as CalListener,
 };
 use iceoryx2_cal::security::AccessRights;
 use iceoryx2_cal::security::credentials::ProcessCredentials;
 use iceoryx2_cal::security::handle::PlatformHandle;
-use iceoryx2_cal::shm_allocator::SegmentId;
 
 use super::audit::{AuditEvent, AuditEventKind, AuditLogger};
 use super::error::IamServerError;
 use super::policy::{IamPolicy, PolicyDecision, ResourceLimits};
+use super::poller::Poller;
 use super::protocol::{
     DenialReason, IamNotification, IamRequest, IamResponse, MessagingPatternKind, PortType,
     ProtocolVersion, SessionId,
@@ -181,6 +184,13 @@ struct PendingDeparture {
     orphaned_ports: Vec<u128>,
 }
 
+/// Creates the readiness poller for `listener` (Linux, listener with a descriptor), or `None`.
+fn make_poller<L: CalListener>(listener: &L) -> Option<Arc<Poller>> {
+    let fd = listener.readiness_fd()?;
+    let poller = Poller::new()?;
+    poller.add(fd).then_some(Arc::new(poller))
+}
+
 // ============================================================================
 // IamServerBuilder
 // ============================================================================
@@ -265,7 +275,9 @@ impl<L: CalListener, P: IamPolicy> IamServerBuilder<L, P> {
     /// Builds the [`IamServer`].
     pub fn build(self) -> IamServer<L, P> {
         IamServer {
+            poller: make_poller(&self.listener),
             listener: self.listener,
+            fd_sessions: HashMap::new(),
             sessions: HashMap::new(),
             segment_manager: SegmentManager::new(),
             policy: self.policy,
@@ -310,6 +322,10 @@ impl<L: CalListener, P: IamPolicy> IamServerBuilder<L, P> {
 pub struct IamServer<L: CalListener, P: IamPolicy> {
     /// The listener for accepting new connections.
     listener: L,
+    /// Readiness poller over the listener and the session sockets (Linux), see `poller.rs`.
+    poller: Option<Arc<Poller>>,
+    /// Session of each polled connection descriptor.
+    fd_sessions: HashMap<i32, SessionId>,
     /// Active sessions indexed by session ID.
     sessions: HashMap<SessionId, SessionEntry<L::Connection>>,
     /// Segment manager for shared memory lifecycle.
@@ -358,6 +374,8 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
     /// * `policy` - The policy for authorization decisions
     pub fn new(listener: L, policy: P) -> Self {
         Self {
+            poller: make_poller(&listener),
+            fd_sessions: HashMap::new(),
             listener,
             sessions: HashMap::new(),
             segment_manager: SegmentManager::new(),
@@ -392,6 +410,8 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         segment_factory: Arc<dyn SegmentFactory>,
     ) -> Self {
         Self {
+            poller: make_poller(&listener),
+            fd_sessions: HashMap::new(),
             listener,
             sessions: HashMap::new(),
             segment_manager: SegmentManager::new(),
@@ -425,6 +445,8 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         audit_logger: Option<Box<dyn AuditLogger>>,
     ) -> Self {
         Self {
+            poller: make_poller(&listener),
+            fd_sessions: HashMap::new(),
             listener,
             sessions: HashMap::new(),
             segment_manager: SegmentManager::new(),
@@ -460,6 +482,8 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         segment_factory: Arc<dyn SegmentFactory>,
     ) -> Self {
         Self {
+            poller: make_poller(&listener),
+            fd_sessions: HashMap::new(),
             listener,
             sessions: HashMap::new(),
             segment_manager: SegmentManager::new(),
@@ -538,14 +562,7 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
     pub fn process(&mut self) -> Result<usize, IamServerError> {
         let mut processed = 0;
 
-        // Accept new connections
-        while let Some(connection) = self
-            .listener
-            .try_accept()
-            .map_err(|_| IamServerError::AcceptFailed)?
-        {
-            self.handle_new_connection(connection)?;
-        }
+        self.accept_pending();
 
         // Process requests from existing sessions
         let session_ids: Vec<SessionId> = self.sessions.keys().copied().collect();
@@ -565,6 +582,65 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         Ok(processed)
     }
 
+    /// Accepts every pending connection. A failing `accept` (for example `EMFILE`) or a peer
+    /// whose credentials cannot be read must not stop the server from serving the sessions it
+    /// already has, so errors end the accept loop for this pass instead of the whole pass.
+    fn accept_pending(&mut self) {
+        loop {
+            match self.listener.try_accept() {
+                Ok(Some(connection)) => {
+                    if let Err(e) = self.handle_new_connection(connection) {
+                        warn!(from "IamServer::accept_pending", "Dropped a new IAM connection ({:?}).", e);
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(from "IamServer::accept_pending", "Unable to accept IAM connections ({:?}).", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The readiness poller, when the platform and the listener support one.
+    pub(crate) fn poller(&self) -> Option<Arc<Poller>> {
+        self.poller.clone()
+    }
+
+    /// Whether departed peers are waiting for retention / grace handling (time based work).
+    pub(crate) fn has_pending_departures(&self) -> bool {
+        !self.pending_departures.is_empty()
+    }
+
+    /// Serves the descriptors a [`Poller`] reported ready: accepts pending connections and
+    /// handles up to [`MAX_REQUESTS_PER_WAKEUP`] requests of every ready session, then the
+    /// departures. Returns the number of requests handled.
+    pub(crate) fn process_ready(&mut self, ready: &[i32]) -> usize {
+        let listener_fd = self.listener.readiness_fd();
+        let mut processed = 0;
+        for fd in ready {
+            if Some(*fd) == listener_fd {
+                self.accept_pending();
+                continue;
+            }
+            let Some(session_id) = self.fd_sessions.get(fd).copied() else {
+                continue;
+            };
+            for _ in 0..MAX_REQUESTS_PER_WAKEUP {
+                match self.process_session_requests(session_id) {
+                    Ok(0) => break,
+                    Ok(count) => processed += count,
+                    Err(_) => {
+                        self.remove_session(session_id);
+                        break;
+                    }
+                }
+            }
+        }
+        self.process_departures();
+        processed
+    }
+
     /// Hands every departed peer node to the departure handler (after the retention period)
     /// until it completed or the grace period expired, then releases the handles of the
     /// departed producer ports.
@@ -576,11 +652,10 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         let (retention, grace) = self.departure_timing;
         let mut finished = Vec::new();
         let mut pending = core::mem::take(&mut self.pending_departures);
+        let connected_nodes: HashSet<u128> =
+            self.sessions.values().filter_map(|e| e.node_id).collect();
         pending.retain(|departure| {
-            let reconnected = self
-                .sessions
-                .values()
-                .any(|e| e.node_id == Some(departure.node_id));
+            let reconnected = connected_nodes.contains(&departure.node_id);
             let done = if reconnected {
                 // the node is alive and opened the service again; its old ports are gone
                 true
@@ -609,7 +684,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
 
     /// Releases every handle registered under the (iceoryx2) producer port `port_id`.
     fn reap_producer_port(&mut self, port_id: u128) {
-        self.segment_manager.remove_all_segments_for_port(port_id);
+        for segment_id in self.segment_manager.remove_all_segments_for_port(port_id) {
+            self.segment_factory.release_segment(segment_id);
+        }
         self.segment_manager.remove_mgmt_segment_for_port(port_id);
         self.segment_manager
             .remove_channels_for_sender_port(port_id);
@@ -638,6 +715,11 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         // Create session (not yet fully authenticated - waiting for Hello)
         let session = ClientSession::new(credentials);
         let session_id = session.id();
+        if let (Some(poller), Some(fd)) = (self.poller.as_ref(), connection.readiness_fd())
+            && poller.add(fd)
+        {
+            self.fd_sessions.insert(fd, session_id);
+        }
         self.sessions
             .insert(session_id, SessionEntry::new(session, connection));
 
@@ -1588,7 +1670,17 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             ));
         }
 
-        // Allocate a segment ID
+        // The producer stamps the segment's index within its own segment set into its pointer
+        // offsets (a u8, 0 = initial segment); the handle itself gets a server-wide id.
+        let Some(port_index) = self.segment_manager.allocate_port_segment_index(port_id) else {
+            return Ok((
+                IamResponse::Denied {
+                    reason: DenialReason::ResourceLimitExceeded,
+                    message: String::from("The port already has the maximum number of segments"),
+                },
+                Vec::new(),
+            ));
+        };
         let segment_id = self.segment_manager.allocate_segment_id()?;
 
         // Create the segment using the factory
@@ -1633,19 +1725,13 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             AccessRights::read_write(),
         )?;
 
-        // Associate segment with the port at its explicit SegmentId index.
+        // Associate the segment with the port at its per-port index.
         //
-        // The producer's resizable memory inserts this IAM-returned segment into its slotmap
-        // at `key = segment_id.value()` and stamps that value into every PointerOffset it
-        // produces; the consumer then requests the handle by `offset.segment_id().value()`.
-        // Placing it at `port_segments[segment_id.value()]` (rather than appending) keeps the
-        // handle lookup aligned with the producer's segment id even for multi-producer
-        // services, where the global segment-id counter diverges from per-port push order.
-        self.segment_manager.associate_segment_with_port_at_index(
-            segment_id,
-            port_id,
-            segment_id.value(),
-        )?;
+        // The producer's resizable memory inserts this IAM-returned segment into its slotmap at
+        // `key = port_index` and stamps that value into every PointerOffset it produces; the
+        // consumer then requests the handle by `(port, offset.segment_id().value())`.
+        self.segment_manager
+            .associate_segment_with_port_at_index(segment_id, port_id, port_index)?;
 
         // Update session resource usage
         if let Some(entry) = self.sessions.get_mut(&session_id) {
@@ -1674,7 +1760,7 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
 
         Ok((
             IamResponse::AddSegmentOk {
-                segment_id,
+                segment_id: SegmentId::new(port_index as u32),
                 size: actual_size,
                 handle_count: 1,
             },
@@ -1749,7 +1835,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         // consumer (the request channel where it is the receiver). Reaping only one role's
         // resources therefore leaked the port's other-role fds and global SegmentIds — reopening
         // the id-exhaustion DoS (F2) via clients.
-        self.segment_manager.remove_all_segments_for_port(port_id);
+        for segment_id in self.segment_manager.remove_all_segments_for_port(port_id) {
+            self.segment_factory.release_segment(segment_id);
+        }
         self.segment_manager.remove_mgmt_segment_for_port(port_id);
         self.segment_manager
             .remove_channels_for_sender_port(port_id);
@@ -2432,7 +2520,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
                 // PortType leaked the request-response client's producer resources (data segment +
                 // management segment + request channel as sender) and, symmetrically, the server's
                 // consumer request channel.
-                self.segment_manager.remove_all_segments_for_port(port_id);
+                for segment_id in self.segment_manager.remove_all_segments_for_port(port_id) {
+                    self.segment_factory.release_segment(segment_id);
+                }
                 self.segment_manager.remove_mgmt_segment_for_port(port_id);
                 self.segment_manager
                     .remove_channels_for_sender_port(port_id);
@@ -2509,8 +2599,15 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         // Revoke session from all segments
         self.segment_manager.revoke_session(session_id);
 
-        // Remove session entry
-        self.sessions.remove(&session_id);
+        // Remove session entry (stop polling its socket before it is closed)
+        if let Some(entry) = self.sessions.remove(&session_id)
+            && let Some(fd) = entry.connection.readiness_fd()
+        {
+            if let Some(poller) = self.poller.as_ref() {
+                poller.remove(fd);
+            }
+            self.fd_sessions.remove(&fd);
+        }
     }
 
     /// Broadcasts a segment update notification to all consumers of a service.
@@ -2764,6 +2861,12 @@ pub(crate) trait ErasedIamServer: Send + Sync {
 
     /// Returns true if the server has active sessions.
     fn has_active_sessions(&self) -> bool;
+
+    /// The readiness poller, if the server has one.
+    fn poller(&self) -> Option<Arc<Poller>>;
+
+    /// Serves the ready descriptors; returns how long the next poller wait may block.
+    fn process_ready(&self, ready: &[i32]) -> Duration;
 }
 
 /// Inner wrapper that provides interior mutability for IamServer.
@@ -2802,6 +2905,30 @@ where
             .and_then(|guard| guard.as_ref().map(|s| s.session_count() > 0))
             .unwrap_or(false)
     }
+
+    fn poller(&self) -> Option<Arc<Poller>> {
+        self.server
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|s| s.poller()))
+    }
+
+    fn process_ready(&self, ready: &[i32]) -> Duration {
+        let Ok(mut guard) = self.server.lock() else {
+            return Duration::from_millis(PROCESSING_INTERVAL_MS);
+        };
+        match guard.as_mut() {
+            Some(server) => {
+                server.process_ready(ready);
+                if server.has_pending_departures() {
+                    Duration::from_millis(PROCESSING_INTERVAL_MS)
+                } else {
+                    Duration::from_millis(IDLE_WAIT_MS)
+                }
+            }
+            None => Duration::from_millis(IDLE_WAIT_MS),
+        }
+    }
 }
 
 /// Type-erased IAM server container with background processing.
@@ -2825,10 +2952,16 @@ pub(crate) struct TypeErasedIamServer {
     inner: Arc<dyn ErasedIamServer>,
     shutdown_flag: Arc<AtomicBool>,
     processing_thread: Option<JoinHandle<()>>,
+    poller: Option<Arc<Poller>>,
 }
 
-/// How often to poll for new connections/requests (in milliseconds).
+/// How often to poll for new connections/requests (in milliseconds) where no readiness poller
+/// is available, and the wait bound while departures are pending.
 const PROCESSING_INTERVAL_MS: u64 = 10;
+/// Wait bound of the readiness poller when nothing time based is pending (shutdown wakes it).
+const IDLE_WAIT_MS: u64 = 500;
+/// Requests handled per ready session and wakeup before other sessions get their turn.
+const MAX_REQUESTS_PER_WAKEUP: usize = 32;
 
 impl TypeErasedIamServer {
     /// Creates a new type-erased IAM server with background processing.
@@ -2850,16 +2983,34 @@ impl TypeErasedIamServer {
         let inner_clone = Arc::clone(&inner);
         let shutdown_clone = Arc::clone(&shutdown_flag);
 
+        let poller = inner.poller();
+        let thread_poller = poller.clone();
+
         // Spawn background processing thread
-        let processing_thread = thread::spawn(move || {
-            while !shutdown_clone.load(Ordering::Relaxed) {
-                // Process pending connections and requests
-                if let Err(_e) = inner_clone.process() {
-                    // Log error but continue processing
-                    // In production, we might want to limit error rates
+        let processing_thread = thread::spawn(move || match thread_poller {
+            // Event driven: wait for the listener / sessions with data, serve only those.
+            Some(poller) => {
+                let mut ready = Vec::new();
+                let mut wait = Duration::ZERO;
+                while !shutdown_clone.load(Ordering::Relaxed) {
+                    ready.clear();
+                    poller.wait(wait, &mut ready);
+                    if shutdown_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    wait = inner_clone.process_ready(&ready);
                 }
-                // Sleep briefly to avoid busy-waiting
-                thread::sleep(Duration::from_millis(PROCESSING_INTERVAL_MS));
+            }
+            None => {
+                while !shutdown_clone.load(Ordering::Relaxed) {
+                    // Process pending connections and requests
+                    if let Err(_e) = inner_clone.process() {
+                        // Log error but continue processing
+                        // In production, we might want to limit error rates
+                    }
+                    // Sleep briefly to avoid busy-waiting
+                    thread::sleep(Duration::from_millis(PROCESSING_INTERVAL_MS));
+                }
             }
         });
 
@@ -2867,6 +3018,7 @@ impl TypeErasedIamServer {
             inner,
             shutdown_flag,
             processing_thread: Some(processing_thread),
+            poller,
         }
     }
 
@@ -2876,6 +3028,9 @@ impl TypeErasedIamServer {
     /// Called automatically when the service is dropped.
     pub fn shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::Relaxed);
+        if let Some(poller) = &self.poller {
+            poller.wake();
+        }
         self.inner.shutdown()
     }
 
@@ -2889,6 +3044,9 @@ impl Drop for TypeErasedIamServer {
     fn drop(&mut self) {
         // Signal the processing thread to stop
         self.shutdown_flag.store(true, Ordering::Relaxed);
+        if let Some(poller) = &self.poller {
+            poller.wake();
+        }
 
         // Wait for the processing thread to finish
         if let Some(thread) = self.processing_thread.take() {

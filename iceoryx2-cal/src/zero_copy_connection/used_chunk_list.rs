@@ -147,6 +147,13 @@ pub mod details {
             self.set(value, false)
         }
 
+        /// Returns `true` if no chunk is marked as used.
+        pub fn is_empty(&self) -> bool {
+            self.verify_init("is_empty");
+            (0..self.capacity)
+                .all(|i| !unsafe { (*self.data_ptr.as_ptr().add(i)).load(Ordering::Relaxed) })
+        }
+
         pub fn remove_all<F: FnMut(usize)>(&self, mut callback: F) {
             self.verify_init("pop");
 

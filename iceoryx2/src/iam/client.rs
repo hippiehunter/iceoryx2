@@ -60,10 +60,10 @@
 
 use alloc::vec::Vec;
 
+use super::protocol::SegmentId;
 use iceoryx2_bb_posix::unique_system_id::UniqueSystemId;
 use iceoryx2_cal::control_channel::ControlChannelClient as CalClient;
 use iceoryx2_cal::security::handle::PlatformHandle;
-use iceoryx2_cal::shm_allocator::SegmentId;
 
 use super::error::IamClientError;
 use super::protocol::{
@@ -175,6 +175,16 @@ impl<C: CalClient> IamClient<C> {
     #[must_use]
     pub const fn is_active(&self) -> bool {
         matches!(self.state, ConnectionState::Active)
+    }
+
+    /// Returns `true` when the IAM server closed the connection (the process hosting it, the
+    /// service's creator, exited or crashed) or the client is disconnected. Does not block and
+    /// does not consume pending messages.
+    pub fn is_server_closed(&self) -> bool {
+        match &self.connection {
+            Some(connection) => connection.is_peer_closed(),
+            None => true,
+        }
     }
 
     /// Returns true if the client is connected (but may not have completed handshake).
@@ -2121,7 +2131,7 @@ mod tests {
 
         // Server sends more segments than protocol allows (DoS attempt)
         let too_many_segments: Vec<SegmentInfo> = (0..MAX_SEGMENTS_PER_ATTACH + 1)
-            .map(|i| SegmentInfo::new(SegmentId::new(i as u8), 4096, AccessRights::read_write()))
+            .map(|i| SegmentInfo::new(SegmentId::new(i as u32), 4096, AccessRights::read_write()))
             .collect();
 
         connection.add_response(IamResponse::AttachOk {

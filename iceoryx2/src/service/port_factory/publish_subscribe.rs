@@ -191,6 +191,20 @@ impl<
         PortFactorySubscriber::new(self)
     }
 
+    /// Secured services: returns `true` when the service is orphaned, i.e. the IAM server that
+    /// brokers its resources, hosted by the process that created the service, has gone away
+    /// (that process exited or crashed). Existing ports keep their shared memory, but nothing
+    /// new can be brokered and the creator's ports are gone. Drop the service and open it again
+    /// once the creator is back; a restarted creator reclaims an orphaned service it owns in
+    /// `open_or_create`. Always `false` for public services. Costs one non-blocking syscall.
+    pub fn is_orphaned(&self) -> bool {
+        use crate::service::resource::ServiceResource;
+        self.service
+            .additional_resource()
+            .as_client()
+            .is_some_and(|ctx| ctx.is_server_closed())
+    }
+
     /// Returns a [`PortFactoryPublisher`] to create a new
     /// [`crate::port::publisher::Publisher`] port.
     ///

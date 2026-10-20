@@ -41,6 +41,7 @@ mod integration_tests {
     use core::time::Duration;
     use std::sync::{Arc, Mutex};
 
+    use crate::iam::protocol::SegmentId;
     use iceoryx2_bb_posix::unique_system_id::UniqueSystemId;
     use iceoryx2_bb_system_types::file_name::FileName;
     use iceoryx2_cal::control_channel::{
@@ -53,7 +54,6 @@ mod integration_tests {
     use iceoryx2_cal::security::credentials::ProcessCredentials;
     use iceoryx2_cal::security::handle::PlatformHandle;
     use iceoryx2_cal::serialize::{Serialize as CalSerialize, postcard::Postcard};
-    use iceoryx2_cal::shm_allocator::SegmentId;
 
     use crate::iam::client::IamClient;
     use crate::iam::policy::{DefaultPolicy, IamPolicy, PolicyDecision, ResourceLimits};

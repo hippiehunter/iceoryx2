@@ -231,10 +231,50 @@ Two effects made mass departure slow; only the first one is a defect:
    cleanup-dead-nodes-on-destruction = false
    ```
 
-   `[global.service] cleanup-dead-nodes-on-open` only inspects the nodes of the opened service
-   and can stay enabled; note that in multi-user mode a writer cannot remove another user's
-   files anyway, so it gains little there either. The IAM departure handling of secured services
-   (see above) does not depend on these settings.
+   `[global.service] cleanup-dead-nodes-on-open` inspects every node of the opened service, so
+   N writers opening a service at once cost O(N^2) as well (300 nodes: 223 s with the scans,
+   3.8 s without, debug build). Disable it for the writers and for the broker
+   (`cleanup-dead-nodes-on-open = false`); the broker cleans up dead nodes periodically on a
+   thread of its own. In multi-user mode a writer cannot remove another user's files anyway.
+   The IAM departure handling of secured services (see above) does not depend on these settings.
+
+## Thousands of participants per service
+
+Changes made for SIP's 10,000-writer target (`iceoryx2/tests/secured_scale_tests.rs`):
+
+* **Segment ids (IAM protocol 2.0).** The IAM server used to hand out server-wide `u8` data
+  segment ids (1..=254): the 255th publisher's segment registration failed, its session was
+  dropped, and the subscriber never received from it. The server now keys segments by a
+  server-wide `u32` and returns the segment's index *within its port* (at most 254 growth
+  segments per publisher) in `AddSegmentOk`, which is what the zero-copy connection carries.
+  Clients and servers of protocol 1.x refuse each other.
+* **Event-driven IAM server.** On Linux the server thread waits in `epoll` for the listener and
+  the sessions with data (woken immediately for shutdown) instead of sleeping 10 ms and trying a
+  non-blocking `recv` on every session per pass. It serves up to 32 requests per ready session
+  per wakeup; an `accept` error (e.g. `EMFILE`) no longer aborts the pass. Idle cost no longer
+  grows with the number of sessions. Departures pending retention keep a 10 ms tick.
+* **Subscriber receive.** Secured subscribers no longer force a full connection update (two
+  walks over all publisher slots plus an IAM round trip) on every `receive`; they poll the IAM
+  notifications and retry failed connections at most every 10 ms. `receive` serves publishers
+  round robin from a cursor instead of scanning from slot 0 (which was O(publishers) per sample
+  and starved high slots).
+* **Orphaned services and creator restart.** `PortFactory::is_orphaned()` (publish-subscribe
+  and event) reports, with one non-blocking syscall, that the IAM server of the service's
+  creator is gone. A new process of the creator's uid can `open_or_create` the service again: a
+  dead control endpoint (refused or missing) of a service whose static config it owns and that
+  is older than twice the creation timeout is removed together with the service
+  (`reclaim_orphaned_service`), and a stale endpoint file no longer blocks the exclusive create.
+  Openers fail fast on a refused endpoint instead of waiting for the connect timeout.
+  `ServiceState::drop` only removes the static config if it still belongs to its own
+  incarnation.
+* **Samples in flight.** `Publisher::has_samples_in_flight()` tells a writer whether any
+  subscriber still holds or has not yet received a sample it sent. A publisher that is dropped
+  (or a process that exits) while samples are in flight takes its data segment with it (public:
+  the shm object is removed; secured: the port detach and later the IAM departure release the
+  handles), and a subscriber that had not mapped that segment yet loses those samples ("Lost
+  chunk ... gone out of scope before the receiver has mapped"). Writers that send and then go
+  away should wait until `has_samples_in_flight()` is false (SIP does this event-driven: it
+  notifies the reader and waits on its "space" event).
 
 ## Tests
 
@@ -268,9 +308,9 @@ released and taken over by a writer of another uid. Uids/gids can be overridden 
   There is no `/proc/<pid>/status` fallback; if `SO_PEERGROUPS` fails the supplementary set is
   empty, i.e. group rules only match the primary gid (fail closed). Group membership is the one
   captured at `connect()` time; a user added to `sipwriters` must start a new login session.
-* **Graceful drop before delivery:** a publisher that sends and is dropped before the
-  subscriber connected loses those samples (upstream iceoryx2 semantics, independent of
-  multi-user mode). Writers should keep their publisher alive.
+* **Drop before delivery:** a publisher that sends and is dropped before the subscriber took
+  the samples loses them (upstream iceoryx2 semantics, independent of multi-user mode). Wait
+  for `Publisher::has_samples_in_flight()` to become false before dropping (see above).
 * **Foreign stale files:** files of a dead node belonging to another user remain until that
   user (or root) cleans them up; in sticky directories other users cannot remove them.
   Cleanup attempts by other nodes log warnings and continue.
@@ -287,10 +327,12 @@ released and taken over by a writer of another uid. Uids/gids can be overridden 
   compile-time defaults (`IamServerBuilder::peer_departure_timing`).
 * **No dead-notifier signal:** removing a dead node's ports from IAM cleanup does not emit the
   "notifier dead" event to listeners.
-* **Broker crash:** the IAM socket and the creator's files of a crashed broker cannot be removed
-  by the writers (other users); the restarted broker (same user) has to perform the usual
-  dead-node cleanup before it re-creates the services. A stale IAM socket file of a crashed
-  creator is not removed automatically (not covered by a test).
+* **Creator crash:** the IAM server runs in the creator; after it dies the service is orphaned
+  until a process of the creator's uid reclaims and re-creates it (see "Thousands of
+  participants"). Openers must re-open the service (`is_orphaned()` tells them when); ports of
+  the old incarnation do not migrate. Samples the creator's subscriber had not taken are lost.
+* **Non-Linux IAM server:** the epoll wait is Linux only; elsewhere the server keeps the
+  periodic 10 ms polling loop.
 * **pidfd / PR_SET_DUMPABLE:** departure detection uses EOF on the control socket plus the
   node monitor (file lock) and pid binding, not pidfds. `PR_SET_DUMPABLE` is not set by
   iceoryx2; set it in the application if `/proc/<pid>/mem` access by same-uid processes is a

@@ -734,6 +734,9 @@ impl<
             number_of_channels: number_of_requests_with_max_service_setting,
             connection_storage: UnsafeCell::new(SlotMap::new(number_of_connections)),
             initial_channel_state: CHANNEL_STATE_CLOSED,
+            receive_cursor: core::cell::Cell::new(0),
+            has_failed_connections: core::cell::Cell::new(false),
+            last_secured_housekeeping: core::cell::Cell::new(None),
         };
 
         let client_shared_state = Service::ArcThreadSafetyPolicy::new(ClientSharedState {
