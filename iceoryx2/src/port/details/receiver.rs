@@ -713,15 +713,21 @@ impl<Service: service::Service, Resource: ServiceResource> Receiver<Service, Res
         // Round robin: start at the connection that delivered last and wrap around, so that a
         // drain of K samples from many senders visits every connection about once instead of
         // rescanning from the first connection for every sample (O(N + K) instead of O(K * N)),
-        // and low connection keys are not favoured.
+        // and low connection keys are not favoured. The slots are addressed by key: iterating
+        // the slot map to the cursor would cost O(cursor) for every sample again.
+        let capacity = connection_storage.capacity();
         let start = self.receive_cursor.get();
-        let from_cursor = connection_storage
-            .iter()
-            .skip_while(|(key, _)| key.value() < start);
-        let before_cursor = connection_storage
-            .iter()
-            .take_while(|(key, _)| key.value() < start);
-        for (connection_key, connection) in from_cursor.chain(before_cursor) {
+        let start = if start < capacity { start } else { 0 };
+        for step in 0..capacity {
+            let mut index = start + step;
+            if index >= capacity {
+                index -= capacity;
+            }
+            let connection_key = SlotMapKey::new(index);
+            let connection = match connection_storage.get(connection_key) {
+                Some(connection) => connection,
+                None => continue,
+            };
             if !connection.receiver.has_data(channel_id) {
                 continue;
             }
@@ -738,7 +744,7 @@ impl<Service: service::Service, Resource: ServiceResource> Receiver<Service, Res
             if let Some((details, absolute_address)) =
                 self.receive_from_connection(connection, connection_key, channel_id)?
             {
-                self.receive_cursor.set(connection_key.value());
+                self.receive_cursor.set(index);
                 return Ok(Some((details, absolute_address)));
             }
         }

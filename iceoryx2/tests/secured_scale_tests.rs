@@ -301,4 +301,59 @@ mod secured_scale {
     fn publisher_reports_samples_in_flight_until_received_secured() {
         samples_in_flight_until_received(&secured_config());
     }
+
+    /// Drains one sample from each of `publishers` publishers; returns the best of three
+    /// drain times.
+    fn drain_one_sample_per_publisher(publishers: usize) -> Duration {
+        let mut config = Config::default();
+        config.global.node.cleanup_dead_nodes_on_creation = false;
+        config.global.node.cleanup_dead_nodes_on_destruction = false;
+        let name = unique_service_name("drain_cost");
+        let node = NodeBuilder::new()
+            .config(&config)
+            .create::<ipc::Service>()
+            .unwrap();
+        let service = node
+            .service_builder(&name)
+            .publish_subscribe::<u64>()
+            .max_publishers(publishers)
+            .subscriber_max_buffer_size(2)
+            .create()
+            .unwrap();
+        let subscriber = service.subscriber_builder().create().unwrap();
+        let senders: Vec<_> = (0..publishers)
+            .map(|_| service.publisher_builder().create().unwrap())
+            .collect();
+        let mut best = Duration::MAX;
+        for _ in 0..3 {
+            for (i, sender) in senders.iter().enumerate() {
+                sender.send_copy(i as u64).unwrap();
+            }
+            let started = Instant::now();
+            let mut received = 0;
+            while let Some(sample) = subscriber.receive().unwrap() {
+                drop(sample);
+                received += 1;
+            }
+            best = best.min(started.elapsed());
+            assert_that!(received, eq publishers);
+        }
+        best
+    }
+
+    // Draining one sample from each of N publishers must cost O(N). The round-robin receive
+    // used to walk the connection slot map up to its cursor for every sample (O(N) per sample,
+    // O(N^2) per drain): at 10,000 writers the broker's throughput collapsed to about 13,000
+    // samples/s under load.
+    #[test]
+    fn draining_many_publishers_is_linear() {
+        let small = drain_one_sample_per_publisher(250);
+        let large = drain_one_sample_per_publisher(1000);
+        // linear: about 4x; quadratic: about 16x
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 9.0,
+            "draining 4x the publishers took {ratio:.1}x as long ({small:?} -> {large:?})"
+        );
+    }
 }
