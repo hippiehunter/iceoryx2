@@ -242,7 +242,16 @@ fn secured_cross_uid_opener_is_denied() {
 
     // Opener runs as a DIFFERENT uid. Use a raw Command (the verbatim
     // coordinator has no uid hook) so we can call CommandExt::uid.
-    let mut child = Command::new(CLIENT_EXE)
+    // The build directory is usually inside a private home directory the second uid cannot
+    // traverse; run a copy from the (world-traversable) per-run root instead.
+    let client_exe = format!("{root}iox2-e2e-client");
+    std::fs::copy(CLIENT_EXE, &client_exe).expect("copy client binary");
+    let _ = std::fs::set_permissions(
+        &client_exe,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    );
+
+    let mut child = Command::new(&client_exe)
         .args(args)
         .uid(target_uid)
         .stdout(Stdio::piped())

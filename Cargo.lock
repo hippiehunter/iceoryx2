@@ -1861,6 +1861,7 @@ dependencies = [
  "iceoryx2-bb-loggers",
  "iceoryx2-cal",
  "libc",
+ "serde_json",
 ]
 
 [[package]]

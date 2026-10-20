@@ -23,6 +23,10 @@ path = "bins/src/server.rs"
 name = "iox2-e2e-client"
 path = "bins/src/client.rs"
 
+[[bin]]
+name = "iox2-e2e-mu"
+path = "bins/src/multi_user.rs"
+
 # NOTE (differs from windows-e2e-tests): dependencies are UNCONDITIONAL, not gated
 # under [target.'cfg(windows)'.dependencies]. The coordinator + scenario code are
 # portable and the child binaries perform real cross-process secured IPC on Linux.
@@ -32,3 +36,6 @@ iceoryx2 = { workspace = true, features = ["std"] }
 iceoryx2-cal = { workspace = true, features = ["std"] }
 iceoryx2-bb-loggers = { workspace = true, features = ["std", "console"] }
 libc = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

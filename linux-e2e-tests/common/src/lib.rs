@@ -18,6 +18,9 @@
 //! * [`scenario`] holds the code that MUST be identical in both child binaries:
 //!   the `secured_config()` builder (so the server and client rendezvous on the
 //!   same IAM endpoint) and the shared CLI definition.
+//! * [`multi_user`] holds the cross-uid (multi-user secured mode) scenario: the
+//!   `iox2-e2e-mu` CLI/config and a spawner that runs children as other users.
 
 pub mod coordinator;
+pub mod multi_user;
 pub mod scenario;
