@@ -25,7 +25,18 @@ use iceoryx2_cal::control_channel::{
     ControlChannel, ControlChannelClientBuilder, ControlChannelListenerBuilder,
 };
 use iceoryx2_cal::named_concept::{NamedConceptBuilder, NamedConceptMgmt};
-use iceoryx2_log::debug;
+use iceoryx2_cal::monitoring::State;
+use iceoryx2_cal::named_concept::NamedConceptConfiguration;
+use iceoryx2_cal::security::credentials::ProcessCredentials;
+use iceoryx2_log::{debug, warn};
+
+use crate::iam::audit::{AuditLogger, FileAuditLogger};
+use crate::iam::server::{PeerDepartureHandler, PeerDepartureOutcome};
+use crate::identifiers::UniqueNodeId;
+use crate::node::Node;
+use crate::service::remove_departed_node_from_service;
+use crate::service::service_hash::ServiceHash;
+use crate::unique_id_generator::UniqueId;
 
 use crate::iam::client::IamClient;
 use crate::iam::configured_policy::{PolicyDispatch, PolicyLoadError, PolicyLoader};
@@ -99,12 +110,31 @@ pub(crate) fn create_secured_resource<Service: service::Service>(
             ServiceCreateError::InternalFailure
         })?;
 
+    // Multi-user: hand the control socket to the configured endpoint group. The socket is not
+    // the security boundary (the policy is), so a failure only limits who can connect.
+    #[cfg(unix)]
+    if let Some(gid) = config.global.node.security.endpoint_access().group() {
+        let socket_path = cc_config.path_for(&endpoint);
+        let socket_path = core::str::from_utf8(socket_path.as_bytes()).unwrap_or("");
+        if let Err(e) = std::os::unix::fs::chown(socket_path, None, Some(gid)) {
+            warn!(from origin,
+                "Unable to hand the IAM control socket \"{}\" to the group {} ({}).", socket_path, gid, e);
+        }
+    }
+
     let factory: Arc<dyn SegmentFactory> =
         Arc::new(ServiceSegmentFactory::<Service>::new(config.clone()));
-    let server = IamServerBuilder::new(listener, policy)
+    let mut builder = IamServerBuilder::new(listener, policy)
         .service_name(static_config.name().as_str())
         .segment_factory(factory)
-        .build();
+        .peer_departure_handler(departure_handler::<Service>(
+            config.clone(),
+            *static_config.service_hash(),
+        ));
+    if let Some(logger) = audit_logger(config) {
+        builder = builder.audit_logger(logger);
+    }
+    let server = builder.build();
     let server = TypeErasedIamServer::new(server);
 
     // The server now has a running poll thread; connect our own client to it so creator-side
@@ -116,6 +146,91 @@ pub(crate) fn create_secured_resource<Service: service::Service>(
         })?;
 
     Ok(SecurityResource::SecuredServer { server, client })
+}
+
+/// Opens the audit log configured in `iam.audit-log-path`. Relative paths are resolved against
+/// the iceoryx2 root path; an empty path disables auditing. Failing to open the log (e.g. its
+/// directory does not exist) disables auditing for this service with a warning.
+fn audit_logger(config: &crate::config::Config) -> Option<Box<dyn AuditLogger>> {
+    let origin = "audit_logger";
+    let configured = core::str::from_utf8(
+        config.global.node.security.iam.audit_log_path.as_bytes(),
+    )
+    .unwrap_or("");
+    if configured.is_empty() {
+        return None;
+    }
+
+    let path = std::path::Path::new(configured);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let root = core::str::from_utf8(config.global.root_path().as_bytes()).unwrap_or("");
+        std::path::Path::new(root).join(path)
+    };
+
+    if !path.parent().is_some_and(|p| p.is_dir()) {
+        debug!(from origin, "IAM audit logging disabled since the directory of {:?} does not exist.", path);
+        return None;
+    }
+
+    match FileAuditLogger::new(&path) {
+        Ok(logger) => Some(Box::new(logger)),
+        Err(e) => {
+            warn!(from origin, "IAM audit logging disabled since {:?} could not be opened ({}).", path, e);
+            None
+        }
+    }
+}
+
+/// Creates the handler the IAM server invokes when the last session of a peer node closed.
+///
+/// A peer that is killed never deregisters its ports. The creator (which owns the service's
+/// dynamic config) removes them once the peer's node is verifiably dead: its monitor reports
+/// `Dead` and the node details record the very process the kernel reported for the session
+/// (`SO_PEERCRED` pid), so a peer can neither evict nor resurrect another node. A node that is
+/// still alive closed its connection gracefully and deregistered its ports itself.
+fn departure_handler<Service: service::Service>(
+    config: crate::config::Config,
+    service_hash: ServiceHash,
+) -> PeerDepartureHandler {
+    Box::new(move |node_value: u128, credentials: &ProcessCredentials| {
+        let origin = "IamServer::peer_departure";
+        let node_id = UniqueNodeId(unsafe { UniqueId::from_raw_id(node_value) });
+
+        match Node::<Service>::get_node_state(&config, &node_id) {
+            Ok(State::Alive) => PeerDepartureOutcome::Retry,
+            Ok(State::DoesNotExist) => PeerDepartureOutcome::Completed,
+            Ok(State::Dead) => {
+                match Node::<Service>::get_node_details(&config, &node_id) {
+                    Ok(Some(details)) if details.process_id().value() as u32 == credentials.pid() => {}
+                    Ok(Some(details)) => {
+                        warn!(from origin,
+                            "Ignoring the departure of node {node_id} since it belongs to process {} and not to the peer process {}.",
+                            details.process_id().value(), credentials.pid());
+                        return PeerDepartureOutcome::Completed;
+                    }
+                    Ok(None) => return PeerDepartureOutcome::Completed,
+                    Err(e) => {
+                        debug!(from origin,
+                            "Unable to read the details of the departed node {node_id} ({e:?}).");
+                        return PeerDepartureOutcome::Completed;
+                    }
+                }
+
+                let removed =
+                    remove_departed_node_from_service::<Service>(&node_id, &service_hash, &config);
+                debug!(from origin,
+                    "Removed {removed} port(s) of the dead node {node_id} (uid {}, pid {}) from the service.",
+                    credentials.uid(), credentials.pid());
+                PeerDepartureOutcome::Completed
+            }
+            Err(e) => {
+                debug!(from origin, "Unable to acquire the state of the departed node {node_id} ({e:?}).");
+                PeerDepartureOutcome::Retry
+            }
+        }
+    })
 }
 
 /// Opener side: connect an IAM client to the creator's server, handshake, and wrap it.

@@ -35,6 +35,8 @@ pub enum iox2_notifier_create_error_e {
     FAILED_TO_DEPLOY_THREAD_SAFETY_POLICY,
     UNABLE_TO_CREATE_PORT_TAG,
     UNABLE_TO_GENERATE_UNIQUE_NOTIFIER_ID,
+    IAM_AUTHORIZATION_DENIED,
+    IAM_CONNECTION_FAILED,
 }
 
 impl IntoCInt for NotifierCreateError {
@@ -51,6 +53,12 @@ impl IntoCInt for NotifierCreateError {
             }
             NotifierCreateError::UnableToGenerateUniqueNotifierId => {
                 iox2_notifier_create_error_e::UNABLE_TO_GENERATE_UNIQUE_NOTIFIER_ID
+            }
+            NotifierCreateError::IamAuthorizationDenied => {
+                iox2_notifier_create_error_e::IAM_AUTHORIZATION_DENIED
+            }
+            NotifierCreateError::IamConnectionFailed => {
+                iox2_notifier_create_error_e::IAM_CONNECTION_FAILED
             }
         }) as c_int
     }

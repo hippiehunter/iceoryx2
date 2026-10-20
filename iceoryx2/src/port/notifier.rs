@@ -54,6 +54,7 @@ use iceoryx2_cal::{event::Event, named_concept::NamedConceptBuilder};
 use iceoryx2_log::{debug, fail, warn};
 
 use crate::port::port_lifetime_tag::PortLifetimeTag;
+use crate::port::details::iam_attachment::IamPortAttachment;
 use crate::service::SharedServiceState;
 use crate::{
     identifiers::{UniqueListenerId, UniqueNodeId, UniqueNotifierId},
@@ -87,6 +88,10 @@ pub enum NotifierCreateError {
     UnableToCreatePortTag,
     /// The [`UniqueNotifierId`] could not be generated.
     UnableToGenerateUniqueNotifierId,
+    /// The IAM server of the secured service denied the `notifier` role.
+    IamAuthorizationDenied,
+    /// The communication with the IAM server of the secured service failed.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for NotifierCreateError {
@@ -321,6 +326,8 @@ pub struct Notifier<Service: service::Service> {
     dynamic_notifier_handle: <Service::Bag as BagFamily>::BagHandle,
     notifier_details: &'static NotifierDetails,
     on_drop_notification: Option<EventId>,
+    /// Detaches the port from the IAM server of a secured service when the port goes away.
+    _iam_attachment: IamPortAttachment<Service, Secured<NoResource>>,
     // IMPORTANT!
     // Fields of a rust struct are dropped in declaration order. Since this tag is our marker that the
     // port exists and might require cleanup after a crash, the tag must be defined as last member of
@@ -343,6 +350,7 @@ unsafe impl<Service: service::Service> Sync for Notifier<Service> where
 impl<Service: service::Service> Abandonable for Notifier<Service> {
     unsafe fn abandon_in_place(mut this: NonNull<Self>) {
         let this = unsafe { this.as_mut() };
+        unsafe { Abandonable::abandon_in_place(NonNull::from_mut(&mut this._iam_attachment)) };
         unsafe {
             Service::ArcThreadSafetyPolicy::abandon_in_place(NonNull::from_mut(
                 &mut this.listener_connections,
@@ -417,6 +425,22 @@ impl<Service: service::Service> Notifier<Service> {
     ) -> Result<Self, NotifierCreateError> {
         let msg = "Unable to create Notifier port";
         let origin = "Notifier::new()";
+
+        // Secured services: the notifier role must be granted by the IAM policy.
+        let mut iam_attachment = IamPortAttachment::new(service.clone());
+        if let Some(ctx) = service.additional_resource().security.as_client() {
+            match ctx.attach_notifier() {
+                Ok(iam_port_id) => iam_attachment.add(iam_port_id),
+                Err(crate::iam::IamClientError::RequestDenied) => {
+                    fail!(from origin, with NotifierCreateError::IamAuthorizationDenied,
+                        "{} since the IAM server denied the attach request.", msg);
+                }
+                Err(e) => {
+                    fail!(from origin, with NotifierCreateError::IamConnectionFailed,
+                        "{} since communication with the IAM server failed: {:?}.", msg, e);
+                }
+            }
+        }
         let notifier_id = fail!(from origin,
             when UniqueNotifierId::new::<Service>(config.port_name, service.shared_node().id_generator()),
             with NotifierCreateError::UnableToGenerateUniqueNotifierId, "{msg} since the UniqueNotifierId could not be generated.");
@@ -475,6 +499,7 @@ impl<Service: service::Service> Notifier<Service> {
         };
 
         Ok(Self {
+            _iam_attachment: iam_attachment,
             lifetime_tag,
             listener_connections,
             default_event_id: config.default_event_id,

@@ -76,6 +76,7 @@ use crate::active_request::RequestId;
 use crate::port::details::chunk::ChunkMut;
 use crate::port::details::data_segment_shared_state::DataSegmentSharedState;
 use crate::port::port_lifetime_tag::PortLifetimeTag;
+use crate::port::details::iam_attachment::IamPortAttachment;
 use crate::service::header::request_response::RequestHeader;
 use crate::service::marker::{CustomHeaderMarker, CustomPayloadMarker, Flatbuffer};
 use crate::service::resource::request_response::RequestResponseResources;
@@ -186,6 +187,8 @@ pub struct ClientSharedState<Service: service::Service> {
     pub(crate) max_active_requests: usize,
     pub(crate) loan_counter: AtomicUsize,
     max_loans: usize,
+    /// Detaches the port from the IAM server of a secured service when the port goes away.
+    _iam_attachment: IamPortAttachment<Service, Secured<RequestResponseResources<Service>>>,
     // IMPORTANT!
     // Fields of a rust struct are dropped in declaration order. Since this tag is our marker that the
     // port exists and might require cleanup after a crash, the tag must be defined as last member of
@@ -241,6 +244,7 @@ impl<Service: service::Service> Grow<ShmPointer> for ClientSharedState<Service> 
 impl<Service: service::Service> Abandonable for ClientSharedState<Service> {
     unsafe fn abandon_in_place(mut this: NonNull<Self>) {
         let this = unsafe { this.as_mut() };
+        unsafe { Abandonable::abandon_in_place(NonNull::from_mut(&mut this._iam_attachment)) };
         unsafe { Sender::abandon_in_place(NonNull::from_mut(&mut this.request_sender)) };
         unsafe { Receiver::abandon_in_place(NonNull::from_mut(&mut this.response_receiver)) };
         unsafe {
@@ -485,12 +489,11 @@ impl<
 
         // For secured services, request authorization from the IAM server before creating the port.
         // The IAM server verifies the process credentials and policy before allowing attachment.
+        let mut iam_attachment = IamPortAttachment::new(service.clone());
         let secured_ctx = service.additional_resource().as_client();
         if let Some(ctx) = secured_ctx {
             match ctx.attach_client(static_config.max_response_buffer_size) {
-                Ok((_port_id, _segments, _handles)) => {
-                    // IAM authorization successful.
-                }
+                Ok((iam_port_id, _segments, _handles)) => iam_attachment.add(iam_port_id),
                 Err(IamClientError::RequestDenied) => {
                     fail!(from origin, with ClientCreateError::IamAuthorizationDenied,
                         "{} since the IAM server denied the attach request.", msg);
@@ -505,6 +508,10 @@ impl<
         let client_id = fail!(from origin,
             when UniqueClientId::new::<Service>(client_factory.config.port_name, service.shared_node().id_generator()),
             with ClientCreateError::UnableToGenerateUniqueClientId, "{msg} since the UniqueClientId could not be generated.");
+        if secured_ctx.is_some() {
+            // the handles of this producer are registered under its own port id
+            iam_attachment.add(client_id.value());
+        }
 
         // !MUST! be the first thing that is created when a new port is instantiated otherwise the
         // port resources might leak if this process is killed in between.
@@ -746,6 +753,7 @@ impl<
             max_active_requests,
             max_loans: static_config.max_loaned_requests,
             loan_counter: AtomicUsize::new(0),
+            _iam_attachment: iam_attachment,
             lifetime_tag,
         });
 

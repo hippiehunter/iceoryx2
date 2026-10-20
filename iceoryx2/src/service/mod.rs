@@ -1296,6 +1296,100 @@ fn read_static_service_config<S: Service>(
     Ok(Some(service_config))
 }
 
+
+/// Deregisters all ports of a departed node (one whose process is gone) from a single service.
+///
+/// Used by the IAM server of a secured service, which runs inside the service creator: when an
+/// authenticated peer disappears without deregistering its ports (e.g. it was `SIGKILL`ed), the
+/// creator removes the peer's ports from the service's dynamic config so that the port slots are
+/// released and no surviving port keeps waiting for it.
+///
+/// In multi-user setups the departed node may belong to another user. Its private files (node
+/// directory, port/service tags, named event sockets) can only be removed by that user (or root);
+/// such failures are tolerated and the files are left for a later cleanup by their owner. Data
+/// segments and connection channels of secured services are anonymous and released with the
+/// IAM server's handles. Returns the number of ports that were deregistered.
+pub(crate) fn remove_departed_node_from_service<S: Service>(
+    node_id: &UniqueNodeId,
+    service_hash: &ServiceHash,
+    config: &config::Config,
+) -> usize {
+    let origin = format!("remove_departed_node_from_service({node_id:?}, {service_hash:?})");
+
+    let static_config = match read_static_service_config::<S>(config, service_hash) {
+        Ok(Some(c)) => c,
+        Ok(None) => return 0,
+        Err(e) => {
+            debug!(from origin, "Unable to read the static service config ({e:?}).");
+            return 0;
+        }
+    };
+
+    let dynamic_config = match open_dynamic_config::<S>(config, static_config.unique_service_id())
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => return 0,
+        Err(e) => {
+            debug!(from origin, "Unable to open the dynamic service config ({e:?}).");
+            return 0;
+        }
+    };
+
+    let mut removed_ports = 0;
+    let cleanup_port_resources = |port_id: UniquePortId| {
+        // Best effort only: every failure below concerns resources that are either anonymous in
+        // secured mode or owned by the departed (foreign) user.
+        match port_id {
+            UniquePortId::Publisher(ref id) => {
+                let _ = remove_sender_connection_and_data_segment::<S>(
+                    id.value(),
+                    config,
+                    &origin,
+                    "publisher",
+                );
+            }
+            UniquePortId::Subscriber(ref id) => {
+                let _ = unsafe { remove_receiver_port_from_all_connections::<S>(id.value(), config) };
+            }
+            UniquePortId::Listener(ref id) => {
+                let _ = unsafe { remove_connection_of_listener::<S>(id, config) };
+            }
+            UniquePortId::Client(ref id) => {
+                let _ = remove_sender_and_receiver_connections_and_data_segment::<S>(
+                    id.value(),
+                    config,
+                    &origin,
+                    "client",
+                );
+            }
+            UniquePortId::Server(ref id) => {
+                let _ = remove_sender_and_receiver_connections_and_data_segment::<S>(
+                    id.value(),
+                    config,
+                    &origin,
+                    "server",
+                );
+            }
+            UniquePortId::Notifier(_) | UniquePortId::Reader(_) | UniquePortId::Writer(_) => {}
+        }
+        let _ = remove_port_tag::<S>(node_id, port_id.value(), config);
+        removed_ports += 1;
+        trace!(from origin, "Removed port {:?} of the departed node from the service.", port_id);
+        PortCleanupAction::RemovePort
+    };
+
+    // The service creator hosting the IAM server is always an owner, so the service itself is
+    // never removed here.
+    let _ = unsafe {
+        dynamic_config
+            .get()
+            .remove_dead_node_id(node_id, cleanup_port_resources)
+    };
+    let _ = remove_service_tag::<S>(node_id, service_hash, config);
+
+    removed_ports
+}
+
 type DynamicConfigStorage<S> = <S as Service>::DynamicStorage<DynamicConfig<<S as Service>::Bag>>;
 fn open_dynamic_config<S: Service>(
     config: &config::Config,

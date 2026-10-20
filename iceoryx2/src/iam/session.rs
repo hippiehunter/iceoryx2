@@ -93,6 +93,10 @@ pub struct SessionResourceUsage {
     pub server_count: usize,
     /// Number of client ports currently attached.
     pub client_count: usize,
+    /// Number of notifier ports currently attached.
+    pub notifier_count: usize,
+    /// Number of listener ports currently attached.
+    pub listener_count: usize,
     /// Total number of segments granted to this session.
     pub segment_count: usize,
     /// Total memory (in bytes) allocated across all granted segments.
@@ -107,6 +111,8 @@ impl SessionResourceUsage {
             subscriber_count: 0,
             server_count: 0,
             client_count: 0,
+            notifier_count: 0,
+            listener_count: 0,
             segment_count: 0,
             total_memory: 0,
         }
@@ -119,6 +125,8 @@ impl SessionResourceUsage {
             PortType::Subscriber => self.subscriber_count += 1,
             PortType::Server => self.server_count += 1,
             PortType::Client => self.client_count += 1,
+            PortType::Notifier => self.notifier_count += 1,
+            PortType::Listener => self.listener_count += 1,
         }
     }
 
@@ -131,6 +139,8 @@ impl SessionResourceUsage {
             PortType::Subscriber => self.subscriber_count = self.subscriber_count.saturating_sub(1),
             PortType::Server => self.server_count = self.server_count.saturating_sub(1),
             PortType::Client => self.client_count = self.client_count.saturating_sub(1),
+            PortType::Notifier => self.notifier_count = self.notifier_count.saturating_sub(1),
+            PortType::Listener => self.listener_count = self.listener_count.saturating_sub(1),
         }
     }
 

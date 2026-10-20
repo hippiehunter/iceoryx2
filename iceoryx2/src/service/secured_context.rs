@@ -98,6 +98,15 @@ pub(crate) trait ErasedSecuredContext: Send + Sync {
         max_pending_responses: usize,
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError>;
 
+    /// Attaches as a notifier to an event service.
+    fn attach_notifier(&self) -> Result<u128, IamClientError>;
+
+    /// Detaches a port (IAM attach id or producer port id) from the service.
+    fn detach(&self, port_id: u128) -> Result<(), IamClientError>;
+
+    /// Attaches as a listener to an event service.
+    fn attach_listener(&self) -> Result<u128, IamClientError>;
+
     /// Returns true if the IAM client is active.
     fn is_active(&self) -> bool;
 
@@ -274,6 +283,21 @@ impl TypeErasedSecuredContext {
         max_pending_responses: usize,
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         self.inner.attach_client(max_pending_responses)
+    }
+
+    /// Attaches as a notifier to an event service.
+    pub fn attach_notifier(&self) -> Result<u128, IamClientError> {
+        self.inner.attach_notifier()
+    }
+
+    /// Detaches a port (IAM attach id or producer port id) from the service.
+    pub fn detach(&self, port_id: u128) -> Result<(), IamClientError> {
+        self.inner.detach(port_id)
+    }
+
+    /// Attaches as a listener to an event service.
+    pub fn attach_listener(&self) -> Result<u128, IamClientError> {
+        self.inner.attach_listener()
     }
 
     /// Disconnects from the IAM server.
@@ -763,6 +787,18 @@ impl<C: CalClient + Send + 'static> ErasedSecuredContext for SecuredServiceConte
         max_pending_responses: usize,
     ) -> Result<(u128, Vec<SegmentInfo>, Vec<PlatformHandle>), IamClientError> {
         SecuredServiceContext::attach_client(self, max_pending_responses)
+    }
+
+    fn attach_notifier(&self) -> Result<u128, IamClientError> {
+        self.client.lock().unwrap().attach_notifier(&self.service_id)
+    }
+
+    fn detach(&self, port_id: u128) -> Result<(), IamClientError> {
+        self.client.lock().unwrap().detach(&self.service_id, port_id)
+    }
+
+    fn attach_listener(&self) -> Result<u128, IamClientError> {
+        self.client.lock().unwrap().attach_listener(&self.service_id)
     }
 
     fn is_active(&self) -> bool {

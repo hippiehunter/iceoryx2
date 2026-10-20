@@ -113,6 +113,14 @@ struct SessionEntry<C: CalConnection> {
     connection: C,
     /// Whether the handshake has completed.
     handshake_complete: bool,
+    /// The node id the peer announced in its Hello (`None` before the handshake).
+    node_id: Option<u128>,
+    /// The (iceoryx2) producer port ids this session registered segments / channels for. A
+    /// producer port belongs to exactly one session; its handles are reaped with the session.
+    producer_ports: Vec<u128>,
+    /// Segments (count, bytes) registered per producer port, given back to the session's usage
+    /// when the port is detached.
+    producer_port_usage: HashMap<u128, (usize, usize)>,
 }
 
 impl<C: CalConnection> SessionEntry<C> {
@@ -121,8 +129,55 @@ impl<C: CalConnection> SessionEntry<C> {
             session,
             connection,
             handshake_complete: false,
+            node_id: None,
+            producer_ports: Vec::new(),
+            producer_port_usage: HashMap::new(),
         }
     }
+
+    fn has_port_type(&self, types: &[PortType]) -> bool {
+        self.session.ports().any(|p| types.contains(&p.port_type))
+    }
+}
+
+/// Port types whose ports produce (and register) data segments and connection channels.
+const PRODUCER_PORT_TYPES: [PortType; 3] = [PortType::Publisher, PortType::Server, PortType::Client];
+/// Port types whose ports consume data segments of producers.
+const CONSUMER_PORT_TYPES: [PortType; 3] =
+    [PortType::Subscriber, PortType::Server, PortType::Client];
+
+/// How long the handles of a departed peer's producer ports stay brokerable before the
+/// departure is handled. Consumers that had not yet mapped the producer's segments (e.g. a
+/// subscriber that has not called `receive()` since the producer's last `send()`) can still
+/// obtain them, so samples sent right before a producer exits or dies are not lost.
+const PEER_DEPARTURE_RETENTION: core::time::Duration = core::time::Duration::from_secs(2);
+
+/// How long the server keeps checking whether a departed peer's node is dead before it assumes
+/// that the peer closed its connection gracefully (and deregistered its ports itself).
+const PEER_DEPARTURE_GRACE: core::time::Duration = core::time::Duration::from_secs(10);
+
+/// Result of a [`PeerDepartureHandler`] invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerDepartureOutcome {
+    /// The departure was handled (or there was nothing to do).
+    Completed,
+    /// The departure cannot be decided yet (e.g. the peer process is still exiting); call again.
+    Retry,
+}
+
+/// Invoked by the server when the last session of a peer node closed (gracefully or because the
+/// peer died). Receives the announced node id and the kernel-verified credentials of the peer.
+pub type PeerDepartureHandler =
+    Box<dyn FnMut(u128, &ProcessCredentials) -> PeerDepartureOutcome + Send>;
+
+/// A peer node whose last session closed and whose departure is still being handled.
+struct PendingDeparture {
+    node_id: u128,
+    credentials: ProcessCredentials,
+    since: std::time::Instant,
+    /// Producer ports of the departed sessions whose handles are kept until the departure was
+    /// handled.
+    orphaned_ports: Vec<u128>,
 }
 
 // ============================================================================
@@ -153,6 +208,8 @@ pub struct IamServerBuilder<L: CalListener, P: IamPolicy> {
     service_name: String,
     audit_logger: Option<Box<dyn AuditLogger>>,
     segment_factory: Arc<dyn SegmentFactory>,
+    departure_handler: Option<PeerDepartureHandler>,
+    departure_timing: (core::time::Duration, core::time::Duration),
 }
 
 impl<L: CalListener, P: IamPolicy> IamServerBuilder<L, P> {
@@ -164,7 +221,26 @@ impl<L: CalListener, P: IamPolicy> IamServerBuilder<L, P> {
             service_name: String::new(),
             audit_logger: None,
             segment_factory: Arc::new(NoSegmentFactory),
+            departure_handler: None,
+            departure_timing: (PEER_DEPARTURE_RETENTION, PEER_DEPARTURE_GRACE),
         }
+    }
+
+    /// Overrides how long the handles of a departed peer stay brokerable (`retention`) and how
+    /// long the server keeps asking the departure handler (`grace`).
+    pub fn peer_departure_timing(
+        mut self,
+        retention: core::time::Duration,
+        grace: core::time::Duration,
+    ) -> Self {
+        self.departure_timing = (retention, grace);
+        self
+    }
+
+    /// Sets the handler that is invoked when the last session of a peer node closed.
+    pub fn peer_departure_handler(mut self, handler: PeerDepartureHandler) -> Self {
+        self.departure_handler = Some(handler);
+        self
     }
 
     /// Sets the service name for audit events.
@@ -199,6 +275,10 @@ impl<L: CalListener, P: IamPolicy> IamServerBuilder<L, P> {
             segment_factory: self.segment_factory,
             port_to_service: HashMap::new(),
             service_consumers: HashMap::new(),
+            producer_port_owner: HashMap::new(),
+            departure_handler: self.departure_handler,
+            pending_departures: Vec::new(),
+            departure_timing: self.departure_timing,
         }
     }
 }
@@ -252,6 +332,16 @@ pub struct IamServer<L: CalListener, P: IamPolicy> {
     /// Used for Phase 8 push-based segment notifications to broadcast
     /// SegmentUpdate notifications to all consumers of a service.
     service_consumers: HashMap<ServiceHash, Vec<(SessionId, u128)>>,
+    /// The session that owns a producer port (the first session that registered a segment or
+    /// channel for it). Prevents other sessions from registering handles under that port.
+    producer_port_owner: HashMap<u128, SessionId>,
+    /// Invoked when the last session of a peer node closed.
+    departure_handler: Option<PeerDepartureHandler>,
+    /// Departed peer nodes whose handling is still pending.
+    pending_departures: Vec<PendingDeparture>,
+    /// (retention, grace) of departed peers, see [`PEER_DEPARTURE_RETENTION`] and
+    /// [`PEER_DEPARTURE_GRACE`].
+    departure_timing: (core::time::Duration, core::time::Duration),
 }
 
 impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
@@ -278,6 +368,10 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             segment_factory: Arc::new(NoSegmentFactory),
             port_to_service: HashMap::new(),
             service_consumers: HashMap::new(),
+            producer_port_owner: HashMap::new(),
+            departure_handler: None,
+            pending_departures: Vec::new(),
+            departure_timing: (PEER_DEPARTURE_RETENTION, PEER_DEPARTURE_GRACE),
         }
     }
 
@@ -308,6 +402,10 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             segment_factory,
             port_to_service: HashMap::new(),
             service_consumers: HashMap::new(),
+            producer_port_owner: HashMap::new(),
+            departure_handler: None,
+            pending_departures: Vec::new(),
+            departure_timing: (PEER_DEPARTURE_RETENTION, PEER_DEPARTURE_GRACE),
         }
     }
 
@@ -337,6 +435,10 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             segment_factory: Arc::new(NoSegmentFactory),
             port_to_service: HashMap::new(),
             service_consumers: HashMap::new(),
+            producer_port_owner: HashMap::new(),
+            departure_handler: None,
+            pending_departures: Vec::new(),
+            departure_timing: (PEER_DEPARTURE_RETENTION, PEER_DEPARTURE_GRACE),
         }
     }
 
@@ -368,6 +470,10 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             segment_factory,
             port_to_service: HashMap::new(),
             service_consumers: HashMap::new(),
+            producer_port_owner: HashMap::new(),
+            departure_handler: None,
+            pending_departures: Vec::new(),
+            departure_timing: (PEER_DEPARTURE_RETENTION, PEER_DEPARTURE_GRACE),
         }
     }
 
@@ -453,7 +559,61 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             }
         }
 
+        self.process_departures();
+
         Ok(processed)
+    }
+
+    /// Hands every departed peer node to the departure handler (after the retention period)
+    /// until it completed or the grace period expired, then releases the handles of the
+    /// departed producer ports.
+    fn process_departures(&mut self) {
+        if self.pending_departures.is_empty() {
+            return;
+        }
+
+        let (retention, grace) = self.departure_timing;
+        let mut finished = Vec::new();
+        let mut pending = core::mem::take(&mut self.pending_departures);
+        pending.retain(|departure| {
+            let reconnected = self
+                .sessions
+                .values()
+                .any(|e| e.node_id == Some(departure.node_id));
+            let done = if reconnected {
+                // the node is alive and opened the service again; its old ports are gone
+                true
+            } else if departure.since.elapsed() < retention {
+                false
+            } else {
+                match self.departure_handler.as_mut() {
+                    Some(handler) => match handler(departure.node_id, &departure.credentials) {
+                        PeerDepartureOutcome::Completed => true,
+                        PeerDepartureOutcome::Retry => departure.since.elapsed() >= grace,
+                    },
+                    None => true,
+                }
+            };
+            if done {
+                finished.extend(departure.orphaned_ports.iter().copied());
+            }
+            !done
+        });
+        self.pending_departures = pending;
+
+        for port_id in finished {
+            self.reap_producer_port(port_id);
+        }
+    }
+
+    /// Releases every handle registered under the (iceoryx2) producer port `port_id`.
+    fn reap_producer_port(&mut self, port_id: u128) {
+        self.segment_manager.remove_all_segments_for_port(port_id);
+        self.segment_manager.remove_mgmt_segment_for_port(port_id);
+        self.segment_manager
+            .remove_channels_for_sender_port(port_id);
+        self.port_to_service.remove(&port_id);
+        self.producer_port_owner.remove(&port_id);
     }
 
     /// Handles a new client connection.
@@ -640,8 +800,44 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         match request {
             IamRequest::Hello {
                 protocol_version,
-                node_id: _,
-            } => self.handle_hello(session_id, protocol_version),
+                node_id,
+            } => {
+                let response = self.handle_hello(session_id, protocol_version)?;
+                if matches!(response.0, IamResponse::HelloOk { .. })
+                    && let Some(entry) = self.sessions.get_mut(&session_id)
+                {
+                    entry.node_id = Some(node_id.value());
+                }
+                Ok(response)
+            }
+
+            IamRequest::AttachNotifier { service_id } | IamRequest::AttachListener { service_id }
+                if !handshake_complete =>
+            {
+                let _ = service_id;
+                Ok((
+                    IamResponse::ProtocolError {
+                        message: String::from("Handshake not complete"),
+                    },
+                    Vec::new(),
+                ))
+            }
+
+            IamRequest::AttachNotifier { service_id } => self.handle_attach_event_port(
+                session_id,
+                &credentials,
+                &usage,
+                &service_id,
+                PortType::Notifier,
+            ),
+
+            IamRequest::AttachListener { service_id } => self.handle_attach_event_port(
+                session_id,
+                &credentials,
+                &usage,
+                &service_id,
+                PortType::Listener,
+            ),
 
             IamRequest::CreateService {
                 service_name,
@@ -1092,6 +1288,131 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         ))
     }
 
+    /// Handles AttachNotifier / AttachListener requests of event services. Event ports carry no
+    /// data segments; the attach is purely an authorization gate (`notifier` / `listener` roles).
+    fn handle_attach_event_port(
+        &mut self,
+        session_id: SessionId,
+        credentials: &ProcessCredentials,
+        usage: &SessionResourceUsage,
+        service_id: &crate::service::service_hash::ServiceHash,
+        port_type: PortType,
+    ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
+        let decision = self
+            .policy
+            .authorize_attach(credentials, service_id, port_type);
+
+        self.audit(
+            AuditEventKind::Attach {
+                port_type,
+                port_id: 0,
+            },
+            credentials,
+            &decision,
+        );
+
+        if let PolicyDecision::Deny { reason, message } = decision {
+            return Ok((IamResponse::Denied { reason, message }, Vec::new()));
+        }
+
+        let limits = self.policy.get_limits(credentials);
+        if let Some(response) = self.check_port_limit(usage, port_type, &limits) {
+            return Ok((response, Vec::new()));
+        }
+
+        let port_id = self.allocate_port_id();
+        if let Some(entry) = self.sessions.get_mut(&session_id) {
+            entry.session.add_port(port_id, port_type);
+        }
+
+        Ok((
+            IamResponse::AttachOk {
+                port_id,
+                segment_info: Vec::new(),
+                handle_count: 0,
+            },
+            Vec::new(),
+        ))
+    }
+
+    /// Binds the (iceoryx2) producer `port_id` to `session_id` before the session may register
+    /// handles for it. Only sessions that attached a producer port (publisher, server, client)
+    /// may register handles at all, and a port that is already bound to another session cannot
+    /// be taken over - otherwise a principal could inject segments into another producer's port.
+    fn claim_producer_port(&mut self, session_id: SessionId, port_id: u128) -> Option<IamResponse> {
+        let (credentials, is_producer) = match self.sessions.get(&session_id) {
+            Some(entry) => (
+                entry.session.credentials().clone(),
+                entry.has_port_type(&PRODUCER_PORT_TYPES),
+            ),
+            None => return Some(IamResponse::ProtocolError {
+                message: String::from("Unknown session"),
+            }),
+        };
+
+        let decision = if !is_producer {
+            PolicyDecision::deny(
+                DenialReason::Unauthorized,
+                "The session has not attached a producer port (publisher, server or client)",
+            )
+        } else {
+            match self.producer_port_owner.get(&port_id) {
+                Some(owner) if *owner != session_id => PolicyDecision::deny(
+                    DenialReason::Unauthorized,
+                    "The producer port is owned by another session",
+                ),
+                _ => PolicyDecision::Allow,
+            }
+        };
+
+        if let PolicyDecision::Deny { reason, message } = decision {
+            self.audit(
+                AuditEventKind::RegisterHandle { port_id },
+                &credentials,
+                &PolicyDecision::Deny {
+                    reason,
+                    message: message.clone(),
+                },
+            );
+            return Some(IamResponse::Denied { reason, message });
+        }
+
+        self.producer_port_owner.insert(port_id, session_id);
+        if let Some(entry) = self.sessions.get_mut(&session_id)
+            && !entry.producer_ports.contains(&port_id)
+        {
+            entry.producer_ports.push(port_id);
+        }
+        None
+    }
+
+    /// Only sessions that attached a consumer port (subscriber, server, client) - and thereby
+    /// passed the policy's role check - may obtain handles to producer resources. A principal
+    /// that may only publish never receives another publisher's data segment.
+    fn authorize_consumer(&self, session_id: SessionId, sender_port_id: u128) -> Option<IamResponse> {
+        let entry = self.sessions.get(&session_id)?;
+        if entry.has_port_type(&CONSUMER_PORT_TYPES) {
+            return None;
+        }
+        let decision = PolicyDecision::deny(
+            DenialReason::Unauthorized,
+            "The session has not attached a consumer port (subscriber, server or client)",
+        );
+        self.audit(
+            AuditEventKind::AccessHandle {
+                port_id: sender_port_id,
+            },
+            entry.session.credentials(),
+            &decision,
+        );
+        match decision {
+            PolicyDecision::Deny { reason, message } => {
+                Some(IamResponse::Denied { reason, message })
+            }
+            PolicyDecision::Allow => None,
+        }
+    }
+
     /// Handles AttachServer request.
     fn handle_attach_server(
         &mut self,
@@ -1323,6 +1644,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             let usage = entry.session.resource_usage_mut();
             usage.segment_count += 1;
             usage.total_memory = usage.total_memory.saturating_add(actual_size);
+            let port_usage = entry.producer_port_usage.entry(port_id).or_default();
+            port_usage.0 += 1;
+            port_usage.1 = port_usage.1.saturating_add(actual_size);
         }
 
         // Phase 8: Broadcast SegmentUpdate notification to consumer sessions
@@ -1357,6 +1681,31 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         _service_id: &crate::service::service_hash::ServiceHash,
         port_id: u128,
     ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
+        // A session may only detach what it owns: one of its attached (IAM) ports or one of the
+        // producer ports it registered handles for. Reaping by an arbitrary id would let a
+        // principal release another producer's handles.
+        let (owns_attached_port, owns_producer_port) = match self.sessions.get(&session_id) {
+            Some(entry) => (
+                entry.session.has_port(port_id),
+                entry.producer_ports.contains(&port_id),
+            ),
+            None => (false, false),
+        };
+        if owns_producer_port {
+            if let Some(entry) = self.sessions.get_mut(&session_id) {
+                entry.producer_ports.retain(|p| *p != port_id);
+                if let Some((count, bytes)) = entry.producer_port_usage.remove(&port_id) {
+                    let usage = entry.session.resource_usage_mut();
+                    usage.segment_count = usage.segment_count.saturating_sub(count);
+                    usage.total_memory = usage.total_memory.saturating_sub(bytes);
+                }
+            }
+            self.reap_producer_port(port_id);
+        }
+        if !owns_attached_port {
+            return Ok((IamResponse::DetachOk, Vec::new()));
+        }
+
         // Get port type and credentials before removal for cleanup and audit
         let (port_type, credentials) = self
             .sessions
@@ -1414,6 +1763,7 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
                     // Clean up empty entries
                     self.service_consumers.retain(|_, v| !v.is_empty());
                 }
+                PortType::Notifier | PortType::Listener => {}
             }
         }
 
@@ -1491,6 +1841,17 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         let credentials = entry.session.credentials().clone();
         let usage = *entry.session.resource_usage();
 
+        if let Some(denied) = self.claim_producer_port(session_id, port_id) {
+            // the client sends its handle(s) right after the request; drain them so that they
+            // are closed and the stream stays in sync
+            if handle_count > 0
+                && let Some(entry) = self.sessions.get(&session_id)
+            {
+                let _ = receive_handles_from_client(&entry.connection);
+            }
+            return Ok((denied, Vec::new()));
+        }
+
         // Check policy
         let decision = self
             .policy
@@ -1551,6 +1912,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             let usage = entry.session.resource_usage_mut();
             usage.segment_count += 1;
             usage.total_memory = usage.total_memory.saturating_add(segment_size);
+            let port_usage = entry.producer_port_usage.entry(port_id).or_default();
+            port_usage.0 += 1;
+            port_usage.1 = port_usage.1.saturating_add(segment_size);
         }
 
         Ok((IamResponse::RegisterSegmentOk { segment_id }, Vec::new()))
@@ -1562,6 +1926,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         session_id: SessionId,
         sender_port_id: u128,
     ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
+        if let Some(denied) = self.authorize_consumer(session_id, sender_port_id) {
+            return Ok((denied, Vec::new()));
+        }
         match self
             .segment_manager
             .get_segment_handle_for_consumer(sender_port_id, session_id)
@@ -1607,6 +1974,17 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
 
         let credentials = entry.session.credentials().clone();
         let usage = *entry.session.resource_usage();
+
+        if let Some(denied) = self.claim_producer_port(session_id, port_id) {
+            // the client sends its handle(s) right after the request; drain them so that they
+            // are closed and the stream stays in sync
+            if handle_count > 0
+                && let Some(entry) = self.sessions.get(&session_id)
+            {
+                let _ = receive_handles_from_client(&entry.connection);
+            }
+            return Ok((denied, Vec::new()));
+        }
 
         // Check policy
         let decision = self
@@ -1669,6 +2047,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             let usage = entry.session.resource_usage_mut();
             usage.segment_count += 1;
             usage.total_memory = usage.total_memory.saturating_add(segment_size);
+            let port_usage = entry.producer_port_usage.entry(port_id).or_default();
+            port_usage.0 += 1;
+            port_usage.1 = port_usage.1.saturating_add(segment_size);
         }
 
         Ok((
@@ -1687,6 +2068,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         sender_port_id: u128,
         segment_index: u8,
     ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
+        if let Some(denied) = self.authorize_consumer(session_id, sender_port_id) {
+            return Ok((denied, Vec::new()));
+        }
         match self.segment_manager.get_dynamic_segment_handle(
             sender_port_id,
             segment_index,
@@ -1738,6 +2122,17 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
 
         let credentials = entry.session.credentials().clone();
         let usage = *entry.session.resource_usage();
+
+        if let Some(denied) = self.claim_producer_port(session_id, sender_port_id) {
+            // the client sends its handle(s) right after the request; drain them so that they
+            // are closed and the stream stays in sync
+            if handle_count > 0
+                && let Some(entry) = self.sessions.get(&session_id)
+            {
+                let _ = receive_handles_from_client(&entry.connection);
+            }
+            return Ok((denied, Vec::new()));
+        }
 
         // Check policy — reuse the add-segment authorization since a connection channel
         // is a brokered shared-memory resource owned by the producer.
@@ -1801,6 +2196,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             let usage = entry.session.resource_usage_mut();
             usage.segment_count += 1;
             usage.total_memory = usage.total_memory.saturating_add(channel_size);
+            let port_usage = entry.producer_port_usage.entry(sender_port_id).or_default();
+            port_usage.0 += 1;
+            port_usage.1 = port_usage.1.saturating_add(channel_size);
         }
 
         Ok((IamResponse::RegisterChannelOk, Vec::new()))
@@ -1814,6 +2212,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         sender_port_id: u128,
         receiver_port_id: u128,
     ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
+        if let Some(denied) = self.authorize_consumer(session_id, sender_port_id) {
+            return Ok((denied, Vec::new()));
+        }
         match self.segment_manager.get_channel_handle_for_consumer(
             sender_port_id,
             receiver_port_id,
@@ -1865,6 +2266,17 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
 
         let credentials = entry.session.credentials().clone();
         let usage = *entry.session.resource_usage();
+
+        if let Some(denied) = self.claim_producer_port(session_id, port_id) {
+            // the client sends its handle(s) right after the request; drain them so that they
+            // are closed and the stream stays in sync
+            if handle_count > 0
+                && let Some(entry) = self.sessions.get(&session_id)
+            {
+                let _ = receive_handles_from_client(&entry.connection);
+            }
+            return Ok((denied, Vec::new()));
+        }
 
         // Check policy — reuse the add-segment authorization since the management segment
         // is a brokered shared-memory resource owned by the producer.
@@ -1924,6 +2336,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             let usage = entry.session.resource_usage_mut();
             usage.segment_count += 1;
             usage.total_memory = usage.total_memory.saturating_add(mgmt_size);
+            let port_usage = entry.producer_port_usage.entry(port_id).or_default();
+            port_usage.0 += 1;
+            port_usage.1 = port_usage.1.saturating_add(mgmt_size);
         }
 
         Ok((IamResponse::RegisterMgmtSegmentOk, Vec::new()))
@@ -1936,6 +2351,9 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
         session_id: SessionId,
         port_id: u128,
     ) -> Result<(IamResponse, Vec<PlatformHandle>), IamServerError> {
+        if let Some(denied) = self.authorize_consumer(session_id, port_id) {
+            return Ok((denied, Vec::new()));
+        }
         match self
             .segment_manager
             .get_mgmt_segment_handle_for_consumer(port_id, session_id)
@@ -1971,6 +2389,8 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
             ),
             PortType::Server => (usage.server_count, limits.max_servers, "servers"),
             PortType::Client => (usage.client_count, limits.max_clients, "clients"),
+            PortType::Notifier => (usage.notifier_count, limits.max_notifiers, "notifiers"),
+            PortType::Listener => (usage.listener_count, limits.max_listeners, "listeners"),
         };
 
         if current >= max {
@@ -2020,6 +2440,54 @@ impl<L: CalListener, P: IamPolicy> IamServer<L, P> {
                     PortType::Subscriber | PortType::Client => {
                         // Consumer port: service_consumers is cleaned up below.
                     }
+                    PortType::Notifier | PortType::Listener => {}
+                }
+            }
+
+        }
+
+        // The handles registered under the session's (iceoryx2) producer ports are released
+        // once the peer's departure was handled (see `process_departures`), so that consumers
+        // can still map what the producer sent right before it went away. Without a known node
+        // (no handshake) or departure handler they are released right away.
+        let (node_id, credentials, producer_ports) = match self.sessions.get(&session_id) {
+            Some(entry) => (
+                entry.node_id,
+                entry.session.credentials().clone(),
+                entry.producer_ports.clone(),
+            ),
+            None => (None, ProcessCredentials::new(0, 0, 0), Vec::new()),
+        };
+        match node_id {
+            Some(node_id) if self.departure_handler.is_some() => {
+                // Another session of the same node (the node opened the service twice) keeps
+                // the node registered; only the last session triggers the departure handling.
+                let node_has_other_sessions = self
+                    .sessions
+                    .iter()
+                    .any(|(sid, e)| *sid != session_id && e.node_id == Some(node_id));
+                match self
+                    .pending_departures
+                    .iter_mut()
+                    .find(|d| d.node_id == node_id)
+                {
+                    Some(departure) => departure.orphaned_ports.extend(producer_ports),
+                    None if node_has_other_sessions => {
+                        for port_id in producer_ports {
+                            self.reap_producer_port(port_id);
+                        }
+                    }
+                    None => self.pending_departures.push(PendingDeparture {
+                        node_id,
+                        credentials,
+                        since: std::time::Instant::now(),
+                        orphaned_ports: producer_ports,
+                    }),
+                }
+            }
+            _ => {
+                for port_id in producer_ports {
+                    self.reap_producer_port(port_id);
                 }
             }
         }
@@ -3542,5 +4010,348 @@ mod tests {
         server.remove_session(session_id);
 
         assert_eq!(server.segment_manager.channel_count(), 0);
+    }
+
+    // ========================================================================
+    // Multi-user hardening: role gating, producer port binding, departures
+    // ========================================================================
+
+    fn mu_service_id() -> ServiceHash {
+        use crate::service::messaging_pattern::MessagingPattern;
+        use iceoryx2_cal::hash::sha1::Sha1;
+        let name = crate::service::service_name::ServiceName::new("test/multi_user").unwrap();
+        ServiceHash::new::<Sha1>(&name, MessagingPattern::PublishSubscribe)
+    }
+
+    /// Accepts a new mock connection with the given credentials and completes its handshake.
+    fn mu_session<P: IamPolicy>(
+        server: &mut IamServer<MockListener, P>,
+        credentials: ProcessCredentials,
+        node_id: Option<u128>,
+    ) -> SessionId {
+        let before: Vec<SessionId> = server.sessions.keys().copied().collect();
+        server
+            .listener
+            .add_connection(MockConnection::new(credentials));
+        server.process().unwrap();
+        let session_id = *server
+            .sessions
+            .keys()
+            .find(|id| !before.contains(id))
+            .unwrap();
+        let entry = server.sessions.get_mut(&session_id).unwrap();
+        entry.handshake_complete = true;
+        entry.node_id = node_id;
+        session_id
+    }
+
+    fn mu_attach<P: IamPolicy>(
+        server: &mut IamServer<MockListener, P>,
+        session_id: SessionId,
+        port_type: PortType,
+    ) -> IamResponse {
+        let credentials = server.sessions[&session_id].session.credentials().clone();
+        let usage = *server.sessions[&session_id].session.resource_usage();
+        let service_id = mu_service_id();
+        match port_type {
+            PortType::Publisher => {
+                server
+                    .handle_attach_publisher(session_id, &credentials, &usage, &service_id, 0, 8)
+                    .unwrap()
+                    .0
+            }
+            PortType::Subscriber => {
+                server
+                    .handle_attach_subscriber(session_id, &credentials, &usage, &service_id)
+                    .unwrap()
+                    .0
+            }
+            t => {
+                server
+                    .handle_attach_event_port(session_id, &credentials, &usage, &service_id, t)
+                    .unwrap()
+                    .0
+            }
+        }
+    }
+
+    fn sip_policy() -> crate::iam::configured_policy::ConfiguredPolicy {
+        let toml = r#"
+[service]
+name = "test/multi_user"
+
+[[allow]]
+principal = { uid = 2000 }
+roles = ["subscriber", "listener"]
+
+[[allow]]
+principal = { gid = 3000 }
+roles = ["publisher", "notifier"]
+"#;
+        let file: crate::iam::configured_policy::PolicyFile = toml::from_str(toml).unwrap();
+        crate::iam::configured_policy::ConfiguredPolicy::from_policy_file(file, 2000)
+    }
+
+    fn writer_credentials(uid: u32) -> ProcessCredentials {
+        // primary group is the user's own group, the grant comes from a supplementary group
+        ProcessCredentials::new(uid, uid, uid).with_supplementary_gids(vec![3000])
+    }
+
+    #[test]
+    fn test_mu_supplementary_group_grants_publisher_and_notifier_only() {
+        let mut server = IamServer::new(MockListener::new(), sip_policy());
+        let writer = mu_session(&mut server, writer_credentials(2001), None);
+
+        assert!(matches!(
+            mu_attach(&mut server, writer, PortType::Publisher),
+            IamResponse::AttachOk { .. }
+        ));
+        assert!(matches!(
+            mu_attach(&mut server, writer, PortType::Notifier),
+            IamResponse::AttachOk { .. }
+        ));
+        assert!(matches!(
+            mu_attach(&mut server, writer, PortType::Subscriber),
+            IamResponse::Denied {
+                reason: DenialReason::Unauthorized,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mu_attach(&mut server, writer, PortType::Listener),
+            IamResponse::Denied {
+                reason: DenialReason::Unauthorized,
+                ..
+            }
+        ));
+
+        // without the supplementary group nothing is granted
+        let stranger = mu_session(&mut server, ProcessCredentials::new(7, 2003, 2003), None);
+        for port_type in [
+            PortType::Publisher,
+            PortType::Subscriber,
+            PortType::Notifier,
+            PortType::Listener,
+        ] {
+            assert!(matches!(
+                mu_attach(&mut server, stranger, port_type),
+                IamResponse::Denied { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn test_mu_publisher_only_session_cannot_obtain_producer_handles() {
+        let mut server = IamServer::new(MockListener::new(), sip_policy());
+        let writer_a = mu_session(&mut server, writer_credentials(2001), None);
+        let writer_b = mu_session(&mut server, writer_credentials(2002), None);
+        let broker = mu_session(&mut server, ProcessCredentials::new(9, 2000, 2000), None);
+        mu_attach(&mut server, writer_a, PortType::Publisher);
+        mu_attach(&mut server, writer_b, PortType::Publisher);
+        mu_attach(&mut server, broker, PortType::Subscriber);
+
+        // writer A's producer port registers a data segment, a management segment and a channel
+        let port_a: u128 = 0xA;
+        assert!(server.claim_producer_port(writer_a, port_a).is_none());
+        server
+            .segment_manager
+            .register_segment_for_port(port_a, create_test_handle(), 4096, AccessRights::read_only())
+            .unwrap();
+        server
+            .segment_manager
+            .register_mgmt_segment(port_a, create_test_handle(), 128)
+            .unwrap();
+        server
+            .segment_manager
+            .register_channel(port_a, 0xB0, create_test_handle(), 128)
+            .unwrap();
+
+        // writer B holds no consumer role: every handle request is refused
+        let denied = |r: IamResponse| matches!(r, IamResponse::Denied { .. });
+        assert!(denied(
+            server.handle_request_segment_handle(writer_b, port_a).unwrap().0
+        ));
+        assert!(denied(
+            server
+                .handle_request_dynamic_segment_handle(writer_b, port_a, 0)
+                .unwrap()
+                .0
+        ));
+        assert!(denied(
+            server
+                .handle_request_mgmt_segment_handle(writer_b, port_a)
+                .unwrap()
+                .0
+        ));
+        assert!(denied(
+            server
+                .handle_request_channel_handle(writer_b, port_a, 0xB0)
+                .unwrap()
+                .0
+        ));
+
+        // the broker (subscriber role) obtains them
+        assert!(matches!(
+            server.handle_request_segment_handle(broker, port_a).unwrap().0,
+            IamResponse::SegmentHandleOk { .. }
+        ));
+        assert!(matches!(
+            server
+                .handle_request_mgmt_segment_handle(broker, port_a)
+                .unwrap()
+                .0,
+            IamResponse::MgmtSegmentHandleOk { .. }
+        ));
+        assert!(matches!(
+            server
+                .handle_request_channel_handle(broker, port_a, 0xB0)
+                .unwrap()
+                .0,
+            IamResponse::ChannelHandleOk { .. }
+        ));
+    }
+
+    #[test]
+    fn test_mu_producer_port_cannot_be_claimed_by_other_session_or_non_producer() {
+        let mut server = IamServer::new(MockListener::new(), sip_policy());
+        let writer_a = mu_session(&mut server, writer_credentials(2001), None);
+        let writer_b = mu_session(&mut server, writer_credentials(2002), None);
+        let broker = mu_session(&mut server, ProcessCredentials::new(9, 2000, 2000), None);
+        mu_attach(&mut server, writer_a, PortType::Publisher);
+        mu_attach(&mut server, writer_b, PortType::Publisher);
+        mu_attach(&mut server, broker, PortType::Subscriber);
+
+        assert!(server.claim_producer_port(writer_a, 0xA).is_none());
+        // idempotent for the owner
+        assert!(server.claim_producer_port(writer_a, 0xA).is_none());
+        // another producer cannot inject handles under A's port
+        assert!(matches!(
+            server.claim_producer_port(writer_b, 0xA),
+            Some(IamResponse::Denied { .. })
+        ));
+        // a session without a producer port cannot register handles at all
+        assert!(matches!(
+            server.claim_producer_port(broker, 0xC),
+            Some(IamResponse::Denied { .. })
+        ));
+    }
+
+    #[test]
+    fn test_mu_detach_only_releases_own_producer_ports() {
+        let mut server = IamServer::new(MockListener::new(), sip_policy());
+        let writer_a = mu_session(&mut server, writer_credentials(2001), None);
+        let writer_b = mu_session(&mut server, writer_credentials(2002), None);
+        mu_attach(&mut server, writer_a, PortType::Publisher);
+        mu_attach(&mut server, writer_b, PortType::Publisher);
+
+        assert!(server.claim_producer_port(writer_a, 0xA).is_none());
+        let segment = server
+            .segment_manager
+            .register_segment_for_port(0xA, create_test_handle(), 4096, AccessRights::read_only())
+            .unwrap();
+
+        // B detaching A's port is a no-op
+        server
+            .handle_detach(writer_b, &mu_service_id(), 0xA)
+            .unwrap();
+        assert!(server.segment_manager.has_segment(segment));
+
+        // A detaching its own port releases the handles
+        server
+            .handle_detach(writer_a, &mu_service_id(), 0xA)
+            .unwrap();
+        assert!(!server.segment_manager.has_segment(segment));
+        assert!(!server.producer_port_owner.contains_key(&0xA));
+    }
+
+    #[test]
+    fn test_mu_detach_returns_attach_quota() {
+        let mut server = IamServer::new(MockListener::new(), sip_policy());
+        let writer = mu_session(&mut server, writer_credentials(2001), None);
+        // far more attach/detach cycles than max_publishers (16)
+        for _ in 0..64 {
+            let port_id = match mu_attach(&mut server, writer, PortType::Publisher) {
+                IamResponse::AttachOk { port_id, .. } => port_id,
+                r => panic!("attach #{} failed: {r:?}", 0),
+            };
+            server
+                .handle_detach(writer, &mu_service_id(), port_id)
+                .unwrap();
+        }
+        assert_eq!(
+            server.sessions[&writer].session.resource_usage().publisher_count,
+            0
+        );
+    }
+
+    #[test]
+    fn test_mu_departure_handler_gets_dead_peer_and_handles_are_retained_until_then() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(Mutex::new(Vec::<(u128, u32)>::new()));
+        let calls_clone = Arc::clone(&calls);
+        let outcome = Arc::new(AtomicUsize::new(1)); // 1 = Retry, 0 = Completed
+        let outcome_clone = Arc::clone(&outcome);
+        let mut server = IamServerBuilder::new(MockListener::new(), sip_policy())
+            .peer_departure_handler(Box::new(move |node_id, credentials| {
+                calls_clone
+                    .lock()
+                    .unwrap()
+                    .push((node_id, credentials.uid()));
+                if outcome_clone.load(Ordering::Relaxed) == 0 {
+                    PeerDepartureOutcome::Completed
+                } else {
+                    PeerDepartureOutcome::Retry
+                }
+            }))
+            .peer_departure_timing(Duration::ZERO, Duration::from_secs(60))
+            .build();
+
+        let writer = mu_session(&mut server, writer_credentials(2001), Some(0x77));
+        mu_attach(&mut server, writer, PortType::Publisher);
+        assert!(server.claim_producer_port(writer, 0xA).is_none());
+        let segment = server
+            .segment_manager
+            .register_segment_for_port(0xA, create_test_handle(), 4096, AccessRights::read_only())
+            .unwrap();
+
+        // the peer disappears (e.g. SIGKILL closes its socket)
+        server.remove_session(writer);
+        assert_eq!(server.session_count(), 0);
+        // its producer handles stay brokerable while the departure is pending
+        assert!(server.segment_manager.has_segment(segment));
+
+        server.process().unwrap();
+        assert_eq!(calls.lock().unwrap().as_slice(), &[(0x77, 2001)]);
+        assert!(server.segment_manager.has_segment(segment));
+
+        outcome.store(0, Ordering::Relaxed);
+        server.process().unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert!(!server.segment_manager.has_segment(segment));
+        assert!(server.pending_departures.is_empty());
+    }
+
+    #[test]
+    fn test_mu_departure_waits_for_last_session_of_the_node() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_clone = Arc::clone(&calls);
+        let mut server = IamServerBuilder::new(MockListener::new(), sip_policy())
+            .peer_departure_handler(Box::new(move |_, _| {
+                *calls_clone.lock().unwrap() += 1;
+                PeerDepartureOutcome::Completed
+            }))
+            .peer_departure_timing(Duration::ZERO, Duration::ZERO)
+            .build();
+
+        let first = mu_session(&mut server, writer_credentials(2001), Some(0x77));
+        let second = mu_session(&mut server, writer_credentials(2001), Some(0x77));
+        server.remove_session(first);
+        server.process().unwrap();
+        assert_eq!(*calls.lock().unwrap(), 0);
+
+        server.remove_session(second);
+        server.process().unwrap();
+        assert_eq!(*calls.lock().unwrap(), 1);
     }
 }

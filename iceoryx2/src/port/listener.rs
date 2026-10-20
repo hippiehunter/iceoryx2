@@ -60,6 +60,7 @@
 
 use crate::config::Config;
 use crate::port::port_lifetime_tag::PortLifetimeTag;
+use crate::port::details::iam_attachment::IamPortAttachment;
 use crate::port::port_name::PortName;
 use crate::service::SharedServiceState;
 use crate::service::config_scheme::event_config;
@@ -104,6 +105,10 @@ pub enum ListenerCreateError {
     UnableToCreatePortTag,
     /// The [`UniqueListenerId`] could not be generated.
     UnableToGenerateUniqueListenerId,
+    /// The IAM server of the secured service denied the `listener` role.
+    IamAuthorizationDenied,
+    /// The communication with the IAM server of the secured service failed.
+    IamConnectionFailed,
 }
 
 impl core::fmt::Display for ListenerCreateError {
@@ -122,6 +127,8 @@ pub struct Listener<Service: service::Service> {
         Service::ArcThreadSafetyPolicy<<Service::Event as iceoryx2_cal::event::Event>::Listener>,
     service_state: SharedServiceState<Service, Secured<NoResource>>,
     listener_details: &'static ListenerDetails,
+    /// Detaches the port from the IAM server of a secured service when the port goes away.
+    _iam_attachment: IamPortAttachment<Service, Secured<NoResource>>,
     // IMPORTANT!
     // Fields of a rust struct are dropped in declaration order. Since this tag is our marker that the
     // port exists and might require cleanup after a crash, the tag must be defined as last member of
@@ -163,6 +170,7 @@ impl<Service: service::Service> SynchronousMultiplexing for Listener<Service> wh
 impl<Service: service::Service> Abandonable for Listener<Service> {
     unsafe fn abandon_in_place(mut this: NonNull<Self>) {
         let this = unsafe { this.as_mut() };
+        unsafe { Abandonable::abandon_in_place(NonNull::from_mut(&mut this._iam_attachment)) };
         unsafe {
             Service::ArcThreadSafetyPolicy::abandon_in_place(NonNull::from_mut(&mut this.listener))
         };
@@ -188,6 +196,22 @@ impl<Service: service::Service> Listener<Service> {
     ) -> Result<Self, ListenerCreateError> {
         let msg = "Failed to create listener";
         let origin = "Listener::new()";
+
+        // Secured services: the listener role must be granted by the IAM policy.
+        let mut iam_attachment = IamPortAttachment::new(service.clone());
+        if let Some(ctx) = service.additional_resource().security.as_client() {
+            match ctx.attach_listener() {
+                Ok(iam_port_id) => iam_attachment.add(iam_port_id),
+                Err(crate::iam::IamClientError::RequestDenied) => {
+                    fail!(from origin, with ListenerCreateError::IamAuthorizationDenied,
+                        "{} since the IAM server denied the attach request.", msg);
+                }
+                Err(e) => {
+                    fail!(from origin, with ListenerCreateError::IamConnectionFailed,
+                        "{} since communication with the IAM server failed: {:?}.", msg, e);
+                }
+            }
+        }
         let listener_id = fail!(from origin,
             when UniqueListenerId::new::<Service>(config.port_name, service.shared_node().id_generator()),
             with ListenerCreateError::UnableToGenerateUniqueListenerId,
@@ -243,6 +267,7 @@ impl<Service: service::Service> Listener<Service> {
         };
 
         Ok(Self {
+            _iam_attachment: iam_attachment,
             lifetime_tag,
             service_state: service.clone(),
             dynamic_listener_handle: handle,

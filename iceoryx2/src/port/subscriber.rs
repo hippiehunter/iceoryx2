@@ -54,6 +54,7 @@ use iceoryx2_log::{fail, warn};
 
 use crate::iam::error::IamClientError;
 use crate::port::port_lifetime_tag::PortLifetimeTag;
+use crate::port::details::iam_attachment::IamPortAttachment;
 use crate::port::port_name::PortName;
 use crate::port::update_connections::UpdateConnections;
 use crate::service::SharedServiceState;
@@ -117,6 +118,8 @@ pub(crate) struct SubscriberSharedState<Service: service::Service> {
     pub(crate) receiver: Receiver<Service, Secured<PublishSubscribeResources<Service>>>,
     pub(crate) publisher_list_state:
         UnsafeCell<<Service::Bag as BagFamily>::BagState<PublisherDetails>>,
+    /// Detaches the port from the IAM server of a secured service when the port goes away.
+    _iam_attachment: IamPortAttachment<Service, Secured<PublishSubscribeResources<Service>>>,
     // IMPORTANT!
     // Fields of a rust struct are dropped in declaration order. Since this tag is our marker that the
     // port exists and might require cleanup after a crash, the tag must be defined as last member of
@@ -129,6 +132,7 @@ pub(crate) struct SubscriberSharedState<Service: service::Service> {
 impl<Service: service::Service> Abandonable for SubscriberSharedState<Service> {
     unsafe fn abandon_in_place(mut this: NonNull<Self>) {
         let this = unsafe { this.as_mut() };
+        unsafe { Abandonable::abandon_in_place(NonNull::from_mut(&mut this._iam_attachment)) };
         unsafe { Receiver::abandon_in_place(NonNull::from_mut(&mut this.receiver)) };
         unsafe { Abandonable::abandon_in_place(NonNull::from_mut(&mut this.lifetime_tag)) };
     }
@@ -219,15 +223,13 @@ impl<
 
         // For secured services, request authorization from the IAM server before creating the port.
         // The IAM server verifies the process credentials and policy before allowing attachment.
+        let mut iam_attachment = IamPortAttachment::new(service.clone());
         if let Some(ctx) = service.additional_resource().as_client() {
             let buffer_size = config
                 .buffer_size
                 .unwrap_or(static_config.subscriber_max_buffer_size);
             match ctx.attach_subscriber(buffer_size) {
-                Ok((_port_id, _segments, _handles)) => {
-                    // IAM authorization successful. In a future iteration, the returned handles
-                    // will be used to open segments instead of creating them by name.
-                }
+                Ok((iam_port_id, _segments, _handles)) => iam_attachment.add(iam_port_id),
                 Err(IamClientError::RequestDenied) => {
                     fail!(from origin, with SubscriberCreateError::IamAuthorizationDenied,
                         "{} since the IAM server denied the attach request.", msg);
@@ -315,6 +317,7 @@ impl<
 
         let subscriber_shared_state = Service::ArcThreadSafetyPolicy::new(SubscriberSharedState {
             lifetime_tag,
+            _iam_attachment: iam_attachment,
             publisher_list_state: UnsafeCell::new(unsafe { publisher_list.get_state() }),
             receiver: Receiver {
                 connections: PolymorphicVec::from_fn(

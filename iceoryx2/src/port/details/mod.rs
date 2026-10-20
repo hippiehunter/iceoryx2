@@ -15,6 +15,7 @@ pub mod chunk_details;
 pub mod chunk_mut_shared_state;
 pub mod data_segment;
 pub mod data_segment_shared_state;
+pub(crate) mod iam_attachment;
 pub mod receiver;
 pub mod segment_state;
 pub mod sender;

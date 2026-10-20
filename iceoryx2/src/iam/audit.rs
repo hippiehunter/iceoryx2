@@ -69,6 +69,17 @@ pub enum AuditEventKind {
         /// The port ID being detached.
         port_id: u128,
     },
+    /// A consumer requested a handle (data segment, management segment or connection channel)
+    /// of a producer port.
+    AccessHandle {
+        /// The producer port whose handle was requested.
+        port_id: u128,
+    },
+    /// A producer registered a handle for one of its ports.
+    RegisterHandle {
+        /// The producer port the handle was registered for.
+        port_id: u128,
+    },
 }
 
 // ============================================================================
@@ -151,6 +162,12 @@ impl From<&AuditEvent> for SerializableAuditEvent {
             }
             AuditEventKind::Detach { port_id } => {
                 format!("detach:{}", port_id)
+            }
+            AuditEventKind::AccessHandle { port_id } => {
+                format!("access_handle:{}", port_id)
+            }
+            AuditEventKind::RegisterHandle { port_id } => {
+                format!("register_handle:{}", port_id)
             }
         };
 
@@ -304,6 +321,8 @@ impl FileAuditLogger {
                 }
                 write_errors = 0;
                 bytes_written += json.len() + 1; // +1 for newline
+                // audit events are rare and must be visible while the server is running
+                let _ = writer.flush();
 
                 // Check if rotation is needed
                 if config.max_file_size > 0 && bytes_written >= config.max_file_size {

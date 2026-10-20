@@ -491,6 +491,36 @@ impl<C: CalClient> IamClient<C> {
         Self::handle_attach_response(conn, response)
     }
 
+    /// Attaches as a notifier to an event service. The attach carries no handles; it is the
+    /// policy gate for the `notifier` role.
+    pub fn attach_notifier(&mut self, service_id: &ServiceHash) -> Result<u128, IamClientError> {
+        self.ensure_active()?;
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+        client_send_message(
+            conn,
+            &IamRequest::AttachNotifier {
+                service_id: *service_id,
+            },
+        )?;
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+        Self::handle_attach_response(conn, response).map(|(port_id, _, _)| port_id)
+    }
+
+    /// Attaches as a listener to an event service. The attach carries no handles; it is the
+    /// policy gate for the `listener` role.
+    pub fn attach_listener(&mut self, service_id: &ServiceHash) -> Result<u128, IamClientError> {
+        self.ensure_active()?;
+        let conn = self.connection.as_ref().ok_or(IamClientError::SendFailed)?;
+        client_send_message(
+            conn,
+            &IamRequest::AttachListener {
+                service_id: *service_id,
+            },
+        )?;
+        let response: IamResponse = client_receive_message(conn, &mut self.receive_buffer)?;
+        Self::handle_attach_response(conn, response).map(|(port_id, _, _)| port_id)
+    }
+
     /// Handles the response to an attach request.
     fn handle_attach_response(
         conn: &C,

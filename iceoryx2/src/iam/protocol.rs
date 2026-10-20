@@ -257,6 +257,10 @@ pub enum PortType {
     Server,
     /// A client port that sends requests to servers.
     Client,
+    /// A notifier port that emits events (event services).
+    Notifier,
+    /// A listener port that waits for events (event services).
+    Listener,
 }
 
 /// The kind of messaging pattern for a service.
@@ -502,6 +506,18 @@ pub enum IamRequest {
         service_id: ServiceHash,
         /// The producer port whose management-segment handle is requested.
         port_id: u128,
+    },
+
+    /// Request to attach a notifier to an event service.
+    AttachNotifier {
+        /// The service to attach to.
+        service_id: ServiceHash,
+    },
+
+    /// Request to attach a listener to an event service.
+    AttachListener {
+        /// The service to attach to.
+        service_id: ServiceHash,
     },
 }
 

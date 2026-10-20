@@ -46,6 +46,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+use iceoryx2_bb_container::semantic_string::SemanticString;
 use iceoryx2_cal::security::credentials::ProcessCredentials;
 use serde::Deserialize;
 
@@ -157,10 +158,23 @@ pub enum PrincipalMatcher {
         /// The user ID to match.
         uid: u32,
     },
-    /// Match by specific GID.
+    /// Match by group: the principal's primary group or any of its supplementary groups (as
+    /// verified by the kernel via `SO_PEERCRED` / `SO_PEERGROUPS`).
     Gid {
         /// The group ID to match.
         gid: u32,
+    },
+    /// Match by group name, resolved through the system group database when the rule is
+    /// evaluated: `{ group = "sipwriters" }`. Same membership semantics as [`PrincipalMatcher::Gid`].
+    GroupName {
+        /// The group name to match.
+        group: String,
+    },
+    /// Match by user name, resolved through the system user database when the rule is
+    /// evaluated: `{ user = "sipbroker" }`.
+    UserName {
+        /// The user name to match.
+        user: String,
     },
     /// Match by UID range using array format: `{ uid_range = [2000, 2999] }`.
     UidRangeArray {
@@ -206,7 +220,13 @@ impl PrincipalMatcher {
     pub fn matches(&self, credentials: &ProcessCredentials) -> bool {
         match self {
             PrincipalMatcher::Uid { uid } => credentials.uid() == *uid,
-            PrincipalMatcher::Gid { gid } => credentials.gid() == *gid,
+            PrincipalMatcher::Gid { gid } => credentials.is_in_group(*gid),
+            PrincipalMatcher::GroupName { group } => {
+                resolve_group_name(group).is_some_and(|gid| credentials.is_in_group(gid))
+            }
+            PrincipalMatcher::UserName { user } => {
+                resolve_user_name(user).is_some_and(|uid| credentials.uid() == uid)
+            }
             PrincipalMatcher::UidRangeArray { uid_range } => {
                 credentials.uid() >= uid_range[0] && credentials.uid() <= uid_range[1]
             }
@@ -216,6 +236,22 @@ impl PrincipalMatcher {
             PrincipalMatcher::Any(_) => true,
         }
     }
+}
+
+/// Resolves a group name through the system group database.
+fn resolve_group_name(name: &str) -> Option<u32> {
+    let name = iceoryx2_bb_system_types::group_name::GroupName::new(name.as_bytes()).ok()?;
+    iceoryx2_bb_posix::group::Group::from_name(&name)
+        .ok()
+        .map(|g| g.gid().value())
+}
+
+/// Resolves a user name through the system user database.
+fn resolve_user_name(name: &str) -> Option<u32> {
+    let name = iceoryx2_bb_system_types::user_name::UserName::new(name.as_bytes()).ok()?;
+    iceoryx2_bb_posix::user::User::from_name(&name)
+        .ok()
+        .map(|u| u.uid().value())
 }
 
 /// Resource limits from a TOML policy file.
@@ -231,6 +267,10 @@ pub struct PolicyLimits {
     pub max_servers: Option<usize>,
     /// Maximum number of clients.
     pub max_clients: Option<usize>,
+    /// Maximum number of notifiers.
+    pub max_notifiers: Option<usize>,
+    /// Maximum number of listeners.
+    pub max_listeners: Option<usize>,
     /// Maximum number of segments.
     pub max_segments: Option<usize>,
     /// Maximum segment size (human-readable, e.g., "64MB").
@@ -262,6 +302,8 @@ impl PolicyLimits {
             max_subscribers: self.max_subscribers.unwrap_or(defaults.max_subscribers),
             max_servers: self.max_servers.unwrap_or(defaults.max_servers),
             max_clients: self.max_clients.unwrap_or(defaults.max_clients),
+            max_notifiers: self.max_notifiers.unwrap_or(defaults.max_notifiers),
+            max_listeners: self.max_listeners.unwrap_or(defaults.max_listeners),
             max_segments: self.max_segments.unwrap_or(defaults.max_segments),
             max_segment_size: self
                 .max_segment_size
@@ -314,6 +356,9 @@ pub fn parse_size_string(s: &str) -> Option<usize> {
 // ============================================================================
 // ConfiguredPolicy
 // ============================================================================
+
+/// Roles whose ports own (and therefore register) shared-memory segments.
+const PRODUCER_ROLES: [&str; 3] = ["publisher", "server", "client"];
 
 /// Policy implementation driven by TOML-based configuration rules.
 ///
@@ -479,6 +524,8 @@ impl IamPolicy for ConfiguredPolicy {
             PortType::Subscriber => "subscriber",
             PortType::Server => "server",
             PortType::Client => "client",
+            PortType::Notifier => "notifier",
+            PortType::Listener => "listener",
         };
 
         if self.check_allow_with_role(credentials, required_role) {
@@ -505,11 +552,16 @@ impl IamPolicy for ConfiguredPolicy {
             return decision;
         }
 
-        // Same-UID check (segment operations require ownership)
-        if credentials.uid() != self.owner_uid {
+        // Segments are owned by producer ports: the service owner and every principal that holds
+        // a producer role (the IAM server additionally binds each segment to the session that
+        // attached the producing port).
+        let is_producer = PRODUCER_ROLES
+            .iter()
+            .any(|role| self.check_allow_with_role(credentials, role));
+        if credentials.uid() != self.owner_uid && !is_producer {
             return PolicyDecision::deny(
                 DenialReason::Unauthorized,
-                "Only the service owner can add segments",
+                "Only the service owner or principals with a producer role (publisher, server, client) can add segments",
             );
         }
 
@@ -1263,6 +1315,8 @@ max_segment_size = "0"
             max_subscribers: Some(32),
             max_servers: Some(4),
             max_clients: Some(16),
+            max_notifiers: Some(2),
+            max_listeners: Some(3),
             max_segments: Some(10),
             max_segment_size: Some(String::from("128MB")),
         };
@@ -1272,6 +1326,8 @@ max_segment_size = "0"
         assert_eq!(rl.max_subscribers, 32);
         assert_eq!(rl.max_servers, 4);
         assert_eq!(rl.max_clients, 16);
+        assert_eq!(rl.max_notifiers, 2);
+        assert_eq!(rl.max_listeners, 3);
         assert_eq!(rl.max_segments, 10);
         assert_eq!(rl.max_segment_size, 128 * 1024 * 1024);
     }
@@ -1283,6 +1339,8 @@ max_segment_size = "0"
             max_subscribers: None,
             max_servers: None,
             max_clients: None,
+            max_notifiers: None,
+            max_listeners: None,
             max_segments: None,
             max_segment_size: None,
         };
@@ -1292,5 +1350,120 @@ max_segment_size = "0"
         // Defaults
         assert_eq!(rl.max_subscribers, 256);
         assert_eq!(rl.max_segment_size, 64 * 1024 * 1024);
+    }
+
+    // ========================================================================
+    // Multi-user: supplementary groups, event roles, producer segments
+    // ========================================================================
+
+    fn sip_policy() -> ConfiguredPolicy {
+        let file: PolicyFile = toml::from_str(
+            r#"
+[service]
+name = "DeltaReplicator/events"
+
+[[allow]]
+principal = { uid = 0 }
+roles = ["listener", "subscriber"]
+
+[[allow]]
+principal = { gid = 3000 }
+roles = ["notifier", "publisher"]
+"#,
+        )
+        .unwrap();
+        ConfiguredPolicy::from_policy_file(file, 0)
+    }
+
+    fn service_id() -> ServiceHash {
+        use crate::service::messaging_pattern::MessagingPattern;
+        use iceoryx2_cal::hash::sha1::Sha1;
+        ServiceHash::new::<Sha1>(
+            &ServiceName::new("DeltaReplicator/events").unwrap(),
+            MessagingPattern::Event,
+        )
+    }
+
+    #[test]
+    fn test_gid_rule_matches_supplementary_group_when_primary_group_differs() {
+        let policy = sip_policy();
+        // `usermod -aG sipwriters dbluser`: primary group 2001, supplementary 3000
+        let member = ProcessCredentials::new(10, 2001, 2001).with_supplementary_gids(vec![100, 3000]);
+        assert!(policy
+            .authorize_attach(&member, &service_id(), PortType::Notifier)
+            .is_allowed());
+        assert!(policy
+            .authorize_attach(&member, &service_id(), PortType::Publisher)
+            .is_allowed());
+
+        let non_member = ProcessCredentials::new(11, 2003, 2003).with_supplementary_gids(vec![100]);
+        assert!(policy
+            .authorize_attach(&non_member, &service_id(), PortType::Notifier)
+            .is_denied());
+
+        // primary-group membership keeps working
+        let primary = ProcessCredentials::new(12, 2004, 3000);
+        assert!(policy
+            .authorize_attach(&primary, &service_id(), PortType::Notifier)
+            .is_allowed());
+    }
+
+    #[test]
+    fn test_notifier_and_listener_roles_are_policy_controlled() {
+        let policy = sip_policy();
+        let broker = ProcessCredentials::new(1, 0, 0);
+        let writer = ProcessCredentials::new(2, 2001, 2001).with_supplementary_gids(vec![3000]);
+
+        assert!(policy.authorize_attach(&broker, &service_id(), PortType::Listener).is_allowed());
+        assert!(policy.authorize_attach(&broker, &service_id(), PortType::Notifier).is_denied());
+        assert!(policy.authorize_attach(&writer, &service_id(), PortType::Notifier).is_allowed());
+        assert!(policy.authorize_attach(&writer, &service_id(), PortType::Listener).is_denied());
+        assert!(policy.authorize_attach(&writer, &service_id(), PortType::Subscriber).is_denied());
+    }
+
+    #[test]
+    fn test_producer_role_may_add_segments_consumer_role_may_not() {
+        let policy = sip_policy();
+        let writer = ProcessCredentials::new(2, 2001, 2001).with_supplementary_gids(vec![3000]);
+        let stranger = ProcessCredentials::new(3, 2003, 2003);
+        let owner = ProcessCredentials::new(1, 0, 0);
+        assert!(policy.authorize_add_segment(&writer, &service_id(), 4096).is_allowed());
+        assert!(policy.authorize_add_segment(&owner, &service_id(), 4096).is_allowed());
+        assert!(policy.authorize_add_segment(&stranger, &service_id(), 4096).is_denied());
+    }
+
+    #[test]
+    fn test_group_and_user_name_principals() {
+        let file: PolicyFile = toml::from_str(
+            r#"
+[service]
+name = "x"
+
+[[allow]]
+principal = { group = "root" }
+roles = ["publisher"]
+
+[[allow]]
+principal = { user = "root" }
+roles = ["subscriber"]
+
+[[allow]]
+principal = { group = "iox2-group-that-does-not-exist" }
+roles = ["listener"]
+"#,
+        )
+        .unwrap();
+        let policy = ConfiguredPolicy::from_policy_file(file, 0);
+        let in_root_group = ProcessCredentials::new(1, 2001, 2001).with_supplementary_gids(vec![0]);
+        assert!(policy
+            .authorize_attach(&in_root_group, &service_id(), PortType::Publisher)
+            .is_allowed());
+        assert!(policy
+            .authorize_attach(&in_root_group, &service_id(), PortType::Subscriber)
+            .is_denied());
+        let root = ProcessCredentials::new(1, 0, 0);
+        assert!(policy.authorize_attach(&root, &service_id(), PortType::Subscriber).is_allowed());
+        // an unknown group never matches
+        assert!(policy.authorize_attach(&root, &service_id(), PortType::Listener).is_denied());
     }
 }

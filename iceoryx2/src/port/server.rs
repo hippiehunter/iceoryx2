@@ -76,6 +76,7 @@
 use crate::iam::error::IamClientError;
 use crate::port::details::data_segment_shared_state::DataSegmentSharedState;
 use crate::port::port_lifetime_tag::PortLifetimeTag;
+use crate::port::details::iam_attachment::IamPortAttachment;
 use crate::port::port_name::PortName;
 use crate::port::update_connections::UpdateConnections;
 use crate::prelude::BackpressureStrategy;
@@ -147,6 +148,8 @@ pub struct SharedServerState<Service: service::Service> {
     pub(crate) request_receiver: Receiver<Service, Secured<RequestResponseResources<Service>>>,
     client_list_state: UnsafeCell<<Service::Bag as BagFamily>::BagState<ClientDetails>>,
     service_state: SharedServiceState<Service, Secured<RequestResponseResources<Service>>>,
+    /// Detaches the port from the IAM server of a secured service when the port goes away.
+    _iam_attachment: IamPortAttachment<Service, Secured<RequestResponseResources<Service>>>,
     // IMPORTANT!
     // Fields of a rust struct are dropped in declaration order. Since this tag is our marker that the
     // port exists and might require cleanup after a crash, the tag must be defined as last member of
@@ -202,6 +205,7 @@ impl<Service: service::Service> Grow<ShmPointer> for SharedServerState<Service> 
 impl<Service: service::Service> Abandonable for SharedServerState<Service> {
     unsafe fn abandon_in_place(mut this: NonNull<Self>) {
         let this = unsafe { this.as_mut() };
+        unsafe { Abandonable::abandon_in_place(NonNull::from_mut(&mut this._iam_attachment)) };
 
         unsafe { Sender::abandon_in_place(NonNull::from_mut(&mut this.response_sender)) };
         unsafe { Receiver::abandon_in_place(NonNull::from_mut(&mut this.request_receiver)) };
@@ -411,11 +415,14 @@ impl<
 
         // For secured services, request authorization from the IAM server before creating the port.
         // The IAM server verifies the process credentials and policy before allowing attachment.
+        let mut iam_attachment = IamPortAttachment::new(service.clone());
         let secured_ctx = service.additional_resource().as_client();
         if let Some(ctx) = secured_ctx {
             match ctx.attach_server(static_config.max_active_requests_per_client) {
-                Ok((_port_id, _segments, _handles)) => {
-                    // IAM authorization successful.
+                Ok((iam_port_id, _segments, _handles)) => {
+                    iam_attachment.add(iam_port_id);
+                    // the handles of this producer are registered under its own port id
+                    iam_attachment.add(server_id.value());
                 }
                 Err(IamClientError::RequestDenied) => {
                     fail!(from origin, with ServerCreateError::IamAuthorizationDenied,
@@ -612,6 +619,7 @@ impl<
 
         let shared_state = Service::ArcThreadSafetyPolicy::new(SharedServerState {
             lifetime_tag,
+            _iam_attachment: iam_attachment,
             config: server_factory.config,
             request_receiver,
             client_list_state: UnsafeCell::new(unsafe { client_list.get_state() }),

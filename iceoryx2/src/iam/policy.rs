@@ -116,6 +116,10 @@ pub struct ResourceLimits {
     pub max_servers: usize,
     /// Maximum number of clients a principal can create.
     pub max_clients: usize,
+    /// Maximum number of notifiers a principal can create.
+    pub max_notifiers: usize,
+    /// Maximum number of listeners a principal can create.
+    pub max_listeners: usize,
     /// Maximum number of segments a principal can allocate.
     ///
     /// Note: This limit is enforced by the IAM server (Phase 3), not by the
@@ -135,6 +139,8 @@ impl Default for ResourceLimits {
             max_subscribers: 256,
             max_servers: 16,
             max_clients: 256,
+            max_notifiers: 256,
+            max_listeners: 256,
             max_segments: 64,
             max_segment_size: 64 * 1024 * 1024, // 64 MB
         }
@@ -227,6 +233,8 @@ impl ResourceLimits {
             max_subscribers,
             max_servers,
             max_clients,
+            max_notifiers: 256,
+            max_listeners: 256,
             max_segments,
             max_segment_size,
         }
@@ -625,6 +633,8 @@ mod tests {
             max_subscribers: 128,
             max_servers: 4,
             max_clients: 64,
+            max_notifiers: 64,
+            max_listeners: 64,
             max_segments: 32,
             max_segment_size: 32 * 1024 * 1024,
         };
@@ -691,6 +701,8 @@ mod tests {
             max_subscribers: 0,
             max_servers: 0,
             max_clients: 0,
+            max_notifiers: 0,
+            max_listeners: 0,
             max_segments: 0,
             max_segment_size: 1024, // Non-zero
         };
