@@ -305,7 +305,7 @@ impl core::fmt::Display for NodeCleanupFailure {
 impl core::error::Error for NodeCleanupFailure {}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum NodeReadStorageFailure {
+pub(crate) enum NodeReadStorageFailure {
     ReadError,
     InsufficientPermissions,
     Corrupted,
@@ -779,6 +779,89 @@ impl<Service: service::Service> DeadNodeView<Service> {
             }
         }
     }
+}
+
+/// Multi-user secured mode: makes sure that the directories every participating user creates
+/// entries in - the root path, the node directory and the service directory - exist with the
+/// configured shared mode (e.g. sticky `1777` or set-group-id `2770`) and group.
+///
+/// Directories that already exist are left untouched (an installer may own them); a directory
+/// this process creates is created with the shared mode and handed to the shared group. When
+/// the process is not allowed to hand it to the group (it is neither root nor a member) the node
+/// creation fails, since other users would otherwise be locked out.
+fn ensure_shared_directories(config: &Config) -> Result<(), NodeCreationFailure> {
+    use iceoryx2_bb_posix::directory::{Directory, DirectoryCreateError};
+    use iceoryx2_bb_posix::file_descriptor::FileDescriptorManagement;
+    use iceoryx2_bb_posix::group::Gid;
+    use iceoryx2_bb_posix::ownership::OwnershipBuilder;
+    use iceoryx2_bb_posix::user::Uid;
+
+    let origin = "ensure_shared_directories()";
+    let security = &config.global.node.security;
+    let Some(mode) = security.shared_directory_mode else {
+        return Ok(());
+    };
+    let permission = mode.as_permission();
+
+    if (mode.bits() & 0o700) != 0o700 {
+        fail!(from origin, with NodeCreationFailure::InternalError,
+            "The shared-directory-mode {mode} must grant the owner full access (rwx).");
+    }
+
+    let group = match &security.shared_group {
+        Some(name) => match crate::config::resolve_group(name) {
+            Some(gid) => Some(gid),
+            None => {
+                fail!(from origin, with NodeCreationFailure::InternalError,
+                    "The shared-group \"{name}\" does not exist.");
+            }
+        },
+        None => None,
+    };
+
+    for path in [
+        *config.global.root_path(),
+        config.global.node_dir(),
+        config.global.service_dir(),
+    ] {
+        match Directory::does_exist(&path) {
+            Ok(true) => continue,
+            Ok(false) => (),
+            Err(e) => {
+                fail!(from origin, with NodeCreationFailure::InsufficientPermissions,
+                    "Unable to check whether the shared directory \"{path}\" exists ({e:?}).");
+            }
+        }
+
+        let mut directory = match Directory::create(&path, permission) {
+            Ok(d) => d,
+            Err(DirectoryCreateError::DirectoryAlreadyExists) => continue,
+            Err(e) => {
+                fail!(from origin, with NodeCreationFailure::InsufficientPermissions,
+                    "Unable to create the shared directory \"{path}\" ({e:?}).");
+            }
+        };
+
+        if let Some(gid) = group {
+            let ownership = OwnershipBuilder::new()
+                .uid(Uid::new_from_native(u32::MAX as _))
+                .gid(Gid::new_from_native(gid))
+                .create();
+            if let Err(e) = directory.set_ownership(ownership) {
+                fail!(from origin, with NodeCreationFailure::InsufficientPermissions,
+                    "Unable to hand the shared directory \"{path}\" to the group {gid} ({e:?}); the creating process must be root or a member of the group.");
+            }
+            // changing the group may clear the set-group-id bit; re-apply the full mode
+            if let Err(e) = directory.set_permission(permission) {
+                fail!(from origin, with NodeCreationFailure::InsufficientPermissions,
+                    "Unable to apply the mode {mode} to the shared directory \"{path}\" ({e:?}).");
+            }
+        }
+
+        debug!(from origin, "created shared directory \"{path}\" with mode {mode} and group {group:?}");
+    }
+
+    Ok(())
 }
 
 fn acquire_all_node_detail_storages<Service: service::Service>(
@@ -1388,7 +1471,7 @@ impl<Service: service::Service> Node<Service> {
         }
     }
 
-    fn get_node_state(config: &Config, node_id: &UniqueNodeId) -> Result<State, NodeListFailure> {
+    pub(crate) fn get_node_state(config: &Config, node_id: &UniqueNodeId) -> Result<State, NodeListFailure> {
         let config = node_monitoring_config::<Service>(config);
         let result = <Service::Monitoring as Monitoring>::Builder::new(&node_id.as_file_name())
             .config(&config)
@@ -1457,7 +1540,7 @@ impl<Service: service::Service> Node<Service> {
         }
     }
 
-    fn get_node_details(
+    pub(crate) fn get_node_details(
         config: &Config,
         node_id: &UniqueNodeId,
     ) -> Result<Option<NodeDetails>, NodeReadStorageFailure> {
@@ -1613,6 +1696,10 @@ impl NodeBuilder {
             .config
             .as_ref()
             .unwrap_or_else(|| Config::global_config());
+
+        if config.global.node.security.is_multi_user() {
+            ensure_shared_directories(config)?;
+        }
 
         let name_generator = fail!(from self, when Service::NameGenerator::open_or_create(config),
             with NodeCreationFailure::UnableToOpenOrCreateNameGenerator,

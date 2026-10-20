@@ -182,6 +182,100 @@ impl Default for Service {
     }
 }
 
+/// A POSIX file mode (permission bits plus set-group-id / sticky bits) used by the multi-user
+/// settings of secured mode.
+///
+/// In TOML it is written as an octal string, e.g. `"1777"`, `"2770"` or `"0660"` (an optional
+/// `0o` prefix is accepted). A TOML octal integer literal (`0o2770`) works as well; a plain
+/// decimal integer is taken literally and therefore almost always wrong.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct FileMode(u32);
+
+impl FileMode {
+    /// Creates a mode from its raw bits, e.g. `FileMode::new(0o2770)`. Bits outside of `0o7777`
+    /// are rejected.
+    pub const fn new(bits: u32) -> Option<Self> {
+        if bits > 0o7777 { None } else { Some(Self(bits)) }
+    }
+
+    /// The raw mode bits.
+    pub const fn bits(&self) -> u32 {
+        self.0
+    }
+
+    /// Parses an octal mode string such as `"2770"` or `"0o1777"`.
+    pub fn from_octal_str(value: &str) -> Option<Self> {
+        let digits = value.trim();
+        let digits = digits.strip_prefix("0o").unwrap_or(digits);
+        if digits.is_empty() || digits.len() > 4 {
+            return None;
+        }
+        u32::from_str_radix(digits, 8).ok().and_then(Self::new)
+    }
+
+    /// The mode as [`Permission`](iceoryx2_bb_posix::permission::Permission).
+    pub fn as_permission(&self) -> iceoryx2_bb_posix::permission::Permission {
+        iceoryx2_bb_posix::permission::Permission::from_bits(self.0)
+    }
+}
+
+impl core::fmt::Display for FileMode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:04o}", self.0)
+    }
+}
+
+impl Serialize for FileMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&alloc::format!("{:04o}", self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for FileMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ModeVisitor;
+        impl serde::de::Visitor<'_> for ModeVisitor {
+            type Value = FileMode;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("an octal file mode string like \"2770\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<FileMode, E> {
+                FileMode::from_octal_str(v)
+                    .ok_or_else(|| E::custom(alloc::format!("invalid octal file mode \"{v}\"")))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<FileMode, E> {
+                u32::try_from(v)
+                    .ok()
+                    .and_then(FileMode::new)
+                    .ok_or_else(|| E::custom(alloc::format!("invalid file mode {v}")))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<FileMode, E> {
+                u32::try_from(v)
+                    .ok()
+                    .and_then(FileMode::new)
+                    .ok_or_else(|| E::custom(alloc::format!("invalid file mode {v}")))
+            }
+        }
+        deserializer.deserialize_any(ModeVisitor)
+    }
+}
+
+/// Resolves a group given by name (`"sipwriters"`) or numerically (`"3000"`) to its gid.
+pub(crate) fn resolve_group(group: &FileName) -> Option<u32> {
+    let name = core::str::from_utf8(group.as_bytes()).ok()?;
+    if let Ok(gid) = name.parse::<u32>() {
+        return Some(gid);
+    }
+    let group_name = iceoryx2_bb_system_types::group_name::GroupName::new(name.as_bytes()).ok()?;
+    iceoryx2_bb_posix::group::Group::from_name(&group_name)
+        .ok()
+        .map(|g| g.gid().value())
+}
+
 /// IAM (Identity and Access Management) configuration for secured services.
 ///
 /// This configuration is only used when [`NodeSecurity::mode`] is set to
@@ -212,6 +306,15 @@ pub struct IamConfig {
     /// The file is opened in append mode and written in JSON Lines format.
     /// Set to an empty path to disable audit logging.
     pub audit_log_path: Path,
+    /// File mode of the IAM control socket (e.g. `"0660"` or `"0666"`). When unset the socket is
+    /// accessible by its owner only (single-user default). Connecting needs write access, so the
+    /// group/others bits decide who may *talk* to the IAM server; what they may *do* is decided
+    /// by the policy, never by this mode.
+    pub endpoint_mode: Option<FileMode>,
+    /// Group (name or numeric gid) the IAM control socket is handed to when
+    /// [`IamConfig::endpoint_mode`] grants group access. Optional; without it the socket keeps
+    /// the group it inherits from its directory.
+    pub endpoint_group: Option<FileName>,
 }
 
 impl Default for IamConfig {
@@ -221,6 +324,8 @@ impl Default for IamConfig {
             connect_timeout: Duration::from_secs(5),
             policy_dir: Path::new(b"iam/policies").unwrap(),
             audit_log_path: Path::new(b"iam/audit.log").unwrap(),
+            endpoint_mode: None,
+            endpoint_group: None,
         }
     }
 }
@@ -255,6 +360,22 @@ pub struct NodeSecurity {
     pub mode: SecurityMode,
     /// IAM configuration (only used when mode is [`SecurityMode::Secured`]).
     pub iam: IamConfig,
+    /// Enables multi-user secured mode (only used when mode is [`SecurityMode::Secured`]).
+    ///
+    /// The mode (e.g. `"1777"` sticky world-writable, or `"2770"` group-shared set-group-id)
+    /// that the shared directories - the root path, the node directory and the service
+    /// directory - are created with when they do not yet exist. When set, the metadata that other
+    /// users need to open a service and to observe nodes (static service config, node details,
+    /// node monitor files, service dynamic config, event channels) is shared with the group
+    /// and/or others as far as the group/others bits of this mode allow. Data segments and
+    /// connection channels stay anonymous and are only handed out by the IAM server.
+    ///
+    /// When unset (default) every resource is accessible by its creating user only.
+    pub shared_directory_mode: Option<FileMode>,
+    /// The group (name or numeric gid) shared directories and shared POSIX shared memory are
+    /// handed to when [`NodeSecurity::shared_directory_mode`] grants group access. The creating
+    /// process must be `root` or a member of the group.
+    pub shared_group: Option<FileName>,
 }
 
 impl Default for NodeSecurity {
@@ -262,6 +383,38 @@ impl Default for NodeSecurity {
         Self {
             mode: SecurityMode::Public,
             iam: IamConfig::default(),
+            shared_directory_mode: None,
+            shared_group: None,
+        }
+    }
+}
+
+impl NodeSecurity {
+    /// Returns `true` when multi-user secured mode is enabled, i.e. the node is secured and a
+    /// [`NodeSecurity::shared_directory_mode`] is configured.
+    pub fn is_multi_user(&self) -> bool {
+        self.mode.is_secured() && self.shared_directory_mode.is_some()
+    }
+
+    /// The access with which metadata resources are shared with other users.
+    pub(crate) fn metadata_access(&self) -> iceoryx2_cal::named_concept::SharedAccess {
+        match (self.mode.is_secured(), self.shared_directory_mode) {
+            (true, Some(mode)) => iceoryx2_cal::named_concept::SharedAccess::from_mode(
+                mode.as_permission(),
+                self.shared_group.as_ref().and_then(resolve_group),
+            ),
+            _ => iceoryx2_cal::named_concept::SharedAccess::owner_only(),
+        }
+    }
+
+    /// The access with which the IAM control socket is shared with other users.
+    pub(crate) fn endpoint_access(&self) -> iceoryx2_cal::named_concept::SharedAccess {
+        match (self.mode.is_secured(), self.iam.endpoint_mode) {
+            (true, Some(mode)) => iceoryx2_cal::named_concept::SharedAccess::from_mode(
+                mode.as_permission(),
+                self.iam.endpoint_group.as_ref().and_then(resolve_group),
+            ),
+            _ => iceoryx2_cal::named_concept::SharedAccess::owner_only(),
         }
     }
 }
@@ -856,3 +1009,70 @@ impl Config {
         ICEORYX2_CONFIG.get()
     }
 }
+
+#[cfg(test)]
+mod multi_user_config_tests {
+    use super::*;
+
+    #[test]
+    fn file_mode_parses_octal_strings() {
+        assert_eq!(FileMode::from_octal_str("1777").unwrap().bits(), 0o1777);
+        assert_eq!(FileMode::from_octal_str("0o2770").unwrap().bits(), 0o2770);
+        assert_eq!(FileMode::from_octal_str("0660").unwrap().bits(), 0o660);
+        assert!(FileMode::from_octal_str("").is_none());
+        assert!(FileMode::from_octal_str("9").is_none());
+        assert!(FileMode::from_octal_str("17777").is_none());
+    }
+
+    #[test]
+    fn multi_user_keys_round_trip_through_toml() {
+        let toml = r#"
+[global.node.security]
+mode = "secured"
+shared-directory-mode = "2770"
+shared-group = "sipwriters"
+
+[global.node.security.iam]
+endpoint-mode = "0660"
+endpoint-group = "sipwriters"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let security = &config.global.node.security;
+        assert!(security.is_multi_user());
+        assert_eq!(security.shared_directory_mode.unwrap().bits(), 0o2770);
+        assert_eq!(security.iam.endpoint_mode.unwrap().bits(), 0o660);
+        assert_eq!(
+            security.shared_group.as_ref().unwrap().as_bytes(),
+            b"sipwriters"
+        );
+
+        let serialized = toml::to_string(&config).unwrap();
+        let again: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(again, config);
+    }
+
+    #[test]
+    fn defaults_are_single_user() {
+        let config = Config::default();
+        let security = &config.global.node.security;
+        assert!(!security.is_multi_user());
+        assert!(security.metadata_access().is_owner_only());
+        assert!(security.endpoint_access().is_owner_only());
+    }
+
+    #[test]
+    fn multi_user_settings_are_ignored_in_public_mode() {
+        let mut config = Config::default();
+        config.global.node.security.shared_directory_mode = FileMode::new(0o1777);
+        config.global.node.security.iam.endpoint_mode = FileMode::new(0o666);
+        assert!(!config.global.node.security.is_multi_user());
+        assert!(config.global.node.security.metadata_access().is_owner_only());
+        assert!(config.global.node.security.endpoint_access().is_owner_only());
+    }
+
+    #[test]
+    fn numeric_groups_resolve_without_a_group_database() {
+        assert_eq!(resolve_group(&FileName::new(b"3000").unwrap()), Some(3000));
+    }
+}
+

@@ -28,6 +28,7 @@ pub(crate) fn dynamic_config_storage_config<Service: crate::service::Service>(
         .prefix(&global_config.global.prefix)
         .suffix(&global_config.global.service.dynamic_config_storage_suffix)
         .path_hint(global_config.global.root_path())
+        .shared_access(&global_config.global.node.security.metadata_access())
 }
 
 pub(crate) fn static_config_storage_config<Service: crate::service::Service>(
@@ -44,6 +45,7 @@ pub(crate) fn static_config_storage_config<Service: crate::service::Service>(
         .prefix(&global_config.global.prefix)
         .suffix(&global_config.global.service.static_config_storage_suffix)
         .path_hint(&path_hint)
+        .shared_access(&global_config.global.node.security.metadata_access())
 }
 
 pub(crate) fn connection_config<Service: crate::service::Service>(
@@ -61,6 +63,7 @@ pub(crate) fn control_channel_config<Service: crate::service::Service>(
     <<Service::ControlChannel as NamedConceptMgmt>::Configuration>::default()
         .prefix(&global_config.global.prefix)
         .path_hint(global_config.global.root_path())
+        .shared_access(&global_config.global.node.security.endpoint_access())
 }
 
 pub(crate) fn event_config<Service: crate::service::Service>(
@@ -70,6 +73,7 @@ pub(crate) fn event_config<Service: crate::service::Service>(
         .prefix(&global_config.global.prefix)
         .suffix(&global_config.global.service.event_connection_suffix)
         .path_hint(global_config.global.root_path())
+        .shared_access(&global_config.global.node.security.metadata_access())
 }
 
 pub(crate) fn data_segment_config<Service: crate::service::Service>(
@@ -97,6 +101,7 @@ pub(crate) fn node_monitoring_config<Service: crate::service::Service>(
         .prefix(&global_config.global.prefix)
         .suffix(&global_config.global.node.monitor_suffix)
         .path_hint(&global_config.global.node_dir())
+        .shared_access(&global_config.global.node.security.metadata_access())
 }
 
 pub(crate) fn node_details_path(
@@ -121,6 +126,7 @@ pub(crate) fn node_details_config<Service: crate::service::Service>(
         .prefix(&global_config.global.prefix)
         .suffix(&global_config.global.node.static_config_suffix)
         .path_hint(&node_details_path(global_config, node_id))
+        .shared_access(&global_config.global.node.security.metadata_access())
 }
 
 pub(crate) fn port_tag_config<Service: crate::service::Service>(
@@ -131,6 +137,7 @@ pub(crate) fn port_tag_config<Service: crate::service::Service>(
         .prefix(&global_config.global.prefix)
         .suffix(&global_config.global.node.port_tag_suffix)
         .path_hint(&node_details_path(global_config, node_id))
+        .shared_access(&global_config.global.node.security.metadata_access())
 }
 
 pub(crate) fn service_tag_config<Service: crate::service::Service>(
@@ -141,6 +148,7 @@ pub(crate) fn service_tag_config<Service: crate::service::Service>(
         .prefix(&global_config.global.prefix)
         .suffix(&global_config.global.node.service_tag_suffix)
         .path_hint(&node_details_path(global_config, node_id))
+        .shared_access(&global_config.global.node.security.metadata_access())
 }
 
 pub(crate) fn blackboard_mgmt_config<
