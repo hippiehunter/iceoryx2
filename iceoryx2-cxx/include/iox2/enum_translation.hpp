@@ -2918,6 +2918,8 @@ constexpr auto from<int, iox2::NodeCleanupFailure>(const int value) noexcept -> 
         return iox2::NodeCleanupFailure::AnotherInstanceIsCleaningUpTheNode;
     case iox2_node_cleanup_failure_e_RESOURCES_ALREADY_CLEANED_UP:
         return iox2::NodeCleanupFailure::ResourcesAlreadyCleanedUp;
+    case iox2_node_cleanup_failure_e_NODE_IS_ALIVE:
+        return iox2::NodeCleanupFailure::NodeIsAlive;
     }
 
     IOX2_UNREACHABLE();

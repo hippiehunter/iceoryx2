@@ -71,6 +71,8 @@ enum class NodeCleanupFailure : uint8_t {
     ResourcesAlreadyCleanedUp,
     /// Another instance has acquired the ownership of all resources and is currently cleaning up.
     AnotherInstanceIsCleaningUpTheNode,
+    /// The [`Node`] was reported dead but is alive (it was starting up); nothing was removed.
+    NodeIsAlive,
 };
 
 } // namespace iox2

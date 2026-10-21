@@ -142,6 +142,9 @@ pub(crate) fn blocking_cleanup_dead_nodes_in_service<T: PortFactory>(
             debug!(from port_factory, "Dead node ({:?}) detected", node_id);
             match node.blocking_remove_stale_resources(timeout) {
                 Ok(()) => cleanup_state.cleanups +=1,
+                Err(NodeCleanupFailure::NodeIsAlive) => {
+                    debug!(from port_factory, "The node ({:?}) is alive after all.", node_id);
+                }
                 Err(NodeCleanupFailure::AnotherInstanceIsCleaningUpTheNode) => {
                     cleanup_state.failed_cleanups += 1;
                     warn!(from port_factory,

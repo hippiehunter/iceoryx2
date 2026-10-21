@@ -294,6 +294,10 @@ pub enum NodeCleanupFailure {
     ResourcesAlreadyCleanedUp,
     /// Another instance has acquired the ownership of all resources and is currently cleaning up.
     AnotherInstanceIsCleaningUpTheNode,
+    /// The [`Node`] was reported dead but is alive: it was starting up while its state was read
+    /// (the state check and the cleanup are separate steps; on Windows, where file locks and
+    /// permissions are emulated, a starting node can be read as dead). Nothing was removed.
+    NodeIsAlive,
 }
 
 impl core::fmt::Display for NodeCleanupFailure {
@@ -774,8 +778,8 @@ impl<Service: service::Service> DeadNodeView<Service> {
                     "{} due to an internal error while acquiring monitoring cleaner.", msg);
             }
             Err(MonitoringCreateCleanerError::InstanceStillAlive) => {
-                fatal_panic!(from self,
-                        "This should never happen! {} since the Node is still alive.", msg);
+                fail!(from self, with NodeCleanupFailure::NodeIsAlive,
+                    "{} since the Node is alive (it was starting up when its state was read).", msg);
             }
         }
     }
@@ -1095,6 +1099,9 @@ impl<Service: service::Service> SharedNodeState<Service> {
                     Ok(_) => {
                         cleanup_state.cleanups += 1;
                         trace!(from origin, "The dead node ({:?}) was successfully removed.", node_id)
+                    }
+                    Err(NodeCleanupFailure::NodeIsAlive) => {
+                        debug!(from origin, "The node ({:?}) is alive after all.", node_id)
                     }
                     Err(e) => {
                         cleanup_state.failed_cleanups += 1;

@@ -125,6 +125,8 @@ pub enum iox2_node_cleanup_failure_e {
     RESOURCES_ALREADY_CLEANED_UP,
     /// Another instance has acquired the ownership of all resources and is currently cleaning up.
     ANOTHER_INSTANCE_IS_CLEANING_UP_THE_NODE,
+    /// The node was reported dead but is alive (it was starting up); nothing was removed.
+    NODE_IS_ALIVE,
 }
 
 impl IntoCInt for NodeCleanupFailure {
@@ -142,6 +144,7 @@ impl IntoCInt for NodeCleanupFailure {
                 iox2_node_cleanup_failure_e::INSUFFICIENT_PERMISSIONS
             }
             NodeCleanupFailure::VersionMismatch => iox2_node_cleanup_failure_e::VERSION_MISMATCH,
+            NodeCleanupFailure::NodeIsAlive => iox2_node_cleanup_failure_e::NODE_IS_ALIVE,
         }) as c_int
     }
 }
