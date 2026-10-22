@@ -868,6 +868,45 @@ fn ensure_shared_directories(config: &Config) -> Result<(), NodeCreationFailure>
     Ok(())
 }
 
+/// Windows objects have no owning group, so in secured mode the group class of every DACL this
+/// process creates names the configured group instead: `shared-group` when the
+/// `shared-directory-mode` shares with the group, else `endpoint-group` when the
+/// `endpoint-mode` does (the IAM pipe then admits its members only). It applies to the whole
+/// process and must be set before anything shared is created.
+#[cfg(windows)]
+fn apply_windows_shared_group(config: &Config) -> Result<(), NodeCreationFailure> {
+    let origin = "apply_windows_shared_group()";
+    let security = &config.global.node.security;
+    if !security.mode.is_secured() {
+        return Ok(());
+    }
+    let group = security
+        .shared_group
+        .as_ref()
+        .filter(|_| security.metadata_access().shares_with_group())
+        .or_else(|| {
+            security
+                .iam
+                .endpoint_group
+                .as_ref()
+                .filter(|_| security.endpoint_access().shares_with_group())
+        });
+    let Some(name) = group else {
+        return Ok(());
+    };
+    match crate::config::group_sid(name) {
+        Some(sid) => {
+            iceoryx2_pal_posix::windows::win32_security_attributes::set_shared_group(Some(&sid));
+            debug!(from origin, "the group class of new objects names \"{name}\" ({sid})");
+            Ok(())
+        }
+        None => {
+            fail!(from origin, with NodeCreationFailure::InternalError,
+                "The group \"{name}\" does not exist.");
+        }
+    }
+}
+
 fn acquire_all_node_detail_storages<Service: service::Service>(
     origin: &str,
     config: &<Service::StaticStorage as NamedConceptMgmt>::Configuration,
@@ -1706,6 +1745,9 @@ impl NodeBuilder {
             .config
             .as_ref()
             .unwrap_or_else(|| Config::global_config());
+
+        #[cfg(windows)]
+        apply_windows_shared_group(config)?;
 
         if config.global.node.security.is_multi_user() {
             ensure_shared_directories(config)?;

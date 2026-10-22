@@ -274,10 +274,33 @@ pub(crate) fn resolve_group(group: &FileName) -> Option<u32> {
     if let Ok(gid) = name.parse::<u32>() {
         return Some(gid);
     }
-    let group_name = iceoryx2_bb_system_types::group_name::GroupName::new(name.as_bytes()).ok()?;
-    iceoryx2_bb_posix::group::Group::from_name(&group_name)
-        .ok()
-        .map(|g| g.gid().value())
+    // Windows has no gids: the group is its SID ([`group_sid`]); its relative id stands in.
+    #[cfg(windows)]
+    {
+        let sid =
+            iceoryx2_pal_posix::windows::security_descriptor::Sid::from_account_name(name).ok()?;
+        let bytes = sid.as_bytes();
+        let rid = bytes.get(bytes.len().checked_sub(4)?..)?;
+        Some(u32::from_le_bytes([rid[0], rid[1], rid[2], rid[3]]))
+    }
+    #[cfg(not(windows))]
+    {
+        let group_name =
+            iceoryx2_bb_system_types::group_name::GroupName::new(name.as_bytes()).ok()?;
+        iceoryx2_bb_posix::group::Group::from_name(&group_name)
+            .ok()
+            .map(|g| g.gid().value())
+    }
+}
+
+/// Windows: the SID (string form) of the group (or account) `group`, e.g. `sipwriters` or
+/// `HOST\group`, which Windows DACLs name in place of a gid.
+#[cfg(windows)]
+pub(crate) fn group_sid(group: &FileName) -> Option<String> {
+    let name = core::str::from_utf8(group.as_bytes()).ok()?;
+    iceoryx2_pal_posix::windows::security_descriptor::Sid::from_account_name(name)
+        .ok()?
+        .to_sid_string()
 }
 
 /// IAM (Identity and Access Management) configuration for secured services.

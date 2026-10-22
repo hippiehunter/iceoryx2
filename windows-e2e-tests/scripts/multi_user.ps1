@@ -1,6 +1,9 @@
-param([string]$Exe = "$PSScriptRoot\win-e2e-mu.exe", [int]$Count = 3)
+param([string]$Exe = "$PSScriptRoot\win-e2e-mu.exe", [int]$Count = 3, [ValidateSet("A", "B")][string]$Variant = "A")
 # Multi-user secured-mode run of win-e2e-mu: the broker runs as the plain user sipbroker,
 # writer1 and writer2 (members of SIPWriters) publish, and outsider must be refused by IAM.
+# Variant A shares the root and the IAM pipe with everybody ("1777", "0666"); variant B with
+# SIPWriters only ("2770", "0660", shared-group SIPWriters, the broker a member), so outsider
+# must not even reach the services.
 #
 # Run it as an administrator on a throwaway machine or container: it creates local accounts
 # and grants Users "Log on as a batch job", since every role runs as a scheduled task under its
@@ -14,7 +17,7 @@ function Ensure-User($name, $pw, $group) {
     if ($group) { cmd /c "net localgroup $group $name /add >nul 2>&1" }
 }
 if (-not (Get-LocalGroup -Name SIPWriters -ErrorAction SilentlyContinue)) { net localgroup SIPWriters /add | Out-Null }
-Ensure-User sipbroker "P@ssw0rd-3x" $null
+Ensure-User sipbroker "P@ssw0rd-3x" $(if ($Variant -eq "B") { "SIPWriters" } else { $null })
 Ensure-User writer1 "P@ssw0rd-1x" SIPWriters
 Ensure-User writer2 "P@ssw0rd-4x" SIPWriters
 Ensure-User outsider "P@ssw0rd-2x" $null
@@ -39,7 +42,8 @@ Copy-Item $Exe "$base\bin\"
 icacls $base /grant "Users:(OI)(CI)M" | Out-Null
 
 $prefix = "mu" + (Get-Random -Maximum 99999) + "_"
-$common = "--root-path $base\root\ --prefix $prefix --policy-dir $base\policies --quit-file $base\quit --shared-mode 1777 --endpoint-mode 0666"
+$sharing = if ($Variant -eq "B") { "--shared-mode 2770 --shared-group SIPWriters --endpoint-mode 0660" } else { "--shared-mode 1777 --endpoint-mode 0666" }
+$common = "--root-path $base\root\ --prefix $prefix --policy-dir $base\policies --quit-file $base\quit $sharing"
 @"
 [service]
 name = "DeltaReplicator"
@@ -120,6 +124,13 @@ foreach ($label in @($tasks.Keys)) { "$label exit=" + (Wait-Exit $label 30) }
 foreach ($label in @($tasks.Keys)) { "----- $label"; if (Test-Path "$base\out\$label.log") { Get-Content "$base\out\$label.log" } }
 "----- audit"; if (Test-Path "$base\audit\audit.log") { Get-Content "$base\audit\audit.log" | Select-Object -Last 30 }
 foreach ($name in $tasks.Values) { Unregister-ScheduledTask -TaskName $name -Confirm:$false }
-$ok = (Select-String -Path "$base\out\broker.log" -Pattern "BROKER: received all" -SimpleMatch -Quiet) -and
-      (Select-String -Path "$base\out\outsider.log" -Pattern "INTRUDER: all ports denied" -SimpleMatch -Quiet)
-if ($ok) { "MULTI-USER RESULT: PASS" } else { "MULTI-USER RESULT: FAIL"; exit 1 }
+$received = Select-String -Path "$base\out\broker.log" -Pattern "BROKER: received all" -SimpleMatch -Quiet
+$denied = Select-String -Path "$base\out\outsider.log" -Pattern "INTRUDER: all ports denied" -SimpleMatch -Quiet
+# Variant B: outsider cannot reach the root or the pipe, so it fails before IAM decides.
+$unreachable = ($Variant -eq "B") -and
+    -not (Select-String -Path "$base\out\outsider.log" -Pattern "INTRUDER: opened all services" -SimpleMatch -Quiet) -and
+    (Select-String -Path "$base\out\outsider.log" -Pattern "Intruder: ERROR" -SimpleMatch -Quiet)
+if ($Variant -eq "B") {
+    "--- root ACL (variant B)"; icacls "$base\root"
+}
+if ($received -and ($denied -or $unreachable)) { "MULTI-USER RESULT: PASS (variant $Variant)" } else { "MULTI-USER RESULT: FAIL (variant $Variant)"; exit 1 }

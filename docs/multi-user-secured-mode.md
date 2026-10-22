@@ -296,13 +296,21 @@ The same configuration works on Windows; the mechanisms underneath differ:
   `PROCESS_DUP_HANDLE` on its own process, the server duplicates the handles a client sends
   out of the client (closing the client's transfer copies), and it duplicates handles into
   clients as before. A listener rejects handle messages a client claims to have pushed.
-* **Endpoint.** `endpoint-mode` decides the pipe DACL: when the group or others bits grant
-  read and write, everybody may connect as a client (without `FILE_CREATE_PIPE_INSTANCE`, so
-  nobody else can serve the pipe); the first instance is created with
-  `FILE_FLAG_FIRST_PIPE_INSTANCE`. Clients wait for a free instance on `ERROR_PIPE_BUSY`.
-* **Shared metadata.** Files and named file mappings get DACLs from the mirrored modes.
-  Windows has no shared group for kernel objects, so use variant A (`"1777"`, `"0666"`) and
-  let the policies decide; protect the root path with folder ACLs instead (installer).
+* **Endpoint.** `endpoint-mode` decides the pipe DACL: when the others bits grant read and
+  write, everybody may connect as a client, and when only the group bits do, the members of
+  the shared group (below); clients connect without `FILE_CREATE_PIPE_INSTANCE`, so nobody
+  else can serve the pipe. The first instance is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`.
+  Clients wait for a free instance on `ERROR_PIPE_BUSY`.
+* **Shared metadata.** Directories, files and named file mappings get DACLs from the mirrored
+  modes. Without a group, the owner bits go to `BUILTIN\Users` and the group bits to Service
+  Logon Users (the single-user mapping). Windows objects have no owning group, so with
+  variant B the node names the group in the DACLs instead: `shared-group` (else
+  `endpoint-group`) is resolved with `LookupAccountNameW` when the node is created (a group
+  that does not resolve fails the node), and from then on the group bits of every DACL the
+  process creates name that group and the owner bits the process's user. So `"2770"` /
+  `"0660"` admit the creator and the members of the group only, as on Linux; the account that
+  removes other users' stale resources (the broker) must be a member, as on Linux. The
+  setting applies to the whole process; one group serves both the metadata and the pipe.
 * **Unlink.** A Windows mapping keeps its name until its last handle is closed, whereas
   `shm_unlink` frees the name at once. Each creation therefore records a generation in the
   object's state file and names the mapping `<name>~<generation>`; unlinking removes the state

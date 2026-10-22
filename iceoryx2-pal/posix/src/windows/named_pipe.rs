@@ -402,8 +402,10 @@ enum AcceptState {
 const PIPE_CLIENT_ACCESS: u32 = 0x0012_0183;
 
 /// Builds the DACL of a pipe created with `mode`: the creating user, SYSTEM and the
-/// administrators get full access; when the group or others bits grant read and write access,
-/// everybody may connect as a client. Returns `None` (default DACL) otherwise.
+/// administrators get full access; when the others bits grant read and write access, everybody
+/// may connect as a client, and when only the group bits do, the members of the shared group
+/// ([`set_shared_group`](super::win32_security_attributes::set_shared_group)), or everybody
+/// when no shared group is set. Returns `None` (default DACL) otherwise.
 #[cfg(windows)]
 fn pipe_security_descriptor(
     mode: u64,
@@ -422,8 +424,12 @@ fn pipe_security_descriptor(
         .user_sid
         .to_sid_string()
         .ok_or(NamedPipeError::UnknownError(0))?;
+    let clients = match super::win32_security_attributes::shared_group() {
+        Some(group) if mode & OTHERS_RW != OTHERS_RW => group,
+        _ => alloc::string::String::from("WD"),
+    };
     let sddl = alloc::format!(
-        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{me})(A;;0x{PIPE_CLIENT_ACCESS:x};;;WD)\0"
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{me})(A;;0x{PIPE_CLIENT_ACCESS:x};;;{clients})\0"
     );
     SecurityDescriptor::from_sddl(sddl.as_bytes())
         .map(Some)
@@ -437,8 +443,8 @@ impl NamedPipeServer {
     /// # Arguments
     /// * `name` - The pipe name (without the `\\.\pipe\` prefix)
     /// * `mode` - Unix-style permission mode. When it grants the group or others read and
-    ///   write access, everybody may connect (see [`pipe_security_descriptor`]); otherwise
-    ///   the default DACL lets only the creator, SYSTEM and administrators connect.
+    ///   write access, the group or everybody may connect (see [`pipe_security_descriptor`]);
+    ///   otherwise the default DACL lets only the creator, SYSTEM and administrators connect.
     ///
     /// # Returns
     /// * `Ok(NamedPipeServer)` - The created server

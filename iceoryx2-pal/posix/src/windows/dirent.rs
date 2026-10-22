@@ -118,8 +118,16 @@ pub unsafe fn scandir(path: *const c_char, namelist: *mut *mut *mut dirent) -> i
 }
 
 pub unsafe fn mkdir(pathname: *const c_char, mode: mode_t) -> int {
+    // With a shared group (multi-user secured mode) the directory gets the DACL of its mode, as
+    // files do, so that e.g. "2770" admits the owner and the group only; otherwise it inherits
+    // the DACL of its parent.
+    let security_attributes = crate::posix::win32_security_attributes::shared_group()
+        .map(|_| crate::posix::win32_security_attributes::from_mode_to_security_attributes(mode));
+    let attributes = security_attributes
+        .as_ref()
+        .map_or(core::ptr::null::<SECURITY_ATTRIBUTES>(), |a| a as *const _);
     let (dir_created, _) = unsafe {
-        win32call! { CreateDirectoryA(pathname as *const u8, core::ptr::null::<SECURITY_ATTRIBUTES>())   ,
+        win32call! { CreateDirectoryA(pathname as *const u8, attributes)   ,
         ignore ERROR_ALREADY_EXISTS, ERROR_PATH_NOT_FOUND}
     };
     if dir_created == FALSE {
