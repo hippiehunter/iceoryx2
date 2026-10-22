@@ -51,6 +51,9 @@ use alloc::vec::Vec;
 
 use super::win32_handle_translator::{FdHandleEntry, FileHandle, HandleTranslator, ShmHandle};
 
+/// `WRITE_DAC`: the right to change an object's DACL.
+const WRITE_DAC_ACCESS: u32 = 0x0004_0000;
+
 struct FileMappingsSet {
     mappings: UnsafeCell<[(isize, HANDLE); 1024]>,
     mtx: Mutex,
@@ -154,6 +157,74 @@ unsafe fn remove_leading_path_separator(value: *const c_char) -> *const c_char {
     }
 }
 
+/// Kernel object names without a namespace prefix live in the session of their creator, but
+/// services run in session 0 and signed-in users in sessions of their own. Named mappings are
+/// therefore created and looked up in the global namespace first.
+const GLOBAL_NAMESPACE: &[u8] = b"Global\\";
+
+/// `name` (NUL-terminated) in the global namespace.
+unsafe fn global_object_name(name: *const c_char) -> [u8; MAX_PATH_LENGTH] {
+    let mut global = [0u8; MAX_PATH_LENGTH];
+    global[..GLOBAL_NAMESPACE.len()].copy_from_slice(GLOBAL_NAMESPACE);
+    let mut i = 0;
+    while GLOBAL_NAMESPACE.len() + i < MAX_PATH_LENGTH - 1 {
+        let c = unsafe { *name.add(i) } as u8;
+        if c == 0 {
+            break;
+        }
+        global[GLOBAL_NAMESPACE.len() + i] = c;
+        i += 1;
+    }
+    global
+}
+
+/// Creates (or opens, see `CreateFileMappingA`) the named mapping `name` in the global
+/// namespace. Outside of session 0 that needs SeCreateGlobalPrivilege; without it, and when
+/// no global mapping of that name exists, the mapping is created in the session namespace,
+/// where only processes of the same session find it.
+pub(crate) unsafe fn create_named_mapping(
+    file: HANDLE,
+    security_attributes: *const SECURITY_ATTRIBUTES,
+    protection: u32,
+    size_high: u32,
+    size_low: u32,
+    name: *const c_char,
+) -> (HANDLE, u32) {
+    unsafe {
+        let global = global_object_name(name);
+        let (handle, error) = win32call! {CreateFileMappingA(file, security_attributes, protection, size_high, size_low, global.as_ptr()), ignore ERROR_ALREADY_EXISTS, ERROR_ACCESS_DENIED};
+        if handle != 0 || error != ERROR_ACCESS_DENIED {
+            return (handle, error);
+        }
+
+        // Access denied: either we may not create global objects or the global mapping
+        // exists and we may not open it with all access rights.
+        let (existing, open_error) = win32call! {OpenFileMappingA(FILE_MAP_READ, FALSE, global.as_ptr()), ignore ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED};
+        if existing != 0 {
+            win32call! {CloseHandle(existing)};
+            return (0, ERROR_ACCESS_DENIED);
+        }
+        if open_error != ERROR_FILE_NOT_FOUND {
+            return (0, ERROR_ACCESS_DENIED);
+        }
+
+        win32call! {CreateFileMappingA(file, security_attributes, protection, size_high, size_low, name as *const u8), ignore ERROR_ALREADY_EXISTS, ERROR_ACCESS_DENIED}
+    }
+}
+
+/// Opens the named mapping `name`, looking in the global namespace first and then in the
+/// session namespace.
+pub(crate) unsafe fn open_named_mapping(access: u32, name: *const c_char) -> (HANDLE, u32) {
+    unsafe {
+        let global = global_object_name(name);
+        let (handle, error) = win32call! {OpenFileMappingA(access, FALSE, global.as_ptr()), ignore ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED};
+        if handle != 0 || error != ERROR_FILE_NOT_FOUND {
+            return (handle, error);
+        }
+        win32call! {OpenFileMappingA(access, FALSE, name as *const u8), ignore ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED}
+    }
+}
+
 unsafe fn trim_ascii(value: &[u8]) -> &[u8] {
     for i in 0..value.len() {
         if value[i] == 0 {
@@ -212,7 +283,7 @@ pub unsafe fn shm_open(name: *const c_char, oflag: int, mode: mode_t) -> int {
     unsafe {
         let name = remove_leading_path_separator(name.cast());
         let handle: HANDLE = 0;
-        let shm_handle;
+        let mut shm_handle;
         let mut shm_state_handle;
 
         if oflag & O_CREAT != 0 {
@@ -236,14 +307,14 @@ pub unsafe fn shm_open(name: *const c_char, oflag: int, mode: mode_t) -> int {
             const MAX_SIZE_HIGH: u32 = ((MAX_SUPPORTED_SHM_SIZE >> 32) & 0xFFFFFFFF) as u32;
 
             let last_mapping_error;
-            (shm_handle, last_mapping_error) = win32call! {CreateFileMappingA(
+            (shm_handle, last_mapping_error) = create_named_mapping(
                 handle,
                 core::ptr::null::<SECURITY_ATTRIBUTES>(),
                 PAGE_READWRITE | SEC_RESERVE,
                 MAX_SIZE_HIGH,
                 MAX_SIZE_LOW,
-                name as *const u8,
-            ), ignore ERROR_ALREADY_EXISTS};
+                name,
+            );
 
             if shm_handle == 0 {
                 Errno::set(Errno::EACCES);
@@ -264,13 +335,30 @@ pub unsafe fn shm_open(name: *const c_char, oflag: int, mode: mode_t) -> int {
                 return -1;
             }
 
-            let last_mapping_error;
-            (shm_handle, last_mapping_error) = win32call! {OpenFileMappingA(FILE_MAP_ALL_ACCESS, false as i32, name as *const u8), ignore ERROR_FILE_NOT_FOUND};
+            // Only ask for the rights a view needs: FILE_MAP_ALL_ACCESS also asks for WRITE_DAC
+            // and WRITE_OWNER, which the creator grants nobody else.
+            let access = if oflag & (O_RDWR | O_WRONLY) != 0 {
+                FILE_MAP_READ | FILE_MAP_WRITE
+            } else {
+                FILE_MAP_READ
+            };
+            // The owner may change the DACL later (fchmod), which needs WRITE_DAC: the owner
+            // holds it implicitly, everybody else is refused and opens without it.
+            let mut last_mapping_error;
+            (shm_handle, last_mapping_error) = open_named_mapping(access | WRITE_DAC_ACCESS, name);
+            if shm_handle == 0 && last_mapping_error == ERROR_ACCESS_DENIED {
+                (shm_handle, last_mapping_error) = open_named_mapping(access, name);
+            }
 
             if shm_handle == 0 {
-                Errno::set(Errno::ENOENT);
-                shm_unlink(name);
                 win32call! {CloseHandle(shm_state_handle)};
+                if last_mapping_error == ERROR_ACCESS_DENIED {
+                    Errno::set(Errno::EACCES);
+                } else {
+                    // a state file without its mapping is a leftover of a crashed creator
+                    Errno::set(Errno::ENOENT);
+                    shm_unlink(name);
+                }
                 return -1;
             }
 
@@ -386,7 +474,10 @@ unsafe fn remove_state_handle(name: *const c_char) -> int {
 
 unsafe fn does_shm_exist(name: *const c_char) -> bool {
     unsafe {
-        let (shm_handle, last_error) = win32call! {OpenFileMappingA(FILE_MAP_ALL_ACCESS, false as i32, name as *const u8), ignore ERROR_FILE_NOT_FOUND};
+        let (shm_handle, last_error) = open_named_mapping(FILE_MAP_READ, name);
+        if shm_handle != 0 {
+            win32call! {CloseHandle(shm_handle)};
+        }
         !(shm_handle == 0 && last_error == ERROR_FILE_NOT_FOUND)
     }
 }
@@ -486,8 +577,14 @@ pub unsafe fn mmap(
                     return core::ptr::null_mut::<void>();
                 }
 
+                let writable = prot & PROT_WRITE != 0;
+                let (view_access, page_protection) = if writable {
+                    (FILE_MAP_ALL_ACCESS, PAGE_READWRITE)
+                } else {
+                    (FILE_MAP_READ, PAGE_READONLY)
+                };
                 let (map_result, _) =
-                    win32call! { MapViewOfFile(mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0, len)};
+                    win32call! { MapViewOfFile(mapping_handle, view_access, 0, 0, len)};
                 match map_result {
                     0 => {
                         win32call! { CloseHandle(mapping_handle) };
@@ -495,7 +592,7 @@ pub unsafe fn mmap(
                         core::ptr::null_mut::<void>()
                     }
                     lpaddress => {
-                        if win32call!{  VirtualAlloc(lpaddress as *const void, len, MEM_COMMIT, PAGE_READWRITE)}.0
+                        if win32call!{  VirtualAlloc(lpaddress as *const void, len, MEM_COMMIT, page_protection)}.0
                         .is_null()
                     {
                         win32call! { UnmapViewOfFile(lpaddress) };

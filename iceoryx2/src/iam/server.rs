@@ -4181,356 +4181,379 @@ mod tests {
     // Multi-user hardening: role gating, producer port binding, departures
     // ========================================================================
 
-    fn mu_service_id() -> ServiceHash {
-        use crate::service::messaging_pattern::MessagingPattern;
-        use iceoryx2_cal::hash::sha1::Sha1;
-        let name = crate::service::service_name::ServiceName::new("test/multi_user").unwrap();
-        ServiceHash::new::<Sha1>(&name, MessagingPattern::PublishSubscribe)
-    }
+    /// Cross-user scenarios: Unix peers identified by uid and (supplementary) gids.
+    #[cfg(unix)]
+    mod multi_user {
+        use super::*;
 
-    /// Accepts a new mock connection with the given credentials and completes its handshake.
-    fn mu_session<P: IamPolicy>(
-        server: &mut IamServer<MockListener, P>,
-        credentials: ProcessCredentials,
-        node_id: Option<u128>,
-    ) -> SessionId {
-        let before: Vec<SessionId> = server.sessions.keys().copied().collect();
-        server
-            .listener
-            .add_connection(MockConnection::new(credentials));
-        server.process().unwrap();
-        let session_id = *server
-            .sessions
-            .keys()
-            .find(|id| !before.contains(id))
-            .unwrap();
-        let entry = server.sessions.get_mut(&session_id).unwrap();
-        entry.handshake_complete = true;
-        entry.node_id = node_id;
-        session_id
-    }
+        fn mu_service_id() -> ServiceHash {
+            use crate::service::messaging_pattern::MessagingPattern;
+            use iceoryx2_cal::hash::sha1::Sha1;
+            let name = crate::service::service_name::ServiceName::new("test/multi_user").unwrap();
+            ServiceHash::new::<Sha1>(&name, MessagingPattern::PublishSubscribe)
+        }
 
-    fn mu_attach<P: IamPolicy>(
-        server: &mut IamServer<MockListener, P>,
-        session_id: SessionId,
-        port_type: PortType,
-    ) -> IamResponse {
-        let credentials = server.sessions[&session_id].session.credentials().clone();
-        let usage = *server.sessions[&session_id].session.resource_usage();
-        let service_id = mu_service_id();
-        match port_type {
-            PortType::Publisher => {
-                server
-                    .handle_attach_publisher(session_id, &credentials, &usage, &service_id, 0, 8)
-                    .unwrap()
-                    .0
-            }
-            PortType::Subscriber => {
-                server
-                    .handle_attach_subscriber(session_id, &credentials, &usage, &service_id)
-                    .unwrap()
-                    .0
-            }
-            t => {
-                server
-                    .handle_attach_event_port(session_id, &credentials, &usage, &service_id, t)
-                    .unwrap()
-                    .0
+        /// Accepts a new mock connection with the given credentials and completes its handshake.
+        fn mu_session<P: IamPolicy>(
+            server: &mut IamServer<MockListener, P>,
+            credentials: ProcessCredentials,
+            node_id: Option<u128>,
+        ) -> SessionId {
+            let before: Vec<SessionId> = server.sessions.keys().copied().collect();
+            server
+                .listener
+                .add_connection(MockConnection::new(credentials));
+            server.process().unwrap();
+            let session_id = *server
+                .sessions
+                .keys()
+                .find(|id| !before.contains(id))
+                .unwrap();
+            let entry = server.sessions.get_mut(&session_id).unwrap();
+            entry.handshake_complete = true;
+            entry.node_id = node_id;
+            session_id
+        }
+
+        fn mu_attach<P: IamPolicy>(
+            server: &mut IamServer<MockListener, P>,
+            session_id: SessionId,
+            port_type: PortType,
+        ) -> IamResponse {
+            let credentials = server.sessions[&session_id].session.credentials().clone();
+            let usage = *server.sessions[&session_id].session.resource_usage();
+            let service_id = mu_service_id();
+            match port_type {
+                PortType::Publisher => {
+                    server
+                        .handle_attach_publisher(
+                            session_id,
+                            &credentials,
+                            &usage,
+                            &service_id,
+                            0,
+                            8,
+                        )
+                        .unwrap()
+                        .0
+                }
+                PortType::Subscriber => {
+                    server
+                        .handle_attach_subscriber(session_id, &credentials, &usage, &service_id)
+                        .unwrap()
+                        .0
+                }
+                t => {
+                    server
+                        .handle_attach_event_port(session_id, &credentials, &usage, &service_id, t)
+                        .unwrap()
+                        .0
+                }
             }
         }
-    }
 
-    fn sip_policy() -> crate::iam::configured_policy::ConfiguredPolicy {
-        let toml = r#"
-[service]
-name = "test/multi_user"
+        fn sip_policy() -> crate::iam::configured_policy::ConfiguredPolicy {
+            let toml = r#"
+    [service]
+    name = "test/multi_user"
 
-[[allow]]
-principal = { uid = 2000 }
-roles = ["subscriber", "listener"]
+    [[allow]]
+    principal = { uid = 2000 }
+    roles = ["subscriber", "listener"]
 
-[[allow]]
-principal = { gid = 3000 }
-roles = ["publisher", "notifier"]
-"#;
-        let file: crate::iam::configured_policy::PolicyFile = toml::from_str(toml).unwrap();
-        crate::iam::configured_policy::ConfiguredPolicy::from_policy_file(file, 2000)
-    }
+    [[allow]]
+    principal = { gid = 3000 }
+    roles = ["publisher", "notifier"]
+    "#;
+            let file: crate::iam::configured_policy::PolicyFile = toml::from_str(toml).unwrap();
+            crate::iam::configured_policy::ConfiguredPolicy::from_policy_file(file, 2000)
+        }
 
-    fn writer_credentials(uid: u32) -> ProcessCredentials {
-        // primary group is the user's own group, the grant comes from a supplementary group
-        ProcessCredentials::new(uid, uid, uid).with_supplementary_gids(vec![3000])
-    }
+        fn writer_credentials(uid: u32) -> ProcessCredentials {
+            // primary group is the user's own group, the grant comes from a supplementary group
+            ProcessCredentials::new(uid, uid, uid).with_supplementary_gids(vec![3000])
+        }
 
-    #[test]
-    fn test_mu_supplementary_group_grants_publisher_and_notifier_only() {
-        let mut server = IamServer::new(MockListener::new(), sip_policy());
-        let writer = mu_session(&mut server, writer_credentials(2001), None);
+        #[test]
+        fn test_mu_supplementary_group_grants_publisher_and_notifier_only() {
+            let mut server = IamServer::new(MockListener::new(), sip_policy());
+            let writer = mu_session(&mut server, writer_credentials(2001), None);
 
-        assert!(matches!(
-            mu_attach(&mut server, writer, PortType::Publisher),
-            IamResponse::AttachOk { .. }
-        ));
-        assert!(matches!(
-            mu_attach(&mut server, writer, PortType::Notifier),
-            IamResponse::AttachOk { .. }
-        ));
-        assert!(matches!(
-            mu_attach(&mut server, writer, PortType::Subscriber),
-            IamResponse::Denied {
-                reason: DenialReason::Unauthorized,
-                ..
-            }
-        ));
-        assert!(matches!(
-            mu_attach(&mut server, writer, PortType::Listener),
-            IamResponse::Denied {
-                reason: DenialReason::Unauthorized,
-                ..
-            }
-        ));
-
-        // without the supplementary group nothing is granted
-        let stranger = mu_session(&mut server, ProcessCredentials::new(7, 2003, 2003), None);
-        for port_type in [
-            PortType::Publisher,
-            PortType::Subscriber,
-            PortType::Notifier,
-            PortType::Listener,
-        ] {
             assert!(matches!(
-                mu_attach(&mut server, stranger, port_type),
-                IamResponse::Denied { .. }
+                mu_attach(&mut server, writer, PortType::Publisher),
+                IamResponse::AttachOk { .. }
+            ));
+            assert!(matches!(
+                mu_attach(&mut server, writer, PortType::Notifier),
+                IamResponse::AttachOk { .. }
+            ));
+            assert!(matches!(
+                mu_attach(&mut server, writer, PortType::Subscriber),
+                IamResponse::Denied {
+                    reason: DenialReason::Unauthorized,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                mu_attach(&mut server, writer, PortType::Listener),
+                IamResponse::Denied {
+                    reason: DenialReason::Unauthorized,
+                    ..
+                }
+            ));
+
+            // without the supplementary group nothing is granted
+            let stranger = mu_session(&mut server, ProcessCredentials::new(7, 2003, 2003), None);
+            for port_type in [
+                PortType::Publisher,
+                PortType::Subscriber,
+                PortType::Notifier,
+                PortType::Listener,
+            ] {
+                assert!(matches!(
+                    mu_attach(&mut server, stranger, port_type),
+                    IamResponse::Denied { .. }
+                ));
+            }
+        }
+
+        #[test]
+        fn test_mu_publisher_only_session_cannot_obtain_producer_handles() {
+            let mut server = IamServer::new(MockListener::new(), sip_policy());
+            let writer_a = mu_session(&mut server, writer_credentials(2001), None);
+            let writer_b = mu_session(&mut server, writer_credentials(2002), None);
+            let broker = mu_session(&mut server, ProcessCredentials::new(9, 2000, 2000), None);
+            mu_attach(&mut server, writer_a, PortType::Publisher);
+            mu_attach(&mut server, writer_b, PortType::Publisher);
+            mu_attach(&mut server, broker, PortType::Subscriber);
+
+            // writer A's producer port registers a data segment, a management segment and a channel
+            let port_a: u128 = 0xA;
+            assert!(server.claim_producer_port(writer_a, port_a).is_none());
+            server
+                .segment_manager
+                .register_segment_for_port(
+                    port_a,
+                    create_test_handle(),
+                    4096,
+                    AccessRights::read_only(),
+                )
+                .unwrap();
+            server
+                .segment_manager
+                .register_mgmt_segment(port_a, create_test_handle(), 128)
+                .unwrap();
+            server
+                .segment_manager
+                .register_channel(port_a, 0xB0, create_test_handle(), 128)
+                .unwrap();
+
+            // writer B holds no consumer role: every handle request is refused
+            let denied = |r: IamResponse| matches!(r, IamResponse::Denied { .. });
+            assert!(denied(
+                server
+                    .handle_request_segment_handle(writer_b, port_a)
+                    .unwrap()
+                    .0
+            ));
+            assert!(denied(
+                server
+                    .handle_request_dynamic_segment_handle(writer_b, port_a, 0)
+                    .unwrap()
+                    .0
+            ));
+            assert!(denied(
+                server
+                    .handle_request_mgmt_segment_handle(writer_b, port_a)
+                    .unwrap()
+                    .0
+            ));
+            assert!(denied(
+                server
+                    .handle_request_channel_handle(writer_b, port_a, 0xB0)
+                    .unwrap()
+                    .0
+            ));
+
+            // the broker (subscriber role) obtains them
+            assert!(matches!(
+                server
+                    .handle_request_segment_handle(broker, port_a)
+                    .unwrap()
+                    .0,
+                IamResponse::SegmentHandleOk { .. }
+            ));
+            assert!(matches!(
+                server
+                    .handle_request_mgmt_segment_handle(broker, port_a)
+                    .unwrap()
+                    .0,
+                IamResponse::MgmtSegmentHandleOk { .. }
+            ));
+            assert!(matches!(
+                server
+                    .handle_request_channel_handle(broker, port_a, 0xB0)
+                    .unwrap()
+                    .0,
+                IamResponse::ChannelHandleOk { .. }
             ));
         }
-    }
 
-    #[test]
-    fn test_mu_publisher_only_session_cannot_obtain_producer_handles() {
-        let mut server = IamServer::new(MockListener::new(), sip_policy());
-        let writer_a = mu_session(&mut server, writer_credentials(2001), None);
-        let writer_b = mu_session(&mut server, writer_credentials(2002), None);
-        let broker = mu_session(&mut server, ProcessCredentials::new(9, 2000, 2000), None);
-        mu_attach(&mut server, writer_a, PortType::Publisher);
-        mu_attach(&mut server, writer_b, PortType::Publisher);
-        mu_attach(&mut server, broker, PortType::Subscriber);
+        #[test]
+        fn test_mu_producer_port_cannot_be_claimed_by_other_session_or_non_producer() {
+            let mut server = IamServer::new(MockListener::new(), sip_policy());
+            let writer_a = mu_session(&mut server, writer_credentials(2001), None);
+            let writer_b = mu_session(&mut server, writer_credentials(2002), None);
+            let broker = mu_session(&mut server, ProcessCredentials::new(9, 2000, 2000), None);
+            mu_attach(&mut server, writer_a, PortType::Publisher);
+            mu_attach(&mut server, writer_b, PortType::Publisher);
+            mu_attach(&mut server, broker, PortType::Subscriber);
 
-        // writer A's producer port registers a data segment, a management segment and a channel
-        let port_a: u128 = 0xA;
-        assert!(server.claim_producer_port(writer_a, port_a).is_none());
-        server
-            .segment_manager
-            .register_segment_for_port(
-                port_a,
-                create_test_handle(),
-                4096,
-                AccessRights::read_only(),
-            )
-            .unwrap();
-        server
-            .segment_manager
-            .register_mgmt_segment(port_a, create_test_handle(), 128)
-            .unwrap();
-        server
-            .segment_manager
-            .register_channel(port_a, 0xB0, create_test_handle(), 128)
-            .unwrap();
-
-        // writer B holds no consumer role: every handle request is refused
-        let denied = |r: IamResponse| matches!(r, IamResponse::Denied { .. });
-        assert!(denied(
-            server
-                .handle_request_segment_handle(writer_b, port_a)
-                .unwrap()
-                .0
-        ));
-        assert!(denied(
-            server
-                .handle_request_dynamic_segment_handle(writer_b, port_a, 0)
-                .unwrap()
-                .0
-        ));
-        assert!(denied(
-            server
-                .handle_request_mgmt_segment_handle(writer_b, port_a)
-                .unwrap()
-                .0
-        ));
-        assert!(denied(
-            server
-                .handle_request_channel_handle(writer_b, port_a, 0xB0)
-                .unwrap()
-                .0
-        ));
-
-        // the broker (subscriber role) obtains them
-        assert!(matches!(
-            server
-                .handle_request_segment_handle(broker, port_a)
-                .unwrap()
-                .0,
-            IamResponse::SegmentHandleOk { .. }
-        ));
-        assert!(matches!(
-            server
-                .handle_request_mgmt_segment_handle(broker, port_a)
-                .unwrap()
-                .0,
-            IamResponse::MgmtSegmentHandleOk { .. }
-        ));
-        assert!(matches!(
-            server
-                .handle_request_channel_handle(broker, port_a, 0xB0)
-                .unwrap()
-                .0,
-            IamResponse::ChannelHandleOk { .. }
-        ));
-    }
-
-    #[test]
-    fn test_mu_producer_port_cannot_be_claimed_by_other_session_or_non_producer() {
-        let mut server = IamServer::new(MockListener::new(), sip_policy());
-        let writer_a = mu_session(&mut server, writer_credentials(2001), None);
-        let writer_b = mu_session(&mut server, writer_credentials(2002), None);
-        let broker = mu_session(&mut server, ProcessCredentials::new(9, 2000, 2000), None);
-        mu_attach(&mut server, writer_a, PortType::Publisher);
-        mu_attach(&mut server, writer_b, PortType::Publisher);
-        mu_attach(&mut server, broker, PortType::Subscriber);
-
-        assert!(server.claim_producer_port(writer_a, 0xA).is_none());
-        // idempotent for the owner
-        assert!(server.claim_producer_port(writer_a, 0xA).is_none());
-        // another producer cannot inject handles under A's port
-        assert!(matches!(
-            server.claim_producer_port(writer_b, 0xA),
-            Some(IamResponse::Denied { .. })
-        ));
-        // a session without a producer port cannot register handles at all
-        assert!(matches!(
-            server.claim_producer_port(broker, 0xC),
-            Some(IamResponse::Denied { .. })
-        ));
-    }
-
-    #[test]
-    fn test_mu_detach_only_releases_own_producer_ports() {
-        let mut server = IamServer::new(MockListener::new(), sip_policy());
-        let writer_a = mu_session(&mut server, writer_credentials(2001), None);
-        let writer_b = mu_session(&mut server, writer_credentials(2002), None);
-        mu_attach(&mut server, writer_a, PortType::Publisher);
-        mu_attach(&mut server, writer_b, PortType::Publisher);
-
-        assert!(server.claim_producer_port(writer_a, 0xA).is_none());
-        let segment = server
-            .segment_manager
-            .register_segment_for_port(0xA, create_test_handle(), 4096, AccessRights::read_only())
-            .unwrap();
-
-        // B detaching A's port is a no-op
-        server
-            .handle_detach(writer_b, &mu_service_id(), 0xA)
-            .unwrap();
-        assert!(server.segment_manager.has_segment(segment));
-
-        // A detaching its own port releases the handles
-        server
-            .handle_detach(writer_a, &mu_service_id(), 0xA)
-            .unwrap();
-        assert!(!server.segment_manager.has_segment(segment));
-        assert!(!server.producer_port_owner.contains_key(&0xA));
-    }
-
-    #[test]
-    fn test_mu_detach_returns_attach_quota() {
-        let mut server = IamServer::new(MockListener::new(), sip_policy());
-        let writer = mu_session(&mut server, writer_credentials(2001), None);
-        // far more attach/detach cycles than max_publishers (16)
-        for _ in 0..64 {
-            let port_id = match mu_attach(&mut server, writer, PortType::Publisher) {
-                IamResponse::AttachOk { port_id, .. } => port_id,
-                r => panic!("attach #{} failed: {r:?}", 0),
-            };
-            server
-                .handle_detach(writer, &mu_service_id(), port_id)
-                .unwrap();
+            assert!(server.claim_producer_port(writer_a, 0xA).is_none());
+            // idempotent for the owner
+            assert!(server.claim_producer_port(writer_a, 0xA).is_none());
+            // another producer cannot inject handles under A's port
+            assert!(matches!(
+                server.claim_producer_port(writer_b, 0xA),
+                Some(IamResponse::Denied { .. })
+            ));
+            // a session without a producer port cannot register handles at all
+            assert!(matches!(
+                server.claim_producer_port(broker, 0xC),
+                Some(IamResponse::Denied { .. })
+            ));
         }
-        assert_eq!(
-            server.sessions[&writer]
-                .session
-                .resource_usage()
-                .publisher_count,
-            0
-        );
-    }
 
-    #[test]
-    fn test_mu_departure_handler_gets_dead_peer_and_handles_are_retained_until_then() {
-        use std::sync::atomic::AtomicUsize;
+        #[test]
+        fn test_mu_detach_only_releases_own_producer_ports() {
+            let mut server = IamServer::new(MockListener::new(), sip_policy());
+            let writer_a = mu_session(&mut server, writer_credentials(2001), None);
+            let writer_b = mu_session(&mut server, writer_credentials(2002), None);
+            mu_attach(&mut server, writer_a, PortType::Publisher);
+            mu_attach(&mut server, writer_b, PortType::Publisher);
 
-        let calls = Arc::new(Mutex::new(Vec::<(u128, u32)>::new()));
-        let calls_clone = Arc::clone(&calls);
-        let outcome = Arc::new(AtomicUsize::new(1)); // 1 = Retry, 0 = Completed
-        let outcome_clone = Arc::clone(&outcome);
-        let mut server = IamServerBuilder::new(MockListener::new(), sip_policy())
-            .peer_departure_handler(Box::new(move |node_id, credentials| {
-                calls_clone
-                    .lock()
-                    .unwrap()
-                    .push((node_id, credentials.uid()));
-                if outcome_clone.load(Ordering::Relaxed) == 0 {
+            assert!(server.claim_producer_port(writer_a, 0xA).is_none());
+            let segment = server
+                .segment_manager
+                .register_segment_for_port(
+                    0xA,
+                    create_test_handle(),
+                    4096,
+                    AccessRights::read_only(),
+                )
+                .unwrap();
+
+            // B detaching A's port is a no-op
+            server
+                .handle_detach(writer_b, &mu_service_id(), 0xA)
+                .unwrap();
+            assert!(server.segment_manager.has_segment(segment));
+
+            // A detaching its own port releases the handles
+            server
+                .handle_detach(writer_a, &mu_service_id(), 0xA)
+                .unwrap();
+            assert!(!server.segment_manager.has_segment(segment));
+            assert!(!server.producer_port_owner.contains_key(&0xA));
+        }
+
+        #[test]
+        fn test_mu_detach_returns_attach_quota() {
+            let mut server = IamServer::new(MockListener::new(), sip_policy());
+            let writer = mu_session(&mut server, writer_credentials(2001), None);
+            // far more attach/detach cycles than max_publishers (16)
+            for _ in 0..64 {
+                let port_id = match mu_attach(&mut server, writer, PortType::Publisher) {
+                    IamResponse::AttachOk { port_id, .. } => port_id,
+                    r => panic!("attach #{} failed: {r:?}", 0),
+                };
+                server
+                    .handle_detach(writer, &mu_service_id(), port_id)
+                    .unwrap();
+            }
+            assert_eq!(
+                server.sessions[&writer]
+                    .session
+                    .resource_usage()
+                    .publisher_count,
+                0
+            );
+        }
+
+        #[test]
+        fn test_mu_departure_handler_gets_dead_peer_and_handles_are_retained_until_then() {
+            use std::sync::atomic::AtomicUsize;
+
+            let calls = Arc::new(Mutex::new(Vec::<(u128, u32)>::new()));
+            let calls_clone = Arc::clone(&calls);
+            let outcome = Arc::new(AtomicUsize::new(1)); // 1 = Retry, 0 = Completed
+            let outcome_clone = Arc::clone(&outcome);
+            let mut server = IamServerBuilder::new(MockListener::new(), sip_policy())
+                .peer_departure_handler(Box::new(move |node_id, credentials| {
+                    calls_clone
+                        .lock()
+                        .unwrap()
+                        .push((node_id, credentials.uid()));
+                    if outcome_clone.load(Ordering::Relaxed) == 0 {
+                        PeerDepartureOutcome::Completed
+                    } else {
+                        PeerDepartureOutcome::Retry
+                    }
+                }))
+                .peer_departure_timing(Duration::ZERO, Duration::from_secs(60))
+                .build();
+
+            let writer = mu_session(&mut server, writer_credentials(2001), Some(0x77));
+            mu_attach(&mut server, writer, PortType::Publisher);
+            assert!(server.claim_producer_port(writer, 0xA).is_none());
+            let segment = server
+                .segment_manager
+                .register_segment_for_port(
+                    0xA,
+                    create_test_handle(),
+                    4096,
+                    AccessRights::read_only(),
+                )
+                .unwrap();
+
+            // the peer disappears (e.g. SIGKILL closes its socket)
+            server.remove_session(writer);
+            assert_eq!(server.session_count(), 0);
+            // its producer handles stay brokerable while the departure is pending
+            assert!(server.segment_manager.has_segment(segment));
+
+            server.process().unwrap();
+            assert_eq!(calls.lock().unwrap().as_slice(), &[(0x77, 2001)]);
+            assert!(server.segment_manager.has_segment(segment));
+
+            outcome.store(0, Ordering::Relaxed);
+            server.process().unwrap();
+            assert_eq!(calls.lock().unwrap().len(), 2);
+            assert!(!server.segment_manager.has_segment(segment));
+            assert!(server.pending_departures.is_empty());
+        }
+
+        #[test]
+        fn test_mu_departure_waits_for_last_session_of_the_node() {
+            let calls = Arc::new(Mutex::new(0usize));
+            let calls_clone = Arc::clone(&calls);
+            let mut server = IamServerBuilder::new(MockListener::new(), sip_policy())
+                .peer_departure_handler(Box::new(move |_, _| {
+                    *calls_clone.lock().unwrap() += 1;
                     PeerDepartureOutcome::Completed
-                } else {
-                    PeerDepartureOutcome::Retry
-                }
-            }))
-            .peer_departure_timing(Duration::ZERO, Duration::from_secs(60))
-            .build();
+                }))
+                .peer_departure_timing(Duration::ZERO, Duration::ZERO)
+                .build();
 
-        let writer = mu_session(&mut server, writer_credentials(2001), Some(0x77));
-        mu_attach(&mut server, writer, PortType::Publisher);
-        assert!(server.claim_producer_port(writer, 0xA).is_none());
-        let segment = server
-            .segment_manager
-            .register_segment_for_port(0xA, create_test_handle(), 4096, AccessRights::read_only())
-            .unwrap();
+            let first = mu_session(&mut server, writer_credentials(2001), Some(0x77));
+            let second = mu_session(&mut server, writer_credentials(2001), Some(0x77));
+            server.remove_session(first);
+            server.process().unwrap();
+            assert_eq!(*calls.lock().unwrap(), 0);
 
-        // the peer disappears (e.g. SIGKILL closes its socket)
-        server.remove_session(writer);
-        assert_eq!(server.session_count(), 0);
-        // its producer handles stay brokerable while the departure is pending
-        assert!(server.segment_manager.has_segment(segment));
-
-        server.process().unwrap();
-        assert_eq!(calls.lock().unwrap().as_slice(), &[(0x77, 2001)]);
-        assert!(server.segment_manager.has_segment(segment));
-
-        outcome.store(0, Ordering::Relaxed);
-        server.process().unwrap();
-        assert_eq!(calls.lock().unwrap().len(), 2);
-        assert!(!server.segment_manager.has_segment(segment));
-        assert!(server.pending_departures.is_empty());
-    }
-
-    #[test]
-    fn test_mu_departure_waits_for_last_session_of_the_node() {
-        let calls = Arc::new(Mutex::new(0usize));
-        let calls_clone = Arc::clone(&calls);
-        let mut server = IamServerBuilder::new(MockListener::new(), sip_policy())
-            .peer_departure_handler(Box::new(move |_, _| {
-                *calls_clone.lock().unwrap() += 1;
-                PeerDepartureOutcome::Completed
-            }))
-            .peer_departure_timing(Duration::ZERO, Duration::ZERO)
-            .build();
-
-        let first = mu_session(&mut server, writer_credentials(2001), Some(0x77));
-        let second = mu_session(&mut server, writer_credentials(2001), Some(0x77));
-        server.remove_session(first);
-        server.process().unwrap();
-        assert_eq!(*calls.lock().unwrap(), 0);
-
-        server.remove_session(second);
-        server.process().unwrap();
-        assert_eq!(*calls.lock().unwrap(), 1);
+            server.remove_session(second);
+            server.process().unwrap();
+            assert_eq!(*calls.lock().unwrap(), 1);
+        }
     }
 }

@@ -238,6 +238,11 @@ impl Drop for ImpersonationGuard {
     }
 }
 
+/// `SE_GROUP_ENABLED`: the group is enabled for access checks.
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+/// `SE_GROUP_USE_FOR_DENY_ONLY`: the group only matches deny ACEs.
+const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x0000_0010;
+
 // ============================================================================
 // TokenSids
 // ============================================================================
@@ -453,6 +458,14 @@ fn get_token_groups(token_handle: HANDLE) -> Result<Vec<Sid>, TokenError> {
         for i in 0..group_count {
             // SAFETY: We're accessing elements within the valid range (verified above).
             let group: &SID_AND_ATTRIBUTES = unsafe { &*groups_ptr.add(i) };
+
+            // A group that is not enabled, or that only takes part in deny checks (the
+            // Administrators group of a filtered UAC token), grants nothing.
+            if group.Attributes & SE_GROUP_ENABLED == 0
+                || group.Attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0
+            {
+                continue;
+            }
 
             // SAFETY: group.Sid is a valid PSID if GetTokenInformation succeeded.
             if let Some(sid) = unsafe { copy_sid_from_ptr(group.Sid) } {

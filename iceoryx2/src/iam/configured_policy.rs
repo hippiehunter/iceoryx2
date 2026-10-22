@@ -46,6 +46,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
+#[cfg(not(windows))]
 use iceoryx2_bb_container::semantic_string::SemanticString;
 use iceoryx2_cal::security::credentials::ProcessCredentials;
 use serde::Deserialize;
@@ -176,6 +177,13 @@ pub enum PrincipalMatcher {
         /// The user name to match.
         user: String,
     },
+    /// Match by Windows security identifier: `{ sid = "S-1-5-32-545" }`. Matches when the
+    /// SID is the principal's user SID or one of its enabled group SIDs. Never matches on
+    /// Unix.
+    Sid {
+        /// The SID in string form.
+        sid: String,
+    },
     /// Match by UID range using array format: `{ uid_range = [2000, 2999] }`.
     UidRangeArray {
         /// Two-element array: [min, max] (both inclusive).
@@ -217,6 +225,7 @@ impl<'de> Deserialize<'de> for AnyMarker {
 
 impl PrincipalMatcher {
     /// Checks if the given credentials match this principal matcher.
+    #[cfg(not(windows))]
     pub fn matches(&self, credentials: &ProcessCredentials) -> bool {
         match self {
             PrincipalMatcher::Uid { uid } => credentials.uid() == *uid,
@@ -227,6 +236,7 @@ impl PrincipalMatcher {
             PrincipalMatcher::UserName { user } => {
                 resolve_user_name(user).is_some_and(|uid| credentials.uid() == uid)
             }
+            PrincipalMatcher::Sid { .. } => false,
             PrincipalMatcher::UidRangeArray { uid_range } => {
                 credentials.uid() >= uid_range[0] && credentials.uid() <= uid_range[1]
             }
@@ -236,9 +246,36 @@ impl PrincipalMatcher {
             PrincipalMatcher::Any(_) => true,
         }
     }
+
+    /// Checks if the given credentials match this principal matcher.
+    ///
+    /// Windows principals carry SIDs and no uid/gid (both are 0 for every peer), so only the
+    /// name and SID matchers can apply to them. A peer whose SIDs are unknown matches nothing
+    /// but "any".
+    #[cfg(windows)]
+    pub fn matches(&self, credentials: &ProcessCredentials) -> bool {
+        let user_sid = credentials.user_sid();
+        match self {
+            PrincipalMatcher::UserName { user } => {
+                user_sid.is_some() && resolve_account_sid(user).as_deref() == user_sid
+            }
+            PrincipalMatcher::GroupName { group } => {
+                resolve_account_sid(group).is_some_and(|sid| credentials.is_member_of(&sid))
+            }
+            PrincipalMatcher::Sid { sid } => resolve_string_sid(sid).is_some_and(|sid| {
+                user_sid == Some(sid.as_slice()) || credentials.is_member_of(&sid)
+            }),
+            PrincipalMatcher::Any(_) => true,
+            PrincipalMatcher::Uid { .. }
+            | PrincipalMatcher::Gid { .. }
+            | PrincipalMatcher::UidRangeArray { .. }
+            | PrincipalMatcher::UidRange { .. } => false,
+        }
+    }
 }
 
 /// Resolves a group name through the system group database.
+#[cfg(not(windows))]
 fn resolve_group_name(name: &str) -> Option<u32> {
     let name = iceoryx2_bb_system_types::group_name::GroupName::new(name.as_bytes()).ok()?;
     iceoryx2_bb_posix::group::Group::from_name(&name)
@@ -247,11 +284,28 @@ fn resolve_group_name(name: &str) -> Option<u32> {
 }
 
 /// Resolves a user name through the system user database.
+#[cfg(not(windows))]
 fn resolve_user_name(name: &str) -> Option<u32> {
     let name = iceoryx2_bb_system_types::user_name::UserName::new(name.as_bytes()).ok()?;
     iceoryx2_bb_posix::user::User::from_name(&name)
         .ok()
         .map(|u| u.uid().value())
+}
+
+/// Resolves a Windows user or group account name to its SID in binary form.
+#[cfg(windows)]
+fn resolve_account_sid(name: &str) -> Option<Vec<u8>> {
+    iceoryx2_pal_posix::windows::security_descriptor::Sid::from_account_name(name)
+        .ok()
+        .map(|sid| sid.as_bytes().to_vec())
+}
+
+/// Parses a Windows SID in string form to its binary form.
+#[cfg(windows)]
+fn resolve_string_sid(sid: &str) -> Option<Vec<u8>> {
+    iceoryx2_pal_posix::windows::security_descriptor::Sid::from_string(sid)
+        .ok()
+        .map(|sid| sid.as_bytes().to_vec())
 }
 
 /// Resource limits from a TOML policy file.
@@ -368,6 +422,8 @@ const PRODUCER_ROLES: [&str; 3] = ["publisher", "server", "client"];
 pub struct ConfiguredPolicy {
     /// The UID of the service owner.
     owner_uid: u32,
+    /// User SID of the service owner (Windows). When set, ownership is decided by SID alone.
+    owner_sid: Option<Vec<u8>>,
     /// Allow rules from the policy file.
     allow_rules: Vec<AllowRule>,
     /// Deny rules from the policy file.
@@ -388,6 +444,7 @@ impl ConfiguredPolicy {
     ) -> Self {
         Self {
             owner_uid,
+            owner_sid: None,
             allow_rules,
             deny_rules,
             limits,
@@ -405,10 +462,26 @@ impl ConfiguredPolicy {
     ) -> Self {
         Self {
             owner_uid,
+            owner_sid: None,
             allow_rules,
             deny_rules,
             limits,
             qos_bounds,
+        }
+    }
+
+    /// Sets the user SID of the service owner (Windows), which then decides ownership in
+    /// place of the uid.
+    pub fn with_owner_sid(mut self, owner_sid: Option<Vec<u8>>) -> Self {
+        self.owner_sid = owner_sid;
+        self
+    }
+
+    /// Returns true if `credentials` belong to the service owner.
+    fn is_owner(&self, credentials: &ProcessCredentials) -> bool {
+        match &self.owner_sid {
+            Some(owner_sid) => credentials.user_sid() == Some(owner_sid.as_slice()),
+            None => credentials.uid() == self.owner_uid,
         }
     }
 
@@ -558,7 +631,7 @@ impl IamPolicy for ConfiguredPolicy {
         let is_producer = PRODUCER_ROLES
             .iter()
             .any(|role| self.check_allow_with_role(credentials, role));
-        if credentials.uid() != self.owner_uid && !is_producer {
+        if !self.is_owner(credentials) && !is_producer {
             return PolicyDecision::deny(
                 DenialReason::Unauthorized,
                 "Only the service owner or principals with a producer role (publisher, server, client) can add segments",
@@ -729,8 +802,9 @@ impl PolicyLoader {
             }
         }
 
-        let owner_uid = ProcessCredentials::from_self().uid();
-        Ok(ConfiguredPolicy::from_policy_file(policy_file, owner_uid))
+        let owner = ProcessCredentials::from_self();
+        Ok(ConfiguredPolicy::from_policy_file(policy_file, owner.uid())
+            .with_owner_sid(owner.user_sid().map(<[u8]>::to_vec)))
     }
 }
 
@@ -749,7 +823,101 @@ fn sanitize_service_name(name: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    const EVERYONE: &str = "S-1-1-0";
+    const USERS: &str = "S-1-5-32-545";
+
+    fn sid(s: &str) -> Vec<u8> {
+        iceoryx2_pal_posix::windows::security_descriptor::Sid::from_string(s)
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn peer(user: &str, groups: &[&str]) -> ProcessCredentials {
+        ProcessCredentials::with_sids(1, sid(user), groups.iter().map(|g| sid(g)).collect())
+    }
+
+    #[test]
+    fn sid_matches_the_user_or_a_group() {
+        let principal = PrincipalMatcher::Sid { sid: USERS.into() };
+        assert!(principal.matches(&peer("S-1-5-21-1-2-3-1001", &[EVERYONE, USERS])));
+        assert!(principal.matches(&peer(USERS, &[])));
+        assert!(!principal.matches(&peer("S-1-5-21-1-2-3-1001", &[EVERYONE])));
+    }
+
+    #[test]
+    fn group_name_is_resolved_to_its_sid() {
+        // the built-in Users group exists on every Windows installation
+        let principal = PrincipalMatcher::GroupName {
+            group: "BUILTIN\\Users".into(),
+        };
+        assert!(principal.matches(&peer("S-1-5-21-1-2-3-1001", &[USERS])));
+        assert!(!principal.matches(&peer("S-1-5-21-1-2-3-1001", &[EVERYONE])));
+    }
+
+    #[test]
+    fn user_name_matches_only_its_own_sid() {
+        let me = ProcessCredentials::from_self();
+        let name = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap(),
+            std::env::var("USERNAME").unwrap()
+        );
+        let principal = PrincipalMatcher::UserName { user: name };
+        assert!(principal.matches(&me));
+        assert!(!principal.matches(&peer("S-1-5-21-1-2-3-1001", &[USERS])));
+    }
+
+    #[test]
+    fn uid_based_principals_never_match_windows_peers() {
+        let root_like = peer("S-1-5-21-1-2-3-1001", &[USERS]);
+        assert_eq!(root_like.uid(), 0);
+        assert!(!PrincipalMatcher::Uid { uid: 0 }.matches(&root_like));
+        assert!(!PrincipalMatcher::Gid { gid: 0 }.matches(&root_like));
+        assert!(!PrincipalMatcher::UidRange { min: 0, max: 10 }.matches(&root_like));
+        assert!(!PrincipalMatcher::UidRangeArray { uid_range: [0, 10] }.matches(&root_like));
+        assert!(PrincipalMatcher::Any(AnyMarker).matches(&root_like));
+    }
+
+    #[test]
+    fn a_peer_without_sids_matches_nothing_but_any() {
+        let unknown = ProcessCredentials::new(1, 0, 0);
+        assert!(!PrincipalMatcher::Uid { uid: 0 }.matches(&unknown));
+        assert!(
+            !PrincipalMatcher::Sid {
+                sid: EVERYONE.into()
+            }
+            .matches(&unknown)
+        );
+        assert!(PrincipalMatcher::Any(AnyMarker).matches(&unknown));
+    }
+
+    #[test]
+    fn only_the_owner_sid_may_add_segments_without_a_producer_role() {
+        let owner = peer("S-1-5-21-1-2-3-1003", &[USERS]);
+        let other = peer("S-1-5-21-1-2-3-1001", &[USERS]);
+        let policy = ConfiguredPolicy::new(0, vec![], vec![], ResourceLimits::default())
+            .with_owner_sid(Some(sid("S-1-5-21-1-2-3-1003")));
+        let service = ServiceHash::new::<iceoryx2_cal::hash::sha1::Sha1>(
+            &ServiceName::new("test/owner").unwrap(),
+            crate::service::messaging_pattern::MessagingPattern::PublishSubscribe,
+        );
+        assert!(matches!(
+            policy.authorize_add_segment(&owner, &service, 1024),
+            PolicyDecision::Allow
+        ));
+        assert!(!matches!(
+            policy.authorize_add_segment(&other, &service, 1024),
+            PolicyDecision::Allow
+        ));
+    }
+}
+
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
     use crate::iam::protocol::DenialReason;

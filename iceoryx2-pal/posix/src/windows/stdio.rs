@@ -14,8 +14,12 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(unused_variables)]
 
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, FALSE};
-use windows_sys::Win32::Storage::FileSystem::DeleteFileA;
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, FALSE,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    DeleteFileA, GetFileAttributesA, INVALID_FILE_ATTRIBUTES,
+};
 
 use crate::posix::types::*;
 
@@ -24,7 +28,13 @@ use crate::win32call;
 use super::win32_handle_translator::HandleTranslator;
 
 pub unsafe fn remove(pathname: *const c_char) -> int {
-    unsafe { crate::posix::chmod(pathname, 0o777) };
+    // A read-only file can only be deleted after granting write access again.
+    let (attributes, _) = unsafe {
+        win32call! { GetFileAttributesA(pathname as *const u8), ignore ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND }
+    };
+    if attributes != INVALID_FILE_ATTRIBUTES {
+        unsafe { crate::posix::chmod(pathname, 0o777) };
+    }
 
     let (has_deleted, _) = unsafe {
         win32call! { DeleteFileA(pathname as *const u8), ignore ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED }

@@ -12,17 +12,18 @@
 
 use iceoryx2_pal_configuration::PATH_LENGTH;
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE},
+    Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE},
     Security::SECURITY_ATTRIBUTES,
     System::Memory::{
-        CreateFileMappingA, FILE_MAP_ALL_ACCESS, MEM_COMMIT, MapViewOfFile, PAGE_READWRITE,
-        SEC_RESERVE, UnmapViewOfFile, VirtualAlloc,
+        FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MapViewOfFile, PAGE_READWRITE, SEC_RESERVE,
+        UnmapViewOfFile, VirtualAlloc,
     },
 };
 
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::mman::{create_named_mapping, open_named_mapping};
 use crate::posix::{c_string_length, types::*};
 use core::ffi::CStr;
 use core::hint::spin_loop;
@@ -236,9 +237,37 @@ impl Drop for PortToUds {
 impl PortToUds {
     pub fn new() -> Option<Self> {
         let handle: HANDLE = 0;
-        let (shm_handle, last_error) = unsafe {
-            win32call! { CreateFileMappingA(handle, core::ptr::null::<SECURITY_ATTRIBUTES>(), PAGE_READWRITE | SEC_RESERVE, 0, SHM_SIZE as _, SHM_SEGMENT_NAME.as_ptr() as *const u8), ignore ERROR_ALREADY_EXISTS}
+        // The map is shared by the processes of all users: everybody signed in may read and
+        // write the entries, but only its creator (and SYSTEM and administrators) its DACL.
+        let security = super::security_descriptor::SecurityDescriptor::from_sddl(
+            b"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;GRGW;;;AU)\0",
+        )
+        .ok();
+        let security_attributes = security.as_ref().map(|sd| sd.as_security_attributes());
+        let security_attributes_ptr = security_attributes
+            .as_ref()
+            .map_or(core::ptr::null::<SECURITY_ATTRIBUTES>(), |sa| {
+                sa as *const _
+            });
+        let (mut shm_handle, mut last_error) = unsafe {
+            create_named_mapping(
+                handle,
+                security_attributes_ptr,
+                PAGE_READWRITE | SEC_RESERVE,
+                0,
+                SHM_SIZE as _,
+                SHM_SEGMENT_NAME.as_ptr(),
+            )
         };
+
+        // CreateFileMappingA opens an existing map with all access rights, which only its
+        // creator holds; everybody else opens it for reading and writing.
+        if shm_handle == 0 && last_error == ERROR_ACCESS_DENIED {
+            (shm_handle, _) = unsafe {
+                open_named_mapping(FILE_MAP_READ | FILE_MAP_WRITE, SHM_SEGMENT_NAME.as_ptr())
+            };
+            last_error = ERROR_ALREADY_EXISTS;
+        }
 
         if shm_handle == 0 {
             return None;
@@ -247,7 +276,7 @@ impl PortToUds {
         let has_created_shm = last_error != ERROR_ALREADY_EXISTS;
 
         let (map_result, _) = unsafe {
-            win32call! {MapViewOfFile(shm_handle, FILE_MAP_ALL_ACCESS, 0, 0, SHM_SIZE as _)}
+            win32call! {MapViewOfFile(shm_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, SHM_SIZE as _)}
         };
 
         if map_result == 0 {

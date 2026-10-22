@@ -26,6 +26,7 @@ use iceoryx2_cal::control_channel::{
     ControlChannelListenerBuilder,
 };
 use iceoryx2_cal::monitoring::State;
+#[cfg(unix)]
 use iceoryx2_cal::named_concept::NamedConceptConfiguration;
 use iceoryx2_cal::named_concept::{NamedConceptBuilder, NamedConceptMgmt};
 use iceoryx2_cal::security::credentials::ProcessCredentials;
@@ -286,6 +287,43 @@ fn endpoint_is_dead<Service: service::Service>(
 /// caller can create the service anew. Remaining participants keep their mappings of the old
 /// (now nameless) resources; [`is_orphaned`](crate::service::port_factory::publish_subscribe::PortFactory::is_orphaned)
 /// tells them to drop the service and open it again. Returns whether the service was reclaimed.
+/// Returns true when the static config of the service belongs to our user and is older than
+/// twice the creation timeout. Always false where file ownership is not known (Windows).
+#[cfg(unix)]
+fn created_by_us_long_ago<Service: service::Service>(
+    config: &crate::config::Config,
+    static_config: &StaticConfig,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let storage_config =
+        crate::service::config_scheme::static_config_storage_config::<Service>(config);
+    let name = crate::service::naming_scheme::static_config_name(static_config.service_hash());
+    let path = storage_config.path_for(&name);
+    let path = core::str::from_utf8(path.as_bytes()).unwrap_or("");
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    // SAFETY: geteuid has no preconditions.
+    if metadata.uid() != unsafe { iceoryx2_pal_posix::posix::geteuid() } {
+        return false;
+    }
+    let min_age = config.global.creation_timeout * 2;
+    metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.elapsed().ok())
+        .is_some_and(|age| age >= min_age)
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::extra_unused_type_parameters)] // same signature as the Unix variant
+fn created_by_us_long_ago<Service: service::Service>(
+    _config: &crate::config::Config,
+    _static_config: &StaticConfig,
+) -> bool {
+    false
+}
+
 pub(crate) fn reclaim_orphaned_service<Service: service::Service>(
     shared_node: &SharedNode<Service>,
     static_config: &StaticConfig,
@@ -296,33 +334,7 @@ pub(crate) fn reclaim_orphaned_service<Service: service::Service>(
         return false;
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let storage_config =
-            crate::service::config_scheme::static_config_storage_config::<Service>(config);
-        let name = crate::service::naming_scheme::static_config_name(static_config.service_hash());
-        let path = storage_config.path_for(&name);
-        let path = core::str::from_utf8(path.as_bytes()).unwrap_or("");
-        let Ok(metadata) = std::fs::metadata(path) else {
-            return false;
-        };
-        // SAFETY: geteuid has no preconditions.
-        if metadata.uid() != unsafe { iceoryx2_pal_posix::posix::geteuid() } {
-            return false;
-        }
-        let min_age = config.global.creation_timeout * 2;
-        let old_enough = metadata
-            .modified()
-            .ok()
-            .and_then(|m| m.elapsed().ok())
-            .is_some_and(|age| age >= min_age);
-        if !old_enough {
-            return false;
-        }
-    }
-    #[cfg(not(unix))]
-    {
+    if !created_by_us_long_ago::<Service>(config, static_config) {
         return false;
     }
 

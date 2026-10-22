@@ -23,10 +23,15 @@ path = "bins/src/server.rs"
 name = "win-e2e-client"
 path = "bins/src/client.rs"
 
+[[bin]]
+name = "win-e2e-mu"
+path = "bins/src/multi_user.rs"
+
 [dependencies]
 clap = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+iceoryx2 = { workspace = true, features = ["std"] }
 iceoryx2-pal-posix = { workspace = true }
 iceoryx2-cal = { workspace = true, features = ["std"] }
 iceoryx2-bb-system-types = { workspace = true }

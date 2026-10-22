@@ -132,6 +132,9 @@ struct SerializableAuditEvent {
     uid: u32,
     gid: u32,
     pid: u32,
+    /// The user SID in string form (Windows peers, which have no uid/gid).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_sid: Option<String>,
     service_name: String,
     decision: String,
     reason: String,
@@ -187,12 +190,28 @@ impl From<&AuditEvent> for SerializableAuditEvent {
             uid: event.credentials.uid(),
             gid: event.credentials.gid(),
             pid: event.credentials.pid(),
+            user_sid: user_sid_string(&event.credentials),
             service_name: event.service_name.clone(),
             decision: decision_str,
             reason: reason_str,
             message: message_str,
         }
     }
+}
+
+/// The user SID of `credentials` in string form, e.g. `S-1-5-21-...-1001`.
+#[cfg(windows)]
+fn user_sid_string(credentials: &ProcessCredentials) -> Option<String> {
+    credentials.user_sid().map(|sid| {
+        iceoryx2_pal_posix::windows::security_descriptor::Sid::from_bytes(sid)
+            .to_sid_string()
+            .unwrap_or_else(|| String::from("<invalid>"))
+    })
+}
+
+#[cfg(not(windows))]
+fn user_sid_string(_credentials: &ProcessCredentials) -> Option<String> {
+    None
 }
 
 // ============================================================================

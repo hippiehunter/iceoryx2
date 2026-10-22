@@ -459,6 +459,88 @@ pub fn duplicate_handle_local(
     Ok(new_handle)
 }
 
+/// Allows the user `sid` to duplicate handles out of and into the current process
+/// (`PROCESS_DUP_HANDLE`) by adding an allow entry to the process DACL. A server that runs
+/// as another user needs this right to take over handles that this process sends it and to
+/// hand handles to this process.
+///
+/// # Returns
+/// * `Ok(())` - The entry was added (or merged into an existing one)
+/// * `Err(code)` - The Win32 error of reading or writing the process DACL
+#[cfg(windows)]
+pub fn allow_handle_duplication_by(sid: &super::security_descriptor::Sid) -> Result<(), u32> {
+    use windows_sys::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_KERNEL_OBJECT,
+        SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, PSECURITY_DESCRIPTOR,
+    };
+    use windows_sys::Win32::System::Memory::LocalFree;
+
+    // SAFETY: GetCurrentProcess returns a pseudo-handle with all access rights.
+    let process = unsafe { GetCurrentProcess() };
+    let mut dacl: *mut ACL = core::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = core::ptr::null_mut();
+    // SAFETY: the out pointers are valid; `descriptor` owns `dacl` and is freed below.
+    let error = unsafe {
+        GetSecurityInfo(
+            process,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            &mut dacl,
+            core::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(error);
+    }
+
+    let mut sid_bytes = sid.as_bytes().to_vec();
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: PROCESS_DUP_HANDLE,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: NO_INHERITANCE,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: core::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid_bytes.as_mut_ptr() as *mut u16,
+        },
+    };
+    let mut new_dacl: *mut ACL = core::ptr::null_mut();
+    // SAFETY: `entry` names a valid SID; `new_dacl` is allocated by the call and freed below.
+    let error = unsafe { SetEntriesInAclW(1, &entry, dacl, &mut new_dacl) };
+    // SAFETY: `descriptor` was allocated by GetSecurityInfo.
+    unsafe { LocalFree(descriptor as _) };
+    if error != 0 {
+        return Err(error);
+    }
+
+    // SAFETY: `new_dacl` is a valid ACL built by SetEntriesInAclW.
+    let error = unsafe {
+        SetSecurityInfo(
+            process,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            new_dacl,
+            core::ptr::null(),
+        )
+    };
+    // SAFETY: `new_dacl` was allocated by SetEntriesInAclW.
+    unsafe { LocalFree(new_dacl as _) };
+    if error != 0 {
+        return Err(error);
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Non-Windows Stub Implementation
 // ============================================================================

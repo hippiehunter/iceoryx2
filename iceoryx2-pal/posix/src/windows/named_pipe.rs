@@ -52,25 +52,26 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BROKEN_PIPE,
     ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_HANDLE, ERROR_IO_PENDING,
     ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING,
-    ERROR_PIPE_NOT_CONNECTED, FALSE, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, TRUE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PIPE_NOT_CONNECTED, FALSE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, TRUE,
+    WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
+    SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, WriteFile,
 };
 
 #[cfg(windows)]
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    GetNamedPipeServerProcessId, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe, SetNamedPipeHandleState,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+    PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
+    SetNamedPipeHandleState, WaitNamedPipeW,
 };
 
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{GetCurrentProcessId, INFINITE, WaitForSingleObject};
 
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
@@ -93,6 +94,15 @@ pub const DEFAULT_PIPE_BUFFER_SIZE: u32 = 65536;
 
 /// Default timeout for pipe operations in milliseconds.
 pub const DEFAULT_PIPE_TIMEOUT_MS: u32 = 5000;
+
+/// The first message of every client. The server reads it while accepting the connection so
+/// that it may impersonate the client to learn its identity.
+#[cfg(windows)]
+const IDENTITY_HANDSHAKE: &[u8; 8] = b"IOX2IDNT";
+
+/// How long accepting a connection waits for the client's [`IDENTITY_HANDSHAKE`].
+#[cfg(windows)]
+const IDENTITY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ============================================================================
 // Error Types
@@ -354,6 +364,9 @@ pub struct NamedPipeServer {
     /// Overlapped structure for the persistent accept operation.
     /// Only valid when accept_event != 0.
     accept_overlapped: OVERLAPPED,
+    /// DACL of every instance, derived from the creation mode. `None` keeps the default
+    /// DACL (creator, SYSTEM and administrators full access, everybody else read only).
+    security: Option<super::security_descriptor::SecurityDescriptor>,
 }
 
 // SAFETY: NamedPipeServer contains raw handles (isize) and an OVERLAPPED struct
@@ -381,51 +394,90 @@ enum AcceptState {
     Pending,
 }
 
+/// The rights a client needs to connect, exchange messages and switch to message-read mode:
+/// FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES |
+/// READ_CONTROL | SYNCHRONIZE. Deliberately without FILE_APPEND_DATA, which for a pipe is
+/// FILE_CREATE_PIPE_INSTANCE: a client must not be able to serve instances of the pipe.
+#[cfg(windows)]
+const PIPE_CLIENT_ACCESS: u32 = 0x0012_0183;
+
+/// Builds the DACL of a pipe created with `mode`: the creating user, SYSTEM and the
+/// administrators get full access; when the group or others bits grant read and write access,
+/// everybody may connect as a client. Returns `None` (default DACL) otherwise.
+#[cfg(windows)]
+fn pipe_security_descriptor(
+    mode: u64,
+) -> Result<Option<super::security_descriptor::SecurityDescriptor>, NamedPipeError> {
+    use super::security_descriptor::SecurityDescriptor;
+
+    const GROUP_RW: u64 = 0o060;
+    const OTHERS_RW: u64 = 0o006;
+    if mode & GROUP_RW != GROUP_RW && mode & OTHERS_RW != OTHERS_RW {
+        return Ok(None);
+    }
+
+    let me = super::process_token::get_process_token_sids(unsafe { GetCurrentProcessId() })
+        .map_err(|_| NamedPipeError::UnknownError(0))?;
+    let me = me
+        .user_sid
+        .to_sid_string()
+        .ok_or(NamedPipeError::UnknownError(0))?;
+    let sddl = alloc::format!(
+        "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{me})(A;;0x{PIPE_CLIENT_ACCESS:x};;;WD)\0"
+    );
+    SecurityDescriptor::from_sddl(sddl.as_bytes())
+        .map(Some)
+        .map_err(|_| NamedPipeError::UnknownError(0))
+}
+
 #[cfg(windows)]
 impl NamedPipeServer {
     /// Creates a new named pipe server.
     ///
     /// # Arguments
     /// * `name` - The pipe name (without the `\\.\pipe\` prefix)
-    /// * `mode` - Unix-style permission mode (currently ignored - see note below)
+    /// * `mode` - Unix-style permission mode. When it grants the group or others read and
+    ///   write access, everybody may connect (see [`pipe_security_descriptor`]); otherwise
+    ///   the default DACL lets only the creator, SYSTEM and administrators connect.
     ///
     /// # Returns
     /// * `Ok(NamedPipeServer)` - The created server
-    /// * `Err(NamedPipeError)` - If creation failed
-    ///
-    /// # Note on Security
-    /// **TODO:** Windows security descriptors are not yet implemented. The `mode` parameter
-    /// is currently ignored and a NULL security descriptor is used, which grants default
-    /// access permissions. To implement proper security:
-    /// - Convert Unix-style mode bits to Windows DACLs
-    /// - Use `InitializeSecurityDescriptor` and `SetSecurityDescriptorDacl`
-    /// - Consider using `ConvertStringSecurityDescriptorToSecurityDescriptor` for simpler cases
-    ///
-    /// # Safety
-    /// This function calls Windows API functions internally.
-    #[allow(unused_variables)] // mode parameter is not yet implemented
+    /// * `Err(NamedPipeError)` - If creation failed, [`NamedPipeError::AccessDenied`] in
+    ///   particular when another process already serves a pipe of that name
     pub fn create(name: &[u8], mode: u64) -> Result<Self, NamedPipeError> {
         let (name_wide, _name_len) = pipe_name_to_wide(name)?;
-        let handle = Self::create_instance(&name_wide)?;
+        let security = pipe_security_descriptor(mode)?;
+        // The first instance must be ours: otherwise a process that created the pipe first
+        // would receive the connections of our clients.
+        let handle = Self::create_instance(&name_wide, security.as_ref(), true)?;
 
         Ok(Self {
             name_wide,
             handle,
             accept_event: 0,
             accept_overlapped: unsafe { core::mem::zeroed() },
+            security,
         })
     }
 
     /// Creates a new listening instance of the pipe.
-    fn create_instance(name_wide: &[u16; MAX_PIPE_NAME_LENGTH]) -> Result<HANDLE, NamedPipeError> {
-        // TODO: Implement proper security descriptor based on mode parameter.
-        // Currently using NULL security descriptor which grants default access.
-        // Windows uses DACLs/SACLs instead of Unix permission bits, so a proper
-        // implementation would need to translate mode bits to appropriate ACEs.
-        let security_attrs = SECURITY_ATTRIBUTES {
-            nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: core::ptr::null_mut(),
-            bInheritHandle: FALSE,
+    fn create_instance(
+        name_wide: &[u16; MAX_PIPE_NAME_LENGTH],
+        security: Option<&super::security_descriptor::SecurityDescriptor>,
+        first_instance: bool,
+    ) -> Result<HANDLE, NamedPipeError> {
+        let security_attrs = match security {
+            Some(sd) => sd.as_security_attributes(),
+            None => SECURITY_ATTRIBUTES {
+                nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: core::ptr::null_mut(),
+                bInheritHandle: FALSE,
+            },
+        };
+        let first_instance_flag = if first_instance {
+            FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            0
         };
 
         // Create the named pipe with FILE_FLAG_OVERLAPPED so that
@@ -436,7 +488,7 @@ impl NamedPipeServer {
         let handle = unsafe {
             CreateNamedPipeW(
                 name_wide.as_ptr(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, // Bidirectional + overlapped
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | first_instance_flag, // Bidirectional + overlapped
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                 PIPE_UNLIMITED_INSTANCES,
                 DEFAULT_PIPE_BUFFER_SIZE,
@@ -524,7 +576,7 @@ impl NamedPipeServer {
         timeout_ms: u32,
     ) -> Result<Option<NamedPipeConnection>, NamedPipeError> {
         if self.handle == INVALID_HANDLE_VALUE {
-            self.handle = Self::create_instance(&self.name_wide)?;
+            self.handle = Self::create_instance(&self.name_wide, self.security.as_ref(), false)?;
         }
 
         let state = if self.accept_event == 0 {
@@ -627,7 +679,8 @@ impl NamedPipeServer {
     fn hand_off_connected_instance(&mut self) -> NamedPipeConnection {
         let connected = self.handle;
         // If the replacement cannot be created now, the next accept retries.
-        self.handle = Self::create_instance(&self.name_wide).unwrap_or(INVALID_HANDLE_VALUE);
+        self.handle = Self::create_instance(&self.name_wide, self.security.as_ref(), false)
+            .unwrap_or(INVALID_HANDLE_VALUE);
         NamedPipeConnection::from_server(connected)
     }
 
@@ -856,6 +909,8 @@ pub struct NamedPipeConnection {
     is_overlapped: bool,
     /// Cached client process ID (lazily fetched).
     cached_client_pid: Option<u32>,
+    /// Server side: the client's user and group SIDs, taken from its identity handshake.
+    client_sids: Option<super::process_token::TokenSids>,
 }
 
 #[cfg(windows)]
@@ -887,11 +942,81 @@ impl NamedPipeConnection {
     /// A future improvement could use `DuplicateHandle` to create an independent handle copy
     /// for each server-side connection, but this would require additional cleanup logic.
     fn from_server(handle: HANDLE) -> Self {
-        Self {
+        let mut connection = Self {
             handle,
             is_server_side: true,
             is_overlapped: true, // Server pipes are created with FILE_FLAG_OVERLAPPED
             cached_client_pid: None,
+            client_sids: None,
+        };
+        connection.receive_identity_handshake();
+        connection
+    }
+
+    /// Reads the server's answer to the [`IDENTITY_HANDSHAKE`], which carries the server's user
+    /// SID, and allows that user to duplicate handles out of and into this process: handles
+    /// are exchanged by the server alone, which cannot open the process of another user
+    /// otherwise.
+    fn allow_server_handle_duplication(&self) {
+        let mut buffer = [0u8; IDENTITY_HANDSHAKE.len() + 68];
+        let n = match self.timed_read(&mut buffer, IDENTITY_HANDSHAKE_TIMEOUT) {
+            Ok(n)
+                if n > IDENTITY_HANDSHAKE.len()
+                    && buffer[..IDENTITY_HANDSHAKE.len()] == *IDENTITY_HANDSHAKE =>
+            {
+                n
+            }
+            other => {
+                std::eprintln!(
+                    "iceoryx2: the pipe server did not answer the identity handshake ({other:?})."
+                );
+                return;
+            }
+        };
+        let server =
+            super::security_descriptor::Sid::from_bytes(&buffer[IDENTITY_HANDSHAKE.len()..n]);
+        let me = super::process_token::get_process_token_sids(unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentProcessId()
+        });
+        if me.is_ok_and(|me| me.user_sid == server) {
+            return;
+        }
+        if let Err(e) = super::handle_passing::allow_handle_duplication_by(&server) {
+            std::eprintln!(
+                "iceoryx2: allowing the pipe server to exchange handles failed (Win32 error {e})."
+            );
+        }
+    }
+
+    /// Reads the client's [`IDENTITY_HANDSHAKE`] and impersonates the client to learn its user
+    /// and group SIDs. Windows only allows impersonating a pipe client after something was
+    /// read from the pipe; impersonation works for every client, whereas opening the client's
+    /// process token works only for processes of the same user (or for administrators).
+    fn receive_identity_handshake(&mut self) {
+        let mut buffer = [0u8; IDENTITY_HANDSHAKE.len()];
+        match self.timed_read(&mut buffer, IDENTITY_HANDSHAKE_TIMEOUT) {
+            Ok(n) if n == buffer.len() && buffer == *IDENTITY_HANDSHAKE => {
+                match super::process_token::get_client_token_sids(self.handle) {
+                    Ok(sids) => self.client_sids = Some(sids),
+                    Err(e) => std::eprintln!(
+                        "iceoryx2: impersonating the pipe client failed ({e}); falling back to its process token."
+                    ),
+                }
+                // Answer with our user SID, so that a client of another user can allow us
+                // to exchange handles with it.
+                let mut reply = IDENTITY_HANDSHAKE.to_vec();
+                if let Ok(me) = super::process_token::get_process_token_sids(unsafe {
+                    windows_sys::Win32::System::Threading::GetCurrentProcessId()
+                }) {
+                    reply.extend_from_slice(me.user_sid.as_bytes());
+                }
+                if let Err(e) = self.write(&reply) {
+                    std::eprintln!("iceoryx2: answering the identity handshake failed ({e:?}).");
+                }
+            }
+            other => std::eprintln!(
+                "iceoryx2: the pipe client sent no identity handshake ({other:?}); falling back to its process token."
+            ),
         }
     }
 
@@ -906,23 +1031,37 @@ impl NamedPipeConnection {
     pub fn connect(name: &[u8]) -> Result<Self, NamedPipeError> {
         let (name_wide, _) = pipe_name_to_wide(name)?;
 
-        // SAFETY: CreateFileW is called with valid parameters to open the named pipe.
-        let handle = unsafe {
-            CreateFileW(
-                name_wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                core::ptr::null(),
-                OPEN_EXISTING,
-                0, // No special flags for synchronous I/O
-                0, // No template file
-            )
-        };
+        // The server keeps one listening instance; while it hands a connected instance off and
+        // creates the next one, concurrent clients get ERROR_PIPE_BUSY and wait for it.
+        const BUSY_RETRIES: u32 = 10;
+        let mut attempt = 0;
+        let handle = loop {
+            // SAFETY: CreateFileW is called with valid parameters to open the named pipe.
+            let handle = unsafe {
+                CreateFileW(
+                    name_wide.as_ptr(),
+                    PIPE_CLIENT_ACCESS,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    core::ptr::null(),
+                    OPEN_EXISTING,
+                    // Synchronous I/O; the server may identify us but not act as us.
+                    SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    0, // No template file
+                )
+            };
+            if handle != INVALID_HANDLE_VALUE {
+                break handle;
+            }
 
-        if handle == INVALID_HANDLE_VALUE {
             let error = unsafe { GetLastError() };
-            return Err(NamedPipeError::from_win32(error));
-        }
+            attempt += 1;
+            if error != ERROR_PIPE_BUSY || attempt > BUSY_RETRIES {
+                return Err(NamedPipeError::from_win32(error));
+            }
+            // SAFETY: the name is NUL-terminated. A failed wait (e.g. the pipe vanished) is
+            // reported by the next CreateFileW.
+            unsafe { WaitNamedPipeW(name_wide.as_ptr(), DEFAULT_PIPE_TIMEOUT_MS) };
+        };
 
         // Set the pipe to message-read mode
         let mode: u32 = PIPE_READMODE_MESSAGE;
@@ -937,12 +1076,16 @@ impl NamedPipeConnection {
             return Err(NamedPipeError::from_win32(error));
         }
 
-        Ok(Self {
+        let connection = Self {
             handle,
             is_server_side: false,
             is_overlapped: false, // Client connections use synchronous I/O
             cached_client_pid: None,
-        })
+            client_sids: None,
+        };
+        connection.write(IDENTITY_HANDSHAKE)?;
+        connection.allow_server_handle_duplication();
+        Ok(connection)
     }
 
     /// Returns the process ID of the connected client.
@@ -1005,6 +1148,14 @@ impl NamedPipeConnection {
     /// * `Err(NamedPipeError)` - Failed to get basic credentials (PID)
     pub fn peer_credentials(&mut self) -> Result<PipeProcessCredentials, NamedPipeError> {
         let pid = self.client_process_id()?;
+
+        if let Some(sids) = &self.client_sids {
+            return Ok(PipeProcessCredentials::with_sids(
+                pid,
+                sids.user_sid.clone(),
+                sids.group_sids.clone(),
+            ));
+        }
 
         // Extract SIDs by opening the client's process token directly.
         // This avoids ImpersonateNamedPipeClient which requires a read from the
@@ -1275,13 +1426,9 @@ impl Drop for NamedPipeConnection {
             return;
         }
 
-        // Server-side connections own the pipe instance handed off by the server;
-        // disconnect the client before closing it.
-        if self.is_server_side {
-            // SAFETY: DisconnectNamedPipe is called with a valid pipe handle that we own.
-            unsafe { DisconnectNamedPipe(self.handle) };
-        }
-
+        // Server-side connections own the pipe instance handed off by the server, which is
+        // never reused, so it is closed and not disconnected: DisconnectNamedPipe would
+        // discard what the client has not read yet (e.g. the last response).
         // SAFETY: CloseHandle is called with a valid handle that we own.
         unsafe { CloseHandle(self.handle) };
     }

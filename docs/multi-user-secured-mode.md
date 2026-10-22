@@ -276,6 +276,43 @@ Changes made for SIP's 10,000-writer target (`iceoryx2/tests/secured_scale_tests
   away should wait until `has_samples_in_flight()` is false (SIP does this event-driven: it
   notifies the reader and waits on its "space" event).
 
+## Windows
+
+The same configuration works on Windows; the mechanisms underneath differ:
+
+* **Identity.** The IAM endpoint is a named pipe. Every client sends an identity handshake
+  when it connects; the server reads it and impersonates the client (identification level
+  only, the client does not allow more) to take the user and group SIDs from the client's
+  token. Disabled and deny-only groups (e.g. Administrators in a filtered UAC token) are left
+  out. Peers have no uid/gid on Windows, so `{ uid = .. }`, `{ gid = .. }` and the uid ranges
+  never match there.
+* **Principals.** `{ user = "name" }` and `{ group = "name" }` are resolved with
+  `LookupAccountNameW` (`sipbroker`, `SIPWriters`, `HOST\writer1`,
+  `NT SERVICE\SIPMessageBroker`, ...); `{ sid = "S-1-5-32-545" }` matches a user or group
+  SID directly. The audit log records the peer's `user_sid`.
+* **Handles.** A client cannot open the process of a server that runs as another user, and the
+  server must not trust handle values a client claims to be valid in the server. So the
+  server answers the handshake with its user SID, the client grants that SID
+  `PROCESS_DUP_HANDLE` on its own process, the server duplicates the handles a client sends
+  out of the client (closing the client's transfer copies), and it duplicates handles into
+  clients as before. A listener rejects handle messages a client claims to have pushed.
+* **Endpoint.** `endpoint-mode` decides the pipe DACL: when the group or others bits grant
+  read and write, everybody may connect as a client (without `FILE_CREATE_PIPE_INSTANCE`, so
+  nobody else can serve the pipe); the first instance is created with
+  `FILE_FLAG_FIRST_PIPE_INSTANCE`. Clients wait for a free instance on `ERROR_PIPE_BUSY`.
+* **Shared metadata.** Files and named file mappings get DACLs from the mirrored modes.
+  Windows has no shared group for kernel objects, so use variant A (`"1777"`, `"0666"`) and
+  let the policies decide; protect the root path with folder ACLs instead (installer).
+* **Sessions.** Named mappings are created and opened in the `Global\` namespace, so that
+  writers in interactive sessions find the objects of a broker service in session 0. Creating
+  a global object outside of session 0 needs `SeCreateGlobalPrivilege`; without it a mapping
+  is created in the session namespace and only seen there, which is fine for everything a
+  writer creates in secured mode (its data is anonymous and IAM-brokered).
+
+`windows-e2e-tests/scripts/multi_user.ps1` runs the `win-e2e-mu` roles under four local
+accounts (broker `sipbroker`, writers `writer1`/`writer2` in `SIPWriters`, `outsider`) through
+scheduled tasks; run it as an administrator in a throwaway container (see the script header).
+
 ## Tests
 
 The cross-user tests need root (or a user namespace with mapped uids 2000-2003 and gid 3000):

@@ -217,6 +217,104 @@ impl Sid {
             inner: vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
         }
     }
+
+    /// Looks up the SID of a user or group account, e.g. `SIPWriters`, `HOST\writer1` or
+    /// `NT SERVICE\SIPMessageBroker`. Names without a domain are resolved the way
+    /// `LookupAccountNameW` resolves them (well-known, built-in, local, then domain accounts).
+    #[cfg(windows)]
+    pub fn from_account_name(name: &str) -> Result<Self, SecurityError> {
+        use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
+
+        let wide_name: Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        let mut sid = vec![0u8; 256];
+        let mut sid_len = sid.len() as u32;
+        let mut domain = vec![0u16; 256];
+        let mut domain_len = domain.len() as u32;
+        let mut sid_use: SID_NAME_USE = 0;
+        for _ in 0..2 {
+            // SAFETY: all buffers are valid for the lengths passed; on
+            // ERROR_INSUFFICIENT_BUFFER the lengths are updated and the call is repeated.
+            let result = unsafe {
+                LookupAccountNameW(
+                    core::ptr::null(),
+                    wide_name.as_ptr(),
+                    sid.as_mut_ptr() as *mut _,
+                    &mut sid_len,
+                    domain.as_mut_ptr(),
+                    &mut domain_len,
+                    &mut sid_use,
+                )
+            };
+            if result != FALSE {
+                // On success cbSid is not updated, so the length comes from the SID itself.
+                // SAFETY: LookupAccountNameW wrote a valid SID to the start of `sid`.
+                let len = unsafe {
+                    windows_sys::Win32::Security::GetLengthSid(sid.as_mut_ptr() as *mut _)
+                };
+                sid.truncate(len as usize);
+                return Ok(Self { inner: sid });
+            }
+            // SAFETY: GetLastError has no preconditions.
+            let error = unsafe { GetLastError() };
+            if error != windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER {
+                return Err(SecurityError::from_win32(error));
+            }
+            sid.resize(sid_len as usize, 0);
+            domain.resize(domain_len as usize, 0);
+        }
+        Err(SecurityError::InvalidParameter)
+    }
+
+    /// Parses a SID in string form, e.g. `S-1-5-32-545`.
+    #[cfg(windows)]
+    pub fn from_string(sid: &str) -> Result<Self, SecurityError> {
+        use windows_sys::Win32::Foundation::PSID;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows_sys::Win32::Security::GetLengthSid;
+
+        let wide: Vec<u16> = sid.encode_utf16().chain(core::iter::once(0)).collect();
+        let mut psid: PSID = core::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; on success `psid` is freed with LocalFree below.
+        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut psid) } == FALSE {
+            // SAFETY: GetLastError has no preconditions.
+            return Err(SecurityError::from_win32(unsafe { GetLastError() }));
+        }
+        // SAFETY: `psid` is a valid SID allocated by ConvertStringSidToSidW.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(psid as *const u8, GetLengthSid(psid) as usize).to_vec()
+        };
+        // SAFETY: `psid` was allocated with LocalAlloc by ConvertStringSidToSidW.
+        unsafe { LocalFree(psid as _) };
+        Ok(Self { inner: bytes })
+    }
+
+    /// Returns the SID in string form, e.g. `S-1-5-32-545`, as used in SDDL and in logs.
+    #[cfg(windows)]
+    pub fn to_sid_string(&self) -> Option<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::IsValidSid;
+
+        let psid = self.inner.as_ptr() as *mut core::ffi::c_void;
+        // SAFETY: IsValidSid checks that the buffer holds a well-formed SID.
+        if self.inner.len() < 8 || unsafe { IsValidSid(psid) } == FALSE {
+            return None;
+        }
+        let mut wide: *mut u16 = core::ptr::null_mut();
+        // SAFETY: `psid` is a valid SID; on success `wide` is freed with LocalFree below.
+        if unsafe { ConvertSidToStringSidW(psid, &mut wide) } == FALSE {
+            return None;
+        }
+        let mut len = 0;
+        // SAFETY: ConvertSidToStringSidW returns a NUL-terminated string.
+        while unsafe { *wide.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `wide` holds `len` UTF-16 code units.
+        let string = String::from_utf16_lossy(unsafe { core::slice::from_raw_parts(wide, len) });
+        // SAFETY: `wide` was allocated with LocalAlloc by ConvertSidToStringSidW.
+        unsafe { LocalFree(wide as _) };
+        Some(string)
+    }
 }
 
 // ============================================================================

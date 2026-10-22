@@ -2696,6 +2696,7 @@ name = "windows-e2e-tests"
 version = "0.10.999"
 dependencies = [
  "clap",
+ "iceoryx2",
  "iceoryx2-bb-loggers",
  "iceoryx2-bb-posix",
  "iceoryx2-bb-system-types",

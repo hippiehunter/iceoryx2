@@ -23,7 +23,7 @@ use windows_sys::Win32::{
     },
     Security::{
         DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityA,
-        OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SetFileSecurityA,
+        OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SetFileSecurityA, SetKernelObjectSecurity,
     },
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileA, FILE_ATTRIBUTE_DIRECTORY,
@@ -357,7 +357,22 @@ pub unsafe fn fchmod(fd: int, mode: mode_t) -> int {
         {
             return 0;
         }
-        Some(FdHandleEntry::SharedMemory(handle)) => handle.state_handle,
+        Some(FdHandleEntry::SharedMemory(handle)) => {
+            // The mapping object is what other processes open, so it gets the same DACL as
+            // its state file; it was created with the creator's default DACL.
+            let security_attributes = from_mode_to_security_attributes(mode);
+            let (has_object_security_set, _) = unsafe {
+                win32call!(SetKernelObjectSecurity(
+                    handle.handle.handle,
+                    DACL_SECURITY_INFORMATION,
+                    security_attributes.lpSecurityDescriptor
+                ))
+            };
+            if has_object_security_set == FALSE {
+                return -1;
+            }
+            handle.state_handle
+        }
         Some(FdHandleEntry::File(handle)) => handle.handle,
         Some(FdHandleEntry::DirectoryStream(handle)) => return 0,
         e => {

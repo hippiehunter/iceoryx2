@@ -65,11 +65,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use iceoryx2_bb_container::semantic_string::SemanticString;
+use iceoryx2_bb_posix::permission::Permission;
 use iceoryx2_bb_system_types::file_name::FileName;
 use iceoryx2_bb_system_types::path::Path;
 use iceoryx2_log::{fail, trace, warn};
 use iceoryx2_pal_posix::windows::handle_passing::{
-    DuplicateOptions, HandleDuplicationError, duplicate_handle_to_process,
+    DuplicateOptions, HandleDuplicationError, duplicate_handle_from_process,
+    duplicate_handle_local, duplicate_handle_to_process,
 };
 use iceoryx2_pal_posix::windows::named_pipe::{
     NamedPipeConnection, NamedPipeError, NamedPipeServer,
@@ -77,6 +79,7 @@ use iceoryx2_pal_posix::windows::named_pipe::{
 
 use crate::named_concept::{
     NamedConcept, NamedConceptBuilder, NamedConceptMgmt, NamedConceptPathHintRemoveError,
+    SharedAccess,
 };
 use crate::security::{PlatformHandle, ProcessCredentials};
 use crate::static_storage::file::{
@@ -96,7 +99,23 @@ use super::{
 // ============================================================================
 
 /// Magic header for handle transfer messages: "IOX2" in ASCII (0x49 0x4F 0x58 0x32).
+/// The handle values were duplicated into the receiver by the sender (listener to client).
 const HANDLE_MSG_MAGIC: u32 = 0x494F5832;
+
+/// Magic header for handle transfer messages whose handle values are valid in the sender:
+/// "IOXP" in ASCII. The receiver duplicates them out of the sender and closes them there
+/// (client to listener). The listener may run as another user, which cannot be expected to
+/// grant clients access to its process; the client grants the listener access to its own.
+const HANDLE_MSG_PULL_MAGIC: u32 = 0x494F5850;
+
+/// How the handle values of a received transfer message are interpreted.
+#[derive(Debug, Clone, Copy)]
+enum HandleTransfer {
+    /// Values were duplicated into this process by the sender.
+    Pushed,
+    /// Values are valid in the process with this id and are duplicated out of it.
+    PulledFrom(u32),
+}
 
 /// Maximum number of handles that can be sent in a single message.
 const MAX_HANDLES_PER_MESSAGE: usize = 16;
@@ -117,6 +136,7 @@ pub struct Configuration {
     suffix: FileName,
     prefix: FileName,
     path_hint: Path,
+    shared_access: SharedAccess,
 }
 
 impl Default for Configuration {
@@ -125,6 +145,7 @@ impl Default for Configuration {
             suffix: Channel::default_suffix(),
             prefix: Channel::default_prefix(),
             path_hint: Channel::default_path_hint(),
+            shared_access: SharedAccess::owner_only(),
         }
     }
 }
@@ -155,6 +176,15 @@ impl NamedConceptConfiguration for Configuration {
 
     fn get_path_hint(&self) -> &Path {
         &self.path_hint
+    }
+
+    fn shared_access(mut self, value: &SharedAccess) -> Self {
+        self.shared_access = *value;
+        self
+    }
+
+    fn get_shared_access(&self) -> SharedAccess {
+        self.shared_access
     }
 }
 
@@ -260,9 +290,13 @@ impl ControlChannelListenerBuilder<Channel> for ListenerBuilder {
         let msg = "Unable to create control channel listener";
         let pipe_name = build_pipe_name(&self.name, &self.config);
 
-        // Create the named pipe server
-        // Mode 0o600 is passed but currently ignored by the Windows implementation
-        let server = match NamedPipeServer::create(pipe_name.as_bytes(), 0o600) {
+        // Clients need read and write access; the shared access decides who else gets it.
+        let mode = self
+            .config
+            .shared_access
+            .file_permission(Permission::OWNER_READ | Permission::OWNER_WRITE)
+            .bits();
+        let server = match NamedPipeServer::create(pipe_name.as_bytes(), mode) {
             Ok(s) => s,
             Err(e) => {
                 return map_pipe_error_to_create(&self, msg, e);
@@ -434,24 +468,28 @@ impl ControlChannelConnection for Connection {
     }
 
     fn receive_handles(&self) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
-        receive_handles_from_pipe(&self.inner)
+        receive_handles_from_pipe(&self.inner, HandleTransfer::PulledFrom(self.client_pid))
     }
 
     fn try_receive_handles(
         &self,
     ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
-        try_receive_handles_from_pipe(&self.inner)
+        try_receive_handles_from_pipe(&self.inner, HandleTransfer::PulledFrom(self.client_pid))
     }
 
     fn timed_receive_handles(
         &self,
         timeout: Duration,
     ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
-        timed_receive_handles_from_pipe(&self.inner, timeout)
+        timed_receive_handles_from_pipe(
+            &self.inner,
+            timeout,
+            HandleTransfer::PulledFrom(self.client_pid),
+        )
     }
 
     fn blocking_receive_handles(&self) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
-        blocking_receive_handles_from_pipe(&self.inner)
+        blocking_receive_handles_from_pipe(&self.inner, HandleTransfer::PulledFrom(self.client_pid))
     }
 
     fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError> {
@@ -562,17 +600,6 @@ impl NamedConcept for Client {
     }
 }
 
-impl Client {
-    /// Returns the PID of the listener process; handles sent to the listener are
-    /// duplicated into that process.
-    fn server_pid(&self) -> Result<u32, ControlChannelSendError> {
-        self.inner.server_process_id().map_err(|e| {
-            warn!(from self, "Unable to determine the listener process id ({:?}).", e);
-            ControlChannelSendError::InternalFailure
-        })
-    }
-}
-
 impl ControlChannelClient for Client {
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
         // On the client side, we can't easily get server credentials on Windows.
@@ -581,7 +608,7 @@ impl ControlChannelClient for Client {
     }
 
     fn send_handles(&self, handles: &[&PlatformHandle]) -> Result<(), ControlChannelSendError> {
-        send_handles_to_process(&self.inner, handles, self.server_pid()?)
+        send_handles_for_pull(&self.inner, handles)
     }
 
     fn try_send_handles(
@@ -589,7 +616,7 @@ impl ControlChannelClient for Client {
         handles: &[&PlatformHandle],
     ) -> Result<bool, ControlChannelSendError> {
         // Same as the listener side: there is no true non-blocking send for this protocol.
-        match send_handles_to_process(&self.inner, handles, self.server_pid()?) {
+        match send_handles_for_pull(&self.inner, handles) {
             Ok(()) => Ok(true),
             Err(ControlChannelSendError::WouldBlock) => Ok(false),
             Err(e) => Err(e),
@@ -597,24 +624,24 @@ impl ControlChannelClient for Client {
     }
 
     fn receive_handles(&self) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
-        receive_handles_from_pipe(&self.inner)
+        receive_handles_from_pipe(&self.inner, HandleTransfer::Pushed)
     }
 
     fn try_receive_handles(
         &self,
     ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
-        try_receive_handles_from_pipe(&self.inner)
+        try_receive_handles_from_pipe(&self.inner, HandleTransfer::Pushed)
     }
 
     fn timed_receive_handles(
         &self,
         timeout: Duration,
     ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
-        timed_receive_handles_from_pipe(&self.inner, timeout)
+        timed_receive_handles_from_pipe(&self.inner, timeout, HandleTransfer::Pushed)
     }
 
     fn blocking_receive_handles(&self) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
-        blocking_receive_handles_from_pipe(&self.inner)
+        blocking_receive_handles_from_pipe(&self.inner, HandleTransfer::Pushed)
     }
 
     fn send(&self, data: &[u8]) -> Result<(), ControlChannelSendError> {
@@ -755,15 +782,53 @@ fn send_handles_to_process(
     }
 }
 
+/// Sends handles to the listener: duplicates each into a transfer copy in this process and
+/// sends the copies' values, which the listener duplicates out of this process (closing the
+/// copies here). This only needs `PROCESS_DUP_HANDLE` of the listener on this process, which
+/// the client grants it while connecting.
+fn send_handles_for_pull(
+    conn: &NamedPipeConnection,
+    handles: &[&PlatformHandle],
+) -> Result<(), ControlChannelSendError> {
+    if handles.len() > MAX_HANDLES_PER_MESSAGE {
+        return Err(ControlChannelSendError::MessageTooLarge);
+    }
+
+    let mut buffer = [0u8; HANDLE_MSG_MAX_SIZE];
+    buffer[0..4].copy_from_slice(&HANDLE_MSG_PULL_MAGIC.to_le_bytes());
+    buffer[4..8].copy_from_slice(&(handles.len() as u32).to_le_bytes());
+    for (i, handle) in handles.iter().enumerate() {
+        let copy = match duplicate_handle_local(
+            handle.as_raw_handle() as isize,
+            DuplicateOptions::same_access(),
+        ) {
+            Ok(copy) => copy,
+            Err(e) => {
+                warn!(from "control_channel::named_pipe",
+                    "Failed to duplicate a handle for the transfer: {:?}", e);
+                return Err(map_duplication_error_to_send(e));
+            }
+        };
+        let offset = HANDLE_MSG_HEADER_SIZE + i * 8;
+        buffer[offset..offset + 8].copy_from_slice(&(copy as u64).to_le_bytes());
+    }
+
+    match conn.write(&buffer[..HANDLE_MSG_HEADER_SIZE + handles.len() * 8]) {
+        Ok(_) => Ok(()),
+        Err(e) => map_pipe_error_to_send(e),
+    }
+}
+
 /// Receives handles from the pipe (blocking).
 fn receive_handles_from_pipe(
     conn: &NamedPipeConnection,
+    transfer: HandleTransfer,
 ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
     let mut buffer = [0u8; HANDLE_MSG_MAX_SIZE];
 
     match conn.blocking_read(&mut buffer) {
         Ok(0) => Ok(None),
-        Ok(n) => parse_handle_message(&buffer[..n]),
+        Ok(n) => parse_handle_message(&buffer[..n], transfer),
         Err(e) => map_pipe_error_to_receive(e),
     }
 }
@@ -771,12 +836,13 @@ fn receive_handles_from_pipe(
 /// Tries to receive handles without blocking.
 fn try_receive_handles_from_pipe(
     conn: &NamedPipeConnection,
+    transfer: HandleTransfer,
 ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
     let mut buffer = [0u8; HANDLE_MSG_MAX_SIZE];
 
     match conn.try_read(&mut buffer) {
         Ok(0) => Ok(None),
-        Ok(n) => parse_handle_message(&buffer[..n]),
+        Ok(n) => parse_handle_message(&buffer[..n], transfer),
         Err(NamedPipeError::WouldBlock) => Ok(None),
         Err(e) => map_pipe_error_to_receive(e),
     }
@@ -786,12 +852,13 @@ fn try_receive_handles_from_pipe(
 fn timed_receive_handles_from_pipe(
     conn: &NamedPipeConnection,
     timeout: Duration,
+    transfer: HandleTransfer,
 ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
     let mut buffer = [0u8; HANDLE_MSG_MAX_SIZE];
 
     match conn.timed_read(&mut buffer, timeout) {
         Ok(0) => Ok(None),
-        Ok(n) => parse_handle_message(&buffer[..n]),
+        Ok(n) => parse_handle_message(&buffer[..n], transfer),
         Err(NamedPipeError::TimedOut) => Ok(None),
         Err(e) => map_pipe_error_to_receive(e),
     }
@@ -800,12 +867,13 @@ fn timed_receive_handles_from_pipe(
 /// Blocks until handles are received.
 fn blocking_receive_handles_from_pipe(
     conn: &NamedPipeConnection,
+    transfer: HandleTransfer,
 ) -> Result<Vec<PlatformHandle>, ControlChannelReceiveError> {
     let mut buffer = [0u8; HANDLE_MSG_MAX_SIZE];
 
     match conn.blocking_read(&mut buffer) {
         Ok(0) => Ok(vec![]),
-        Ok(n) => match parse_handle_message(&buffer[..n])? {
+        Ok(n) => match parse_handle_message(&buffer[..n], transfer)? {
             Some(handles) => Ok(handles),
             None => Ok(vec![]),
         },
@@ -813,9 +881,12 @@ fn blocking_receive_handles_from_pipe(
     }
 }
 
-/// Parses a handle transfer message.
+/// Parses a handle transfer message. A listener only accepts handles it pulls out of the
+/// client (never raw values a client claims to be valid in the listener), a client only
+/// handles the listener pushed into it.
 fn parse_handle_message(
     buffer: &[u8],
+    transfer: HandleTransfer,
 ) -> Result<Option<Vec<PlatformHandle>>, ControlChannelReceiveError> {
     if buffer.len() < HANDLE_MSG_HEADER_SIZE {
         warn!(from "control_channel::named_pipe",
@@ -825,7 +896,11 @@ fn parse_handle_message(
 
     // Check magic header
     let magic = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    if magic != HANDLE_MSG_MAGIC {
+    let expected_magic = match transfer {
+        HandleTransfer::Pushed => HANDLE_MSG_MAGIC,
+        HandleTransfer::PulledFrom(_) => HANDLE_MSG_PULL_MAGIC,
+    };
+    if magic != expected_magic {
         warn!(from "control_channel::named_pipe",
             "Received message with invalid magic header: 0x{:08X}", magic);
         return Err(ControlChannelReceiveError::InternalFailure);
@@ -866,9 +941,23 @@ fn parse_handle_message(
             buffer[offset + 7],
         ]);
 
-        // SAFETY: The handle value was duplicated into our process by the sender
-        // using DuplicateHandle. The sender is trusted (server process) and the
-        // protocol ensures handle values received are valid in our process space.
+        let handle_val = match transfer {
+            HandleTransfer::Pushed => handle_val,
+            HandleTransfer::PulledFrom(pid) => {
+                let options = DuplicateOptions::same_access().close_source();
+                match duplicate_handle_from_process(pid, handle_val as _, options) {
+                    Ok(handle) => handle as u64,
+                    Err(e) => {
+                        warn!(from "control_channel::named_pipe",
+                            "Failed to duplicate handle out of process {}: {:?}", pid, e);
+                        return Err(ControlChannelReceiveError::InternalFailure);
+                    }
+                }
+            }
+        };
+
+        // SAFETY: The handle value was duplicated into our process, either by the sender
+        // (listener to client; the listener is trusted) or by us out of the sender.
         // We now take ownership and are responsible for closing the handle.
         let handle = unsafe { PlatformHandle::from_raw_handle(handle_val as *mut _) };
         handles.push(handle);
@@ -1083,7 +1172,7 @@ mod tests {
         buffer[0..4].copy_from_slice(&HANDLE_MSG_MAGIC.to_le_bytes());
         buffer[4..8].copy_from_slice(&0u32.to_le_bytes());
 
-        let result = parse_handle_message(&buffer);
+        let result = parse_handle_message(&buffer, HandleTransfer::Pushed);
         assert!(result.is_ok());
         let handles = result.unwrap();
         assert!(handles.is_some());
@@ -1096,14 +1185,14 @@ mod tests {
         buffer[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
         buffer[4..8].copy_from_slice(&0u32.to_le_bytes());
 
-        let result = parse_handle_message(&buffer);
+        let result = parse_handle_message(&buffer, HandleTransfer::Pushed);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_too_short_message() {
         let buffer = [0u8; 4]; // Too short for header
-        let result = parse_handle_message(&buffer);
+        let result = parse_handle_message(&buffer, HandleTransfer::Pushed);
         assert!(result.is_err());
     }
 
@@ -1113,8 +1202,38 @@ mod tests {
         buffer[0..4].copy_from_slice(&HANDLE_MSG_MAGIC.to_le_bytes());
         buffer[4..8].copy_from_slice(&(MAX_HANDLES_PER_MESSAGE as u32 + 1).to_le_bytes());
 
-        let result = parse_handle_message(&buffer);
+        let result = parse_handle_message(&buffer, HandleTransfer::Pushed);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_listener_rejects_handles_a_client_claims_to_have_pushed() {
+        let mut buffer = [0u8; HANDLE_MSG_HEADER_SIZE];
+        buffer[0..4].copy_from_slice(&HANDLE_MSG_MAGIC.to_le_bytes());
+        buffer[4..8].copy_from_slice(&0u32.to_le_bytes());
+
+        let result = parse_handle_message(&buffer, HandleTransfer::PulledFrom(1));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_client_rejects_handles_to_pull() {
+        let mut buffer = [0u8; HANDLE_MSG_HEADER_SIZE];
+        buffer[0..4].copy_from_slice(&HANDLE_MSG_PULL_MAGIC.to_le_bytes());
+        buffer[4..8].copy_from_slice(&0u32.to_le_bytes());
+
+        let result = parse_handle_message(&buffer, HandleTransfer::Pushed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_pull_message() {
+        let mut buffer = [0u8; HANDLE_MSG_HEADER_SIZE];
+        buffer[0..4].copy_from_slice(&HANDLE_MSG_PULL_MAGIC.to_le_bytes());
+        buffer[4..8].copy_from_slice(&0u32.to_le_bytes());
+
+        let result = parse_handle_message(&buffer, HandleTransfer::PulledFrom(1));
+        assert_eq!(result.unwrap().unwrap().len(), 0);
     }
 
     // NOTE: Integration tests requiring Windows are located in the integration
