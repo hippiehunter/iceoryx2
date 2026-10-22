@@ -601,6 +601,10 @@ impl NamedConcept for Client {
 }
 
 impl ControlChannelClient for Client {
+    fn is_peer_closed(&self) -> bool {
+        self.inner.is_peer_closed()
+    }
+
     fn peer_credentials(&self) -> Result<ProcessCredentials, ControlChannelCredentialsError> {
         // On the client side, we can't easily get server credentials on Windows.
         // Return an error indicating this isn't supported.

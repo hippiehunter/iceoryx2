@@ -288,7 +288,9 @@ pub unsafe fn shm_open(name: *const c_char, oflag: int, mode: mode_t) -> int {
 
         if oflag & O_CREAT != 0 {
             shm_state_handle = create_state_handle(name);
-            if shm_state_handle == INVALID_HANDLE_VALUE {
+            let created_state = shm_state_handle != INVALID_HANDLE_VALUE;
+            let generation;
+            if !created_state {
                 if oflag & O_EXCL != 0 {
                     Errno::set(Errno::EEXIST);
                     return -1;
@@ -300,8 +302,26 @@ pub unsafe fn shm_open(name: *const c_char, oflag: int, mode: mode_t) -> int {
                     Errno::set(Errno::ENOENT);
                     return -1;
                 }
+                generation = match shm_get_generation(shm_state_handle) {
+                    Some(generation) => generation,
+                    None => {
+                        // another process is creating it
+                        CloseHandle(shm_state_handle);
+                        Errno::set(Errno::ENOENT);
+                        return -1;
+                    }
+                };
+            } else {
+                shm_set_size(shm_state_handle, 0);
+                generation = new_generation();
+                if !shm_set_generation(shm_state_handle, generation) {
+                    CloseHandle(shm_state_handle);
+                    remove_state_handle(name);
+                    Errno::set(Errno::EACCES);
+                    return -1;
+                }
             }
-            shm_set_size(shm_state_handle, 0);
+            let object_name = mapping_name(name, generation);
 
             const MAX_SIZE_LOW: u32 = (MAX_SUPPORTED_SHM_SIZE & 0xFFFFFFFF) as u32;
             const MAX_SIZE_HIGH: u32 = ((MAX_SUPPORTED_SHM_SIZE >> 32) & 0xFFFFFFFF) as u32;
@@ -313,18 +333,26 @@ pub unsafe fn shm_open(name: *const c_char, oflag: int, mode: mode_t) -> int {
                 PAGE_READWRITE | SEC_RESERVE,
                 MAX_SIZE_HIGH,
                 MAX_SIZE_LOW,
-                name,
+                object_name.as_ptr().cast(),
             );
 
             if shm_handle == 0 {
                 Errno::set(Errno::EACCES);
                 CloseHandle(shm_state_handle);
+                if created_state {
+                    remove_state_handle(name);
+                }
                 return -1;
             }
 
+            // only when another creation drew the same generation
             if oflag & O_EXCL != 0 && last_mapping_error == ERROR_ALREADY_EXISTS {
                 CloseHandle(shm_handle);
                 CloseHandle(shm_state_handle);
+                if created_state {
+                    remove_state_handle(name);
+                }
+                Errno::set(Errno::EEXIST);
                 return -1;
             }
         } else {
@@ -334,6 +362,14 @@ pub unsafe fn shm_open(name: *const c_char, oflag: int, mode: mode_t) -> int {
                 Errno::set(Errno::ENOENT);
                 return -1;
             }
+
+            let Some(generation) = shm_get_generation(shm_state_handle) else {
+                // the creation is still in progress
+                win32call! {CloseHandle(shm_state_handle)};
+                Errno::set(Errno::ENOENT);
+                return -1;
+            };
+            let object_name = mapping_name(name, generation);
 
             // Only ask for the rights a view needs: FILE_MAP_ALL_ACCESS also asks for WRITE_DAC
             // and WRITE_OWNER, which the creator grants nobody else.
@@ -345,20 +381,24 @@ pub unsafe fn shm_open(name: *const c_char, oflag: int, mode: mode_t) -> int {
             // The owner may change the DACL later (fchmod), which needs WRITE_DAC: the owner
             // holds it implicitly, everybody else is refused and opens without it.
             let mut last_mapping_error;
-            (shm_handle, last_mapping_error) = open_named_mapping(access | WRITE_DAC_ACCESS, name);
+            (shm_handle, last_mapping_error) =
+                open_named_mapping(access | WRITE_DAC_ACCESS, object_name.as_ptr().cast());
             if shm_handle == 0 && last_mapping_error == ERROR_ACCESS_DENIED {
-                (shm_handle, last_mapping_error) = open_named_mapping(access, name);
+                (shm_handle, last_mapping_error) =
+                    open_named_mapping(access, object_name.as_ptr().cast());
             }
 
             if shm_handle == 0 {
                 win32call! {CloseHandle(shm_state_handle)};
-                if last_mapping_error == ERROR_ACCESS_DENIED {
-                    Errno::set(Errno::EACCES);
+                // A state file without its mapping is either a leftover of a dead creator or a
+                // creation in progress (the state file is created first). It must not be
+                // removed here: that would corrupt a concurrent creation. A creator replaces
+                // a leftover (create_state_handle).
+                Errno::set(if last_mapping_error == ERROR_ACCESS_DENIED {
+                    Errno::EACCES
                 } else {
-                    // a state file without its mapping is a leftover of a crashed creator
-                    Errno::set(Errno::ENOENT);
-                    shm_unlink(name);
-                }
+                    Errno::ENOENT
+                });
                 return -1;
             }
 
@@ -472,9 +512,97 @@ unsafe fn remove_state_handle(name: *const c_char) -> int {
     }
 }
 
+// A POSIX shm_unlink frees the name at once: processes that still map the object keep it, and
+// the next shm_open(O_CREAT) creates a new object. A Windows mapping keeps its name until its last
+// handle is closed. So the mapping is named after a generation that the creator records in the
+// object's state file ("<name>~<generation>"): shm_unlink removes the state file, and the next
+// creation records a new generation and gets a mapping of its own.
+
+/// Offset of the generation in the state file (after the size).
+const STATE_GENERATION_OFFSET: i32 = 8;
+
+/// A generation that no earlier creation of the same name used.
+fn new_generation() -> u64 {
+    let mut now = windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: both calls only fill or return plain values.
+    let (now, pid) = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime(&mut now);
+        (
+            ((now.dwHighDateTime as u64) << 32) | now.dwLowDateTime as u64,
+            windows_sys::Win32::System::Threading::GetCurrentProcessId() as u64,
+        )
+    };
+    now ^ (pid << 44)
+}
+
+unsafe fn shm_set_generation(state_handle: HANDLE, generation: u64) -> bool {
+    let mut bytes_written = 0;
+    unsafe {
+        win32call! {SetFilePointer(state_handle, STATE_GENERATION_OFFSET, core::ptr::null_mut::<i32>(), FILE_BEGIN)};
+        let (written, _) = win32call! { WriteFile(
+            state_handle,
+            (&generation as *const u64) as *const u8,
+            8,
+            &mut bytes_written,
+            core::ptr::null_mut::<OVERLAPPED>(),
+        )};
+        written != FALSE && bytes_written == 8
+    }
+}
+
+/// The generation recorded in the state file; `None` while its creation is still in progress.
+unsafe fn shm_get_generation(state_handle: HANDLE) -> Option<u64> {
+    let mut generation: u64 = 0;
+    let mut bytes_read = 0;
+    unsafe {
+        win32call! {SetFilePointer(state_handle, STATE_GENERATION_OFFSET, core::ptr::null_mut::<i32>(), FILE_BEGIN)};
+        let (has_read, _) = win32call! { ReadFile(
+            state_handle,
+            (&mut generation as *mut u64) as *mut void,
+            8,
+            &mut bytes_read,
+            core::ptr::null_mut::<OVERLAPPED>(),
+        )};
+        (has_read != FALSE && bytes_read == 8).then_some(generation)
+    }
+}
+
+/// The name of the mapping of `name`'s `generation` (NUL-terminated).
+unsafe fn mapping_name(name: *const c_char, generation: u64) -> [u8; MAX_PATH_LENGTH] {
+    let suffix = alloc::format!("~{generation:x}");
+    let mut result = [0u8; MAX_PATH_LENGTH];
+    let mut i = 0;
+    while i < MAX_PATH_LENGTH - suffix.len() - 1 {
+        let c = unsafe { *name.add(i) } as u8;
+        if c == 0 {
+            break;
+        }
+        result[i] = c;
+        i += 1;
+    }
+    result[i..i + suffix.len()].copy_from_slice(suffix.as_bytes());
+    result
+}
+
+/// Whether the object `name` exists. A state file whose generation is not yet recorded belongs
+/// to a creation in progress and counts as existing.
 unsafe fn does_shm_exist(name: *const c_char) -> bool {
     unsafe {
-        let (shm_handle, last_error) = open_named_mapping(FILE_MAP_READ, name);
+        let state_handle = open_state_handle(name);
+        if state_handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let generation = shm_get_generation(state_handle);
+        win32call! {CloseHandle(state_handle)};
+        let Some(generation) = generation else {
+            return true;
+        };
+        let object_name = mapping_name(name, generation);
+        let (shm_handle, last_error) =
+            open_named_mapping(FILE_MAP_READ, object_name.as_ptr().cast());
         if shm_handle != 0 {
             win32call! {CloseHandle(shm_handle)};
         }

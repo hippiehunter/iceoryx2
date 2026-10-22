@@ -1331,6 +1331,31 @@ impl NamedPipeConnection {
         self.read(buffer)
     }
 
+    /// Returns true when the other end has closed the pipe (or the server disconnected it).
+    /// Data still pending in the pipe counts as open.
+    pub fn is_peer_closed(&self) -> bool {
+        let mut bytes_available: u32 = 0;
+        // SAFETY: PeekNamedPipe only reports the number of available bytes.
+        let peek_result = unsafe {
+            PeekNamedPipe(
+                self.handle,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                &mut bytes_available,
+                core::ptr::null_mut(),
+            )
+        };
+        if peek_result != 0 {
+            return false;
+        }
+        let error = unsafe { GetLastError() };
+        matches!(
+            error,
+            ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED | ERROR_NO_DATA
+        )
+    }
+
     /// Reads data from the pipe with a timeout.
     ///
     /// # Arguments
@@ -1479,6 +1504,10 @@ impl NamedPipeConnection {
 
     pub fn try_read(&self, _buffer: &mut [u8]) -> Result<usize, NamedPipeError> {
         Err(NamedPipeError::UnknownError(0))
+    }
+
+    pub fn is_peer_closed(&self) -> bool {
+        true
     }
 
     pub fn timed_read(

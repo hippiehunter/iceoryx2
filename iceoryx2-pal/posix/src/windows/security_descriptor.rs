@@ -288,6 +288,42 @@ impl Sid {
         Ok(Self { inner: bytes })
     }
 
+    /// Returns the owner SID of the file or directory `path`.
+    #[cfg(windows)]
+    pub fn file_owner(path: &str) -> Result<Self, SecurityError> {
+        use windows_sys::Win32::Foundation::PSID;
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{GetLengthSid, OWNER_SECURITY_INFORMATION};
+
+        let wide: Vec<u16> = path.encode_utf16().chain(core::iter::once(0)).collect();
+        let mut owner: PSID = core::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = core::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; `owner` points into `descriptor`, which is freed
+        // below after the SID was copied.
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(SecurityError::from_win32(error));
+        }
+        // SAFETY: GetNamedSecurityInfoW returned a valid owner SID.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(owner as *const u8, GetLengthSid(owner) as usize).to_vec()
+        };
+        // SAFETY: `descriptor` was allocated by GetNamedSecurityInfoW.
+        unsafe { LocalFree(descriptor as _) };
+        Ok(Self { inner: bytes })
+    }
+
     /// Returns the SID in string form, e.g. `S-1-5-32-545`, as used in SDDL and in logs.
     #[cfg(windows)]
     pub fn to_sid_string(&self) -> Option<String> {

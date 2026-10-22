@@ -303,6 +303,13 @@ The same configuration works on Windows; the mechanisms underneath differ:
 * **Shared metadata.** Files and named file mappings get DACLs from the mirrored modes.
   Windows has no shared group for kernel objects, so use variant A (`"1777"`, `"0666"`) and
   let the policies decide; protect the root path with folder ACLs instead (installer).
+* **Unlink.** A Windows mapping keeps its name until its last handle is closed, whereas
+  `shm_unlink` frees the name at once. Each creation therefore records a generation in the
+  object's state file and names the mapping `<name>~<generation>`; unlinking removes the state
+  file, so a service that is removed and created again (a reclaimed orphan, a restarted
+  broker) gets new mappings while writers still map the old ones. An opener that finds a state
+  file without its mapping reports "does not exist" and leaves the file alone: it may belong
+  to a creation in progress, and only a creator replaces a leftover.
 * **Sessions.** Named mappings are created and opened in the `Global\` namespace, so that
   writers in interactive sessions find the objects of a broker service in session 0. Creating
   a global object outside of session 0 needs `SeCreateGlobalPrivilege`; without it a mapping

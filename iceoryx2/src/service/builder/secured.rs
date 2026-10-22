@@ -26,7 +26,6 @@ use iceoryx2_cal::control_channel::{
     ControlChannelListenerBuilder,
 };
 use iceoryx2_cal::monitoring::State;
-#[cfg(unix)]
 use iceoryx2_cal::named_concept::NamedConceptConfiguration;
 use iceoryx2_cal::named_concept::{NamedConceptBuilder, NamedConceptMgmt};
 use iceoryx2_cal::security::credentials::ProcessCredentials;
@@ -288,13 +287,11 @@ fn endpoint_is_dead<Service: service::Service>(
 /// (now nameless) resources; [`is_orphaned`](crate::service::port_factory::publish_subscribe::PortFactory::is_orphaned)
 /// tells them to drop the service and open it again. Returns whether the service was reclaimed.
 /// Returns true when the static config of the service belongs to our user and is older than
-/// twice the creation timeout. Always false where file ownership is not known (Windows).
-#[cfg(unix)]
+/// twice the creation timeout.
 fn created_by_us_long_ago<Service: service::Service>(
     config: &crate::config::Config,
     static_config: &StaticConfig,
 ) -> bool {
-    use std::os::unix::fs::MetadataExt;
     let storage_config =
         crate::service::config_scheme::static_config_storage_config::<Service>(config);
     let name = crate::service::naming_scheme::static_config_name(static_config.service_hash());
@@ -303,8 +300,7 @@ fn created_by_us_long_ago<Service: service::Service>(
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
-    // SAFETY: geteuid has no preconditions.
-    if metadata.uid() != unsafe { iceoryx2_pal_posix::posix::geteuid() } {
+    if !owned_by_us(path, &metadata) {
         return false;
     }
     let min_age = config.global.creation_timeout * 2;
@@ -315,12 +311,27 @@ fn created_by_us_long_ago<Service: service::Service>(
         .is_some_and(|age| age >= min_age)
 }
 
-#[cfg(not(unix))]
-#[allow(clippy::extra_unused_type_parameters)] // same signature as the Unix variant
-fn created_by_us_long_ago<Service: service::Service>(
-    _config: &crate::config::Config,
-    _static_config: &StaticConfig,
-) -> bool {
+#[cfg(unix)]
+fn owned_by_us(_path: &str, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    metadata.uid() == unsafe { iceoryx2_pal_posix::posix::geteuid() }
+}
+
+/// The file's owner is our user SID. Files created by an elevated administrator may be owned
+/// by the Administrators group instead; those are not ours.
+#[cfg(windows)]
+fn owned_by_us(path: &str, _metadata: &std::fs::Metadata) -> bool {
+    use iceoryx2_pal_posix::windows::security_descriptor::Sid;
+    let me = ProcessCredentials::from_self();
+    match (me.user_sid(), Sid::file_owner(path)) {
+        (Some(me), Ok(owner)) => owner.as_bytes() == me,
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn owned_by_us(_path: &str, _metadata: &std::fs::Metadata) -> bool {
     false
 }
 
